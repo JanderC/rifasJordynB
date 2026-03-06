@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 5000;
 
 // ── Middlewares globales ───────────────────────────────────
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'rifas-jordyn-f.vercel.app',
+  origin: process.env.FRONTEND_URL || 'https://rifas-jordyn-f.vercel.app',
   credentials: true
 }));
 app.use(express.json());

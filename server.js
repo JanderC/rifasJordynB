@@ -10,8 +10,8 @@ app.use(cors({
   origin: process.env.FRONTEND_URL || 'https://rifas-jordyn-f.vercel.app',
   credentials: true
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));   // ← aumentado para imagen base64
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ── Logger de requests (desarrollo) ───────────────────────
 if (process.env.NODE_ENV === 'development') {
@@ -28,23 +28,24 @@ app.use('/api/numeros',    require('./routes/numeros'));
 app.use('/api/vendedores', require('./routes/vendedores'));
 app.use('/api/reportes',   require('./routes/reportes'));
 app.use('/api/caja',       require('./routes/caja'));
+app.use('/api/publico',    require('./routes/Publico'));   // ← rutas públicas cliente
 
 // ── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     app: '🎰 RIFAS JORDYN',
-    version: '1.0.0',
+    version: '2.0.0',
     timestamp: new Date().toISOString()
   });
 });
 
-// ── Manejo de rutas no encontradas ────────────────────────
+// ── Rutas no encontradas ───────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: `Ruta no encontrada: ${req.method} ${req.path}` });
 });
 
-// ── Manejo global de errores ───────────────────────────────
+// ── Error global ───────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('Error no manejado:', err);
   res.status(500).json({ error: 'Error interno del servidor' });
@@ -54,19 +55,20 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log('');
   console.log('🎰  ══════════════════════════════════════');
-  console.log('🎰       RIFAS JORDYN - Backend           ');
+  console.log('🎰       RIFAS JORDYN v2.0 — Backend     ');
   console.log('🎰  ══════════════════════════════════════');
-  console.log(`🚀  Servidor corriendo en: http://localhost:${PORT}`);
+  console.log(`🚀  http://localhost:${PORT}`);
   console.log(`📡  Entorno: ${process.env.NODE_ENV || 'development'}`);
   console.log('');
-  console.log('📋  Endpoints disponibles:');
+  console.log('📋  Endpoints:');
   console.log(`    POST   /api/auth/login`);
   console.log(`    GET    /api/rifas`);
   console.log(`    GET    /api/numeros/verificar/:numero`);
   console.log(`    POST   /api/numeros/vender`);
   console.log(`    GET    /api/reportes/dashboard`);
+  console.log(`    GET    /api/publico/rifas              (público)`);
+  console.log(`    POST   /api/publico/reservar           (público)`);
   console.log('🎰  ══════════════════════════════════════');
-  console.log('');
 });
 
 module.exports = app;

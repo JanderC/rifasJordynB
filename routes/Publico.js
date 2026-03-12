@@ -56,15 +56,26 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
       `SELECT numero FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente'`,
       [req.params.id]
     );
+    // Números asignados a vendedores → NO aparecen en el grid público
+    const asignadosVendedor = await pool.query(
+      `SELECT numero FROM numeros_vendedor WHERE rifa_id=$1`,
+      [req.params.id]
+    );
 
     const mapa = {};
     vendidos.rows.forEach(r => { mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1'; });
     reservados.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'reservado'; });
+    // Marcar como 'vendedor' para excluirlos del resultado público
+    asignadosVendedor.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'vendedor'; });
 
     const numeros = [];
     for (let i = 0; i < 1000; i++) {
       const n = String(i).padStart(3, '0');
-      numeros.push({ numero: n, estado: mapa[n] || 'disponible' });
+      const estado = mapa[n] || 'disponible';
+      // Excluir completamente los números de vendedor del listado público
+      if (estado !== 'vendedor') {
+        numeros.push({ numero: n, estado });
+      }
     }
     res.json(numeros);
   } catch (e) {

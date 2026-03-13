@@ -1,33 +1,32 @@
+// ============================================================
+//   RIFAS JORDYN — Rutas de Números
+//   ✅ ACTUALIZADO: endpoint POST /vender-bulk para múltiples números
+// ============================================================
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
-// ── Función helper para validar formato de número ─────────
 const validarNumero = (num) => /^[0-9]{3}$/.test(num);
 
-// ── GET /api/numeros/estado-global ────────────────────────
-// Vista unificada de los 1000 números con estado en AMBAS rifas
+// ── GET /api/numeros/estado-global ─────────────────────────
 router.get('/estado-global', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
         n.numero,
-        -- Estado Rifa 1
         COALESCE(r1.veces, 0) AS rifa1_vendido,
         CASE
           WHEN COALESCE(r1.veces, 0) = 0 THEN 'disponible'
           WHEN COALESCE(r1.veces, 0) = 1 THEN 'vendido_1'
           ELSE 'agotado'
         END AS rifa1_estado,
-        -- Estado Rifa 2
         COALESCE(r2.veces, 0) AS rifa2_vendido,
         CASE
           WHEN COALESCE(r2.veces, 0) = 0 THEN 'disponible'
           WHEN COALESCE(r2.veces, 0) = 1 THEN 'vendido_1'
           ELSE 'agotado'
         END AS rifa2_estado,
-        -- Estado global combinado
         CASE
           WHEN COALESCE(r1.veces, 0) = 0 AND COALESCE(r2.veces, 0) = 0 THEN 'libre'
           WHEN COALESCE(r1.veces, 0) >= 2 AND COALESCE(r2.veces, 0) >= 2 THEN 'agotado_total'
@@ -65,7 +64,6 @@ router.get('/estado-global', authMiddleware, async (req, res) => {
 });
 
 // ── GET /api/numeros/verificar/:numero ────────────────────
-// Verificar disponibilidad de un número en todas las rifas activas
 router.get('/verificar/:numero', authMiddleware, async (req, res) => {
   const { numero } = req.params;
 
@@ -89,9 +87,6 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
         );
 
         const veces_vendido = ventas.rows.length;
-
-        // Si la rifa tiene números asignados a vendedores, verificar si este número
-        // está bloqueado para el vendedor actual
         let bloqueadoPorOtro = false;
         let vendedorPropietario = null;
 
@@ -129,7 +124,7 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
             : 'agotado',
           disponible,
           bloqueado_por: vendedorPropietario,
-          compradores: ventas.rows
+          compradores: ventas.rows,
         };
       })
     );
@@ -142,7 +137,6 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
 });
 
 // ── GET /api/numeros/rifa/:rifa_id ────────────────────────
-// Estado de todos los números de una rifa específica
 router.get('/rifa/:rifa_id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -160,7 +154,7 @@ router.get('/rifa/:rifa_id', authMiddleware, async (req, res) => {
 });
 
 // ── POST /api/numeros/vender ───────────────────────────────
-// Registrar una venta
+// Vender un único número (endpoint original sin cambios)
 router.post('/vender', authMiddleware, async (req, res) => {
   const { rifa_id, numero, nombre_comprador, telefono, observacion } = req.body;
 
@@ -177,7 +171,6 @@ router.post('/vender', authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Verificar cuántas veces se ha vendido este número (con lock)
     const checkResult = await client.query(
       `SELECT COUNT(*) AS veces FROM ventas WHERE rifa_id = $1 AND numero = $2`,
       [rifa_id, numero]
@@ -190,12 +183,10 @@ router.post('/vender', authMiddleware, async (req, res) => {
       return res.status(409).json({
         error: 'NUMERO_AGOTADO',
         message: `⛔ El número ${numero} ya fue vendido 2 veces y está AGOTADO en esta rifa`,
-        veces_vendido: veces
+        veces_vendido: veces,
       });
     }
 
-    // Si el vendedor NO es dueño, verificar que el número le pertenezca
-    // (si hay números asignados en esta rifa, el vendedor solo puede vender los suyos)
     if (req.user.rol === 'vendedor') {
       const hayAsignados = await client.query(
         `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`,
@@ -213,20 +204,18 @@ router.post('/vender', authMiddleware, async (req, res) => {
           await client.query('ROLLBACK');
           return res.status(403).json({
             error: 'NUMERO_NO_ASIGNADO',
-            message: `⛔ El número ${numero} no está asignado a tu cartera. Solo puedes vender tus números asignados.`
+            message: `⛔ El número ${numero} no está asignado a tu cartera.`,
           });
         }
       }
     }
 
-    // Obtener precio de la rifa
     const rifaResult = await client.query('SELECT precio FROM rifas WHERE id = $1', [rifa_id]);
     if (!rifaResult.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
 
-    // Registrar la venta
     const venta = await client.query(
       `INSERT INTO ventas (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -244,19 +233,14 @@ router.post('/vender', authMiddleware, async (req, res) => {
       venta: venta.rows[0],
       estado_actual: estado,
       veces_vendido: nuevasVeces,
-      alerta: nuevasVeces === 2 ? `⚠️ El número ${numero} ahora está AGOTADO (vendido 2 veces)` : null
+      alerta: nuevasVeces === 2 ? `⚠️ El número ${numero} ahora está AGOTADO` : null,
     });
 
   } catch (err) {
     await client.query('ROLLBACK');
-
-    if (err.message && err.message.includes('NUMERO_AGOTADO')) {
-      return res.status(409).json({
-        error: 'NUMERO_AGOTADO',
-        message: `⛔ El número ${numero} está agotado`
-      });
+    if (err.message?.includes('NUMERO_AGOTADO')) {
+      return res.status(409).json({ error: 'NUMERO_AGOTADO', message: `⛔ El número ${numero} está agotado` });
     }
-
     console.error('Error registrando venta:', err);
     res.status(500).json({ error: 'Error del servidor al registrar la venta' });
   } finally {
@@ -264,8 +248,152 @@ router.post('/vender', authMiddleware, async (req, res) => {
   }
 });
 
+/* ── POST /api/numeros/vender-bulk ───────────────────────────
+   ✅ NUEVO: Registrar venta de MÚLTIPLES números en una transacción
+   Body:
+     {
+       rifa_id,
+       numeros: ['001','002','045'],
+       nombre_comprador,
+       telefono,
+       observacion
+     }
+   Respuesta:
+     {
+       vendidos: [{ numero, venta }],
+       fallidos: [{ numero, razon }],
+       total_vendido,
+       total_fallido
+     }
+─────────────────────────────────────────────────────────── */
+router.post('/vender-bulk', authMiddleware, async (req, res) => {
+  const { rifa_id, numeros, nombre_comprador, telefono, observacion } = req.body;
+
+  if (!rifa_id || !nombre_comprador) {
+    return res.status(400).json({ error: 'rifa_id y nombre_comprador son requeridos' });
+  }
+
+  if (!Array.isArray(numeros) || numeros.length === 0) {
+    return res.status(400).json({ error: 'numeros[] debe ser un array no vacío' });
+  }
+
+  if (numeros.length > 100) {
+    return res.status(400).json({ error: 'Máximo 100 números por operación' });
+  }
+
+  const invalidos = numeros.filter(n => !validarNumero(n));
+  if (invalidos.length > 0) {
+    return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
+  }
+
+  const numerosUnicos = [...new Set(numeros)];
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Obtener precio de la rifa
+    const rifaResult = await client.query('SELECT precio FROM rifas WHERE id = $1', [rifa_id]);
+    if (!rifaResult.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+    const precioBoleto = rifaResult.rows[0].precio;
+
+    // Si el vendedor tiene asignaciones, verificar de antemano
+    let numerosPermitidos = new Set(numerosUnicos);
+    if (req.user.rol === 'vendedor') {
+      const hayAsignados = await client.query(
+        `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`,
+        [rifa_id]
+      );
+      if (parseInt(hayAsignados.rows[0].total) > 0) {
+        const asignados = await client.query(
+          `SELECT numero FROM numeros_vendedor WHERE vendedor_id = $1 AND rifa_id = $2`,
+          [req.user.id, rifa_id]
+        );
+        numerosPermitidos = new Set(asignados.rows.map(r => r.numero));
+      }
+    }
+
+    // Obtener estado actual de todos los números en una sola consulta
+    const estadoActual = await client.query(
+      `SELECT numero, COUNT(*) AS veces
+       FROM ventas
+       WHERE rifa_id = $1 AND numero = ANY($2)
+       GROUP BY numero`,
+      [rifa_id, numerosUnicos]
+    );
+    const vecesMap = {};
+    estadoActual.rows.forEach(r => { vecesMap[r.numero] = parseInt(r.veces); });
+
+    const vendidos = [];
+    const fallidos = [];
+
+    for (const numero of numerosUnicos) {
+      // Verificar asignación de vendedor
+      if (!numerosPermitidos.has(numero) && req.user.rol === 'vendedor') {
+        fallidos.push({ numero, razon: 'no_asignado' });
+        continue;
+      }
+
+      const veces = vecesMap[numero] || 0;
+      if (veces >= 2) {
+        fallidos.push({ numero, razon: 'agotado' });
+        continue;
+      }
+
+      try {
+        const venta = await client.query(
+          `INSERT INTO ventas
+             (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
+          [
+            rifa_id, numero, req.user.id,
+            nombre_comprador.trim(),
+            telefono || null,
+            precioBoleto,
+            observacion || `Venta múltiple`,
+          ]
+        );
+        vendidos.push({ numero, estado: veces + 1 >= 2 ? 'agotado' : 'vendido_1', venta: venta.rows[0] });
+        // Actualizar el mapa local para siguientes iteraciones
+        vecesMap[numero] = veces + 1;
+      } catch (insertErr) {
+        // Posible conflicto de unicidad (CONSTRAINT max_dos_ventas)
+        fallidos.push({ numero, razon: 'conflicto_bd' });
+      }
+    }
+
+    if (vendidos.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Ningún número pudo venderse',
+        fallidos,
+      });
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      message: `✅ ${vendidos.length} número(s) vendidos exitosamente`,
+      vendidos,
+      fallidos,
+      total_vendido: vendidos.length,
+      total_fallido: fallidos.length,
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error en venta bulk:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+});
+
 // ── GET /api/numeros/vendedor/mis-numeros ─────────────────
-// Números asignados al vendedor actual
 router.get('/vendedor/mis-numeros', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -293,7 +421,6 @@ router.get('/vendedor/mis-numeros', authMiddleware, async (req, res) => {
 });
 
 // ── POST /api/numeros/asignar (solo dueño) ────────────────
-// Asignar números fijos a un vendedor
 router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, rifa_id, numeros } = req.body;
 
@@ -307,7 +434,6 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   }
 
   try {
-    // Verificar que ninguno de los números esté ya asignado a OTRO vendedor en esta rifa
     const conflictos = await pool.query(
       `SELECT nv.numero, u.nombre AS vendedor_actual
        FROM numeros_vendedor nv
@@ -324,7 +450,7 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
         .join(', ');
       return res.status(409).json({
         error: 'NUMEROS_YA_ASIGNADOS',
-        message: `Los siguientes números ya pertenecen a otro vendedor: ${detalle}`
+        message: `Los siguientes números ya pertenecen a otro vendedor: ${detalle}`,
       });
     }
 
@@ -346,7 +472,6 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/numeros/asignar (solo dueño) ──────────────
-// Remover números asignados a un vendedor
 router.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, rifa_id, numeros } = req.body;
 
@@ -369,7 +494,6 @@ router.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── GET /api/numeros/ventas/historial ─────────────────────
-// Historial de ventas (dueño ve todo, vendedor solo las suyas)
 router.get('/ventas/historial', authMiddleware, async (req, res) => {
   const { rifa_id, page = 1, limit = 50 } = req.query;
   const offset = (page - 1) * limit;
@@ -399,7 +523,7 @@ router.get('/ventas/historial', authMiddleware, async (req, res) => {
     res.json({
       ventas: result.rows,
       page: parseInt(page),
-      limit: parseInt(limit)
+      limit: parseInt(limit),
     });
   } catch (err) {
     console.error('Error obteniendo historial:', err);
@@ -408,7 +532,6 @@ router.get('/ventas/historial', authMiddleware, async (req, res) => {
 });
 
 // ── DELETE /api/numeros/venta/:id (solo dueño) ────────────
-// Anular una venta
 router.delete('/venta/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const result = await pool.query(
@@ -421,7 +544,7 @@ router.delete('/venta/:id', authMiddleware, soloDueno, async (req, res) => {
     }
 
     res.json({
-      message: `Venta anulada. Número ${result.rows[0].numero} vuelve a estar disponible.`
+      message: `Venta anulada. Número ${result.rows[0].numero} vuelve a estar disponible.`,
     });
   } catch (err) {
     console.error('Error anulando venta:', err);

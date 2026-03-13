@@ -74,7 +74,6 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
   }
 
   try {
-    // Obtener todas las rifas activas
     const rifas = await pool.query('SELECT * FROM rifas WHERE activa = TRUE ORDER BY created_at');
 
     const disponibilidad = await Promise.all(
@@ -90,6 +89,31 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
         );
 
         const veces_vendido = ventas.rows.length;
+
+        // Si la rifa tiene números asignados a vendedores, verificar si este número
+        // está bloqueado para el vendedor actual
+        let bloqueadoPorOtro = false;
+        let vendedorPropietario = null;
+
+        if (req.user.rol === 'vendedor') {
+          const asignacion = await pool.query(
+            `SELECT nv.vendedor_id, u.nombre AS vendedor_nombre
+             FROM numeros_vendedor nv
+             JOIN users u ON u.id = nv.vendedor_id
+             WHERE nv.rifa_id = $1 AND nv.numero = $2`,
+            [rifa.id, numero]
+          );
+          if (asignacion.rows.length > 0) {
+            const propietario = asignacion.rows[0];
+            if (propietario.vendedor_id !== req.user.id) {
+              bloqueadoPorOtro = true;
+              vendedorPropietario = propietario.vendedor_nombre;
+            }
+          }
+        }
+
+        const disponible = veces_vendido < 2 && !bloqueadoPorOtro;
+
         return {
           rifa_id: rifa.id,
           rifa_nombre: rifa.nombre,
@@ -98,17 +122,19 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
           fecha_sorteo: rifa.fecha_sorteo,
           loteria_ref: rifa.loteria_ref,
           veces_vendido,
-          estado: veces_vendido === 0 ? 'disponible' : veces_vendido === 1 ? 'vendido_1' : 'agotado',
-          disponible: veces_vendido < 2,
+          estado: bloqueadoPorOtro
+            ? 'asignado_otro'
+            : veces_vendido === 0 ? 'disponible'
+            : veces_vendido === 1 ? 'vendido_1'
+            : 'agotado',
+          disponible,
+          bloqueado_por: vendedorPropietario,
           compradores: ventas.rows
         };
       })
     );
 
-    res.json({
-      numero,
-      rifas: disponibilidad
-    });
+    res.json({ numero, rifas: disponibilidad });
   } catch (err) {
     console.error('Error verificando número:', err);
     res.status(500).json({ error: 'Error del servidor' });
@@ -166,6 +192,31 @@ router.post('/vender', authMiddleware, async (req, res) => {
         message: `⛔ El número ${numero} ya fue vendido 2 veces y está AGOTADO en esta rifa`,
         veces_vendido: veces
       });
+    }
+
+    // Si el vendedor NO es dueño, verificar que el número le pertenezca
+    // (si hay números asignados en esta rifa, el vendedor solo puede vender los suyos)
+    if (req.user.rol === 'vendedor') {
+      const hayAsignados = await client.query(
+        `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`,
+        [rifa_id]
+      );
+      const rifaTieneAsignaciones = parseInt(hayAsignados.rows[0].total) > 0;
+
+      if (rifaTieneAsignaciones) {
+        const essuyo = await client.query(
+          `SELECT 1 FROM numeros_vendedor
+           WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3`,
+          [req.user.id, rifa_id, numero]
+        );
+        if (!essuyo.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'NUMERO_NO_ASIGNADO',
+            message: `⛔ El número ${numero} no está asignado a tu cartera. Solo puedes vender tus números asignados.`
+          });
+        }
+      }
     }
 
     // Obtener precio de la rifa
@@ -256,6 +307,27 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   }
 
   try {
+    // Verificar que ninguno de los números esté ya asignado a OTRO vendedor en esta rifa
+    const conflictos = await pool.query(
+      `SELECT nv.numero, u.nombre AS vendedor_actual
+       FROM numeros_vendedor nv
+       JOIN users u ON u.id = nv.vendedor_id
+       WHERE nv.rifa_id = $1
+         AND nv.numero = ANY($2)
+         AND nv.vendedor_id != $3`,
+      [rifa_id, numeros, vendedor_id]
+    );
+
+    if (conflictos.rows.length > 0) {
+      const detalle = conflictos.rows
+        .map(r => `${r.numero} (asignado a ${r.vendedor_actual})`)
+        .join(', ');
+      return res.status(409).json({
+        error: 'NUMEROS_YA_ASIGNADOS',
+        message: `Los siguientes números ya pertenecen a otro vendedor: ${detalle}`
+      });
+    }
+
     const values = numeros.map((n, i) => `($1, $2, $${i + 3})`).join(', ');
     const params = [vendedor_id, rifa_id, ...numeros];
 

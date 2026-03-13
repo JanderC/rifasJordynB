@@ -70,13 +70,6 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   }
 
   try {
-    const countResult = await pool.query(
-      `SELECT COUNT(*) FROM rifas WHERE activa = TRUE AND COALESCE(estado,'activa') != 'archivada'`
-    );
-    if (parseInt(countResult.rows[0].count) >= 2) {
-      return res.status(400).json({ error: 'Solo se permiten 2 rifas activas simultáneamente' });
-    }
-
     const result = await pool.query(
       `INSERT INTO rifas
          (nombre, descripcion, premio, precio, fecha_sorteo, loteria_ref,
@@ -104,17 +97,6 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   } = req.body;
 
   try {
-    if (activa === true) {
-      const countResult = await pool.query(
-        `SELECT COUNT(*) FROM rifas
-         WHERE activa = TRUE AND COALESCE(estado,'activa') != 'archivada' AND id != $1`,
-        [req.params.id]
-      );
-      if (parseInt(countResult.rows[0].count) >= 2) {
-        return res.status(400).json({ error: 'Solo se permiten 2 rifas activas simultáneamente' });
-      }
-    }
-
     // imagen_url: si el cliente envía explícitamente null la borramos;
     // si no la envía (undefined) mantenemos la que había.
     const imgValue = imagen_url !== undefined ? imagen_url : undefined;
@@ -166,7 +148,7 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
       });
     }
     await pool.query('DELETE FROM rifas WHERE id = $1', [req.params.id]);
-    res.json({ message: 'Rifa eliminada exitosamente' });
+    res.json({ message: 'Rifa eliminada exitosamente' });s
   } catch (err) {
     console.error('Error eliminando rifa:', err);
     res.status(500).json({ error: 'Error del servidor' });

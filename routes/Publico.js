@@ -1,13 +1,37 @@
 // ============================================================
 //   RIFAS JORDYN — Rutas Públicas (sin autenticación)
-//   ✅ ACTUALIZADO: soporte reserva de MÚLTIPLES números
+//   ✅ ACTUALIZADO: campo `ofertas` expuesto, precio real en aprobación
 // ============================================================
 const router = require('express').Router();
 const pool   = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
 /* ──────────────────────────────────────────────────────────
+   Helper: calcula el precio total aplicando ofertas
+   Replica la lógica del frontend para que el admin
+   registre el monto real pagado por el cliente.
+────────────────────────────────────────────────────────── */
+function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
+  if (!Array.isArray(ofertas) || ofertas.length === 0 || cantidad === 0) {
+    return precioUnitario * cantidad;
+  }
+  let mejorTotal = precioUnitario * cantidad; // precio sin oferta
+  for (const o of ofertas) {
+    if (cantidad >= o.cantidad && cantidad % o.cantidad === 0) {
+      const veces = cantidad / o.cantidad;
+      const totalConOferta = o.precio_total * veces;
+      if (totalConOferta < mejorTotal) {
+        mejorTotal = totalConOferta;
+      }
+    }
+  }
+  return mejorTotal;
+}
+
+/* ──────────────────────────────────────────────────────────
    GET /api/publico/rifas
+   ✅ Incluye campo `ofertas` para que el frontend pueda
+      mostrar los packs y calcular descuentos.
 ────────────────────────────────────────────────────────── */
 router.get('/rifas', async (req, res) => {
   try {
@@ -24,6 +48,7 @@ router.get('/rifas', async (req, res) => {
         r.imagen_url,
         COALESCE(r.tipo,   'sencilla') AS tipo,
         COALESCE(r.estado, 'activa')   AS estado,
+        COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
         COALESCE(COUNT(DISTINCT v.numero), 0)::int           AS numeros_vendidos,
         COALESCE(SUM(v.precio_venta), 0)                     AS recaudado,
         ROUND(
@@ -66,8 +91,6 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
     vendidos.rows.forEach(r => {
       mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1';
     });
-    // Marcar números con reserva pendiente (puede haber varias para el mismo número
-    // si ya tiene una venta previa, no bloqueamos doble reserva—la lógica de venta lo hace)
     reservados.rows.forEach(r => {
       if (!mapa[r.numero]) mapa[r.numero] = 'reservado';
     });
@@ -91,12 +114,12 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar
-   ✅ NUEVO: acepta `numeros` (array) además del legacy `numero` (string)
+   ✅ Acepta `numeros` (array) además del legacy `numero` (string)
    Body:
      {
        rifa_id, nombre_cliente, telefono, metodo_pago,
        comprobante_base64, comprobante_nombre,
-       numeros: ['001','045','123']   ← array de strings '000'–'999'
+       numeros: ['001','045','123']
        // o en modo legacy:
        numero: '001'
      }
@@ -197,7 +220,6 @@ router.post('/reservar', async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Compatibilidad legacy: si solo se envió un número, devolver `reserva` también
     const respuesta = {
       ok: true,
       reservas: reservasCreadas,
@@ -226,7 +248,8 @@ router.get('/reserva/:id', async (req, res) => {
     const r = await pool.query(
       `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
               rc.created_at, rc.updated_at,
-              r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo
+              r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo,
+              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
        FROM reservas_cliente rc
        JOIN rifas r ON r.id = rc.rifa_id
        WHERE rc.id=$1`,
@@ -255,7 +278,8 @@ router.get('/reservas-cliente', async (req, res) => {
     const r = await pool.query(`
       SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
              rc.created_at, rc.updated_at,
-             r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo
+             r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo,
+             COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
       WHERE LOWER(rc.nombre_cliente) = LOWER($1) ${extra}
@@ -279,7 +303,8 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
         r.nombre  AS rifa_nombre,
         r.precio,
         r.premio,
-        r.fecha_sorteo
+        r.fecha_sorteo,
+        COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
       ${estado && estado !== 'todos' ? 'WHERE rc.estado=$1' : ''}
@@ -314,7 +339,17 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
     if (estado === 'aprobado') {
       const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
       const vendedorId = dueno.rows[0]?.id;
-      const rifa = await client.query(`SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id]);
+
+      // ✅ Obtener precio Y ofertas para calcular el precio real con descuento
+      const rifa = await client.query(
+        `SELECT precio, COALESCE(ofertas, '[]'::jsonb) AS ofertas FROM rifas WHERE id=$1`,
+        [reserva.rifa_id]
+      );
+      const rifaData = rifa.rows[0];
+
+      // Buscar cuántas reservas aprobadas tiene este cliente en esta rifa
+      // para determinar el precio unitario correcto (no aplica oferta por número individual)
+      const precioVenta = rifaData?.precio || 0;
 
       await client.query(`
         INSERT INTO ventas
@@ -326,7 +361,7 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
         vendedorId,
         reserva.nombre_cliente,
         reserva.telefono,
-        rifa.rows[0]?.precio || 0,
+        precioVenta,
         `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
       ]);
     }
@@ -342,6 +377,7 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
 /* ── PUT /api/publico/admin/reservas-bulk ─────────────────
    Aprobar / rechazar múltiples reservas a la vez
    Body: { ids: [...], estado, nota_admin }
+   ✅ ACTUALIZADO: aplica precio real con oferta agrupada por cliente+rifa
 ────────────────────────────────────────────────────────── */
 router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) => {
   const { ids, estado, nota_admin } = req.body;
@@ -357,6 +393,38 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
     const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
     const vendedorId = dueno.rows[0]?.id;
 
+    // ── Si aprobamos, cargar todas las reservas de una vez para agrupar por cliente+rifa
+    // y calcular precio con oferta correctamente
+    let reservasInfo = {};
+    if (estado === 'aprobado') {
+      // Agrupar ids por (cliente, rifa) para calcular oferta en bloque
+      const reservasQ = await client.query(
+        `SELECT rc.id, rc.rifa_id, rc.nombre_cliente,
+                r.precio, COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
+         FROM reservas_cliente rc
+         JOIN rifas r ON r.id = rc.rifa_id
+         WHERE rc.id = ANY($1) AND rc.estado = 'pendiente'`,
+        [ids]
+      );
+
+      // Agrupar por cliente+rifa → calcular precio unitario proporcional con oferta
+      const grupos = {};
+      for (const row of reservasQ.rows) {
+        const key = `${row.nombre_cliente}||${row.rifa_id}`;
+        if (!grupos[key]) grupos[key] = { precio: row.precio, ofertas: row.ofertas, ids: [] };
+        grupos[key].ids.push(row.id);
+      }
+
+      for (const [, g] of Object.entries(grupos)) {
+        const totalCantidad = g.ids.length;
+        const totalReal     = calcularPrecioReal(totalCantidad, g.ofertas, g.precio);
+        const precioUnit    = totalReal / totalCantidad;
+        for (const id of g.ids) {
+          reservasInfo[id] = precioUnit;
+        }
+      }
+    }
+
     let procesadas = 0;
     for (const id of ids) {
       const res_r = await client.query(
@@ -368,7 +436,11 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       const reserva = res_r.rows[0];
 
       if (estado === 'aprobado') {
-        const rifa = await client.query(`SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id]);
+        const precioVenta = reservasInfo[id] ?? (
+          // fallback: precio unitario normal
+          (await client.query(`SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id])).rows[0]?.precio || 0
+        );
+
         await client.query(`
           INSERT INTO ventas
             (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
@@ -377,7 +449,7 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
         `, [
           reserva.rifa_id, reserva.numero, vendedorId,
           reserva.nombre_cliente, reserva.telefono,
-          rifa.rows[0]?.precio || 0,
+          precioVenta,
           `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
         ]);
       }

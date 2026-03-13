@@ -28,7 +28,8 @@ app.use('/api/numeros',    require('./routes/numeros'));
 app.use('/api/vendedores', require('./routes/vendedores'));
 app.use('/api/reportes',   require('./routes/reportes'));
 app.use('/api/caja',       require('./routes/caja'));
-app.use('/api/publico',    require('./routes/Publico'));   // ← rutas públicas cliente
+app.use('/api/publico',    require('./routes/Publico'));  
+app.use('/api/tasas', require('./routes/tasas'));
 
 // ── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {

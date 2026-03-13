@@ -196,4 +196,44 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
+
+// ── GET /api/rifas/:id/ticket-design ──────────────────────
+router.get('/:id/ticket-design', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT ticket_design FROM rifas WHERE id = $1',
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+    res.json({ ticket_design: result.rows[0].ticket_design || null });
+  } catch (err) {
+    console.error('Error obteniendo ticket design:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+// ── PUT /api/rifas/:id/ticket-design ──────────────────────
+router.put('/:id/ticket-design', authMiddleware, soloDueno, async (req, res) => {
+  const { ticket_design } = req.body;
+  if (!ticket_design || typeof ticket_design !== 'object')
+    return res.status(400).json({ error: 'ticket_design debe ser un objeto JSON' });
+  try {
+    const result = await pool.query(
+      `UPDATE rifas SET ticket_design = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING id, nombre, ticket_design`,
+      [JSON.stringify(ticket_design), req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+    res.json({
+      message: 'Diseño de ticket guardado',
+      rifa_id: result.rows[0].id,
+      rifa_nombre: result.rows[0].nombre,
+      ticket_design: result.rows[0].ticket_design,
+    });
+  } catch (err) {
+    console.error('Error guardando ticket design:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
 module.exports = router;

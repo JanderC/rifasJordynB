@@ -1,10 +1,7 @@
 // ============================================================
 //   RIFAS JORDYN — Rutas de Números
-//   ✅ ACTUALIZADO: endpoint POST /vender-bulk para múltiples números
-//   ✅ FIX PUNTO 3A: estado-global ahora soporta N rifas activas
-//      (antes hardcodeaba LIMIT 1 / OFFSET 1, rompiendo con 3+)
-//      La validación de agotado ya era correcta por rifa_id,
-//      pero la vista global ahora refleja todos los pares rifa×número.
+//   ✅ FIX PUNTO 3A: estado-global soporta N rifas activas
+//   ✅ NUEVO: cedula y correo en ventas directas
 // ============================================================
 const express = require('express');
 const router = express.Router();
@@ -15,78 +12,51 @@ const validarNumero = (num) => /^[0-9]{3}$/.test(num);
 
 /* ──────────────────────────────────────────────────────────
    GET /api/numeros/estado-global
-   ─────────────────────────────────────────────────────────
-   FIX PUNTO 3A — Rifas Simultáneas
-   ─────────────────────────────────────────────────────────
-   PROBLEMA ORIGINAL:
-     La query hardcodeaba dos subqueries con:
-       WHERE v.rifa_id = (SELECT id FROM rifas WHERE activa=TRUE ORDER BY created_at LIMIT 1)
-       WHERE v.rifa_id = (SELECT id FROM rifas WHERE activa=TRUE ORDER BY created_at OFFSET 1 LIMIT 1)
-     Esto asumía EXACTAMENTE 2 rifas activas. Con 3+ rifas:
-       - La rifa 3 quedaba invisible en el estado global.
-       - Un número vendido en rifa 3 se mostraba como "libre" en el grid.
-       - El estado_global resultante era incorrecto (solo calculaba rifa1 y rifa2).
 
-   SOLUCIÓN:
-     Reescribir la query para que funcione con cualquier número de rifas activas.
-     El estado_global por número ahora es:
-       - 'libre':           0 ventas en TODAS las rifas activas
-       - 'parcial_vendido': ≥1 número tiene 1 venta (pero ninguno agotado)
-       - 'parcial_agotado': ≥1 número agotado (2 ventas) pero no todos
-       - 'agotado_total':   TODOS los números están agotados en TODAS sus rifas
+   FIX: query reescrita para soportar cualquier número de rifas
+   activas sin ORDER BY dentro de CTEs (que causaba el 500).
 
-     NOTA IMPORTANTE sobre la lógica de negocio:
-     El número "001" puede venderse hasta 2 veces EN CADA rifa activa de forma independiente.
-     Eso es correcto — rifas diferentes son productos diferentes.
-     El estado_global es solo para el DISPLAY del grid admin (colores/labels),
-     NO para controlar si se puede vender (eso lo hace POST /vender por rifa_id).
+   La CTE rifas_activas usa ROW_NUMBER() OVER (ORDER BY created_at)
+   directamente, sin referenciar esa columna en el SELECT final.
 ────────────────────────────────────────────────────────── */
 router.get('/estado-global', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(`
-      WITH rifas_activas AS (
-        -- Obtener todas las rifas activas (sin límite hardcodeado)
-        SELECT id AS rifa_id, nombre
+      WITH
+      rifas_activas AS (
+        SELECT id AS rifa_id,
+               ROW_NUMBER() OVER (ORDER BY created_at) AS rn
         FROM rifas
         WHERE activa = TRUE
-        ORDER BY created_at
       ),
-      numeros_serie AS (
-        -- Generar el rango 000–999
-        SELECT LPAD(gs::text, 3, '0') AS numero
-        FROM generate_series(0, 999) gs
-      ),
-      ventas_por_rifa_numero AS (
-        -- Contar ventas de cada número en cada rifa activa
-        SELECT
-          v.numero,
-          v.rifa_id,
-          COUNT(*) AS veces
+      ventas_agg AS (
+        SELECT v.numero,
+               v.rifa_id,
+               COUNT(*)::int AS veces
         FROM ventas v
-        WHERE v.rifa_id IN (SELECT rifa_id FROM rifas_activas)
+        INNER JOIN rifas_activas ra ON ra.rifa_id = v.rifa_id
         GROUP BY v.numero, v.rifa_id
       ),
-      estado_por_numero AS (
-        -- Para cada número, calcular estado global considerando TODAS las rifas activas
+      total_rifas_cte AS (
+        SELECT COUNT(*)::int AS total FROM rifas_activas
+      ),
+      estado AS (
         SELECT
           n.numero,
-          COUNT(ra.rifa_id)                                        AS total_rifas,
-          COALESCE(SUM(vpn.veces), 0)                              AS total_ventas_globales,
-          COUNT(CASE WHEN COALESCE(vpn.veces, 0) >= 2 THEN 1 END) AS rifas_agotadas,
-          COUNT(CASE WHEN COALESCE(vpn.veces, 0) = 1  THEN 1 END) AS rifas_con_1_venta,
-          COUNT(CASE WHEN COALESCE(vpn.veces, 0) = 0  THEN 1 END) AS rifas_libres,
-          -- Datos de las primeras dos rifas para compatibilidad con el frontend existente
-          MAX(CASE WHEN ra_ord.rn = 1 THEN COALESCE(vpn.veces, 0) END) AS rifa1_vendido,
-          MAX(CASE WHEN ra_ord.rn = 2 THEN COALESCE(vpn.veces, 0) END) AS rifa2_vendido
-        FROM numeros_serie n
+          tr.total                                                       AS total_rifas,
+          COALESCE(SUM(va.veces), 0)::int                               AS total_ventas_globales,
+          COUNT(CASE WHEN COALESCE(va.veces, 0) >= 2 THEN 1 END)::int  AS rifas_agotadas,
+          COUNT(CASE WHEN COALESCE(va.veces, 0) = 1  THEN 1 END)::int  AS rifas_con_1_venta,
+          COALESCE(MAX(CASE WHEN ra.rn = 1 THEN va.veces END), 0)::int AS rifa1_vendido,
+          COALESCE(MAX(CASE WHEN ra.rn = 2 THEN va.veces END), 0)::int AS rifa2_vendido
+        FROM (
+          SELECT LPAD(gs::text, 3, '0') AS numero
+          FROM generate_series(0, 999) gs
+        ) n
         CROSS JOIN rifas_activas ra
-        LEFT JOIN ventas_por_rifa_numero vpn
-          ON vpn.numero = n.numero AND vpn.rifa_id = ra.rifa_id
-        LEFT JOIN (
-          SELECT rifa_id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
-          FROM rifas_activas
-        ) ra_ord ON ra_ord.rifa_id = ra.rifa_id
-        GROUP BY n.numero
+        CROSS JOIN total_rifas_cte tr
+        LEFT JOIN ventas_agg va ON va.numero = n.numero AND va.rifa_id = ra.rifa_id
+        GROUP BY n.numero, tr.total
       )
       SELECT
         numero,
@@ -94,31 +64,25 @@ router.get('/estado-global', authMiddleware, async (req, res) => {
         total_ventas_globales,
         rifas_agotadas,
         rifas_con_1_venta,
-        rifas_libres,
-        -- Compatibilidad con el frontend que espera rifa1_vendido / rifa2_vendido
-        COALESCE(rifa1_vendido, 0)::int AS rifa1_vendido,
+        rifa1_vendido,
         CASE
-          WHEN COALESCE(rifa1_vendido, 0) = 0 THEN 'disponible'
-          WHEN COALESCE(rifa1_vendido, 0) = 1 THEN 'vendido_1'
+          WHEN rifa1_vendido = 0 THEN 'disponible'
+          WHEN rifa1_vendido = 1 THEN 'vendido_1'
           ELSE 'agotado'
         END AS rifa1_estado,
-        COALESCE(rifa2_vendido, 0)::int AS rifa2_vendido,
+        rifa2_vendido,
         CASE
-          WHEN COALESCE(rifa2_vendido, 0) = 0 THEN 'disponible'
-          WHEN COALESCE(rifa2_vendido, 0) = 1 THEN 'vendido_1'
+          WHEN rifa2_vendido = 0 THEN 'disponible'
+          WHEN rifa2_vendido = 1 THEN 'vendido_1'
           ELSE 'agotado'
         END AS rifa2_estado,
-        -- Estado global calculado sobre TODAS las rifas activas
         CASE
-          WHEN total_ventas_globales = 0
-            THEN 'libre'
-          WHEN rifas_agotadas = total_rifas
-            THEN 'agotado_total'
-          WHEN rifas_agotadas > 0
-            THEN 'parcial_agotado'
+          WHEN total_ventas_globales = 0    THEN 'libre'
+          WHEN rifas_agotadas = total_rifas THEN 'agotado_total'
+          WHEN rifas_agotadas > 0           THEN 'parcial_agotado'
           ELSE 'parcial_vendido'
         END AS estado_global
-      FROM estado_por_numero
+      FROM estado
       ORDER BY numero
     `);
 
@@ -143,7 +107,7 @@ router.get('/verificar/:numero', authMiddleware, async (req, res) => {
     const disponibilidad = await Promise.all(
       rifas.rows.map(async (rifa) => {
         const ventas = await pool.query(
-          `SELECT v.id, v.nombre_comprador, v.telefono, v.created_at,
+          `SELECT v.id, v.nombre_comprador, v.telefono, v.cedula, v.created_at,
                   u.nombre AS nombre_vendedor
            FROM ventas v
            JOIN users u ON u.id = v.vendedor_id
@@ -211,7 +175,6 @@ router.get('/rifa/:rifa_id', authMiddleware, async (req, res) => {
        WHERE rifa_id = $1`,
       [req.params.rifa_id]
     );
-
     res.json(result.rows);
   } catch (err) {
     console.error('Error obteniendo números de rifa:', err);
@@ -220,12 +183,9 @@ router.get('/rifa/:rifa_id', authMiddleware, async (req, res) => {
 });
 
 // ── POST /api/numeros/vender ───────────────────────────────
-// Vender un único número
-// FIX PUNTO 3A: La validación ya era correcta — usa rifa_id en el WHERE,
-// por lo tanto el mismo número puede venderse en rifas distintas.
-// Solo se bloquea si ESA rifa_id ya tiene 2 ventas de ESE número.
+// NUEVO: acepta cedula y correo para ventas directas desde el admin
 router.post('/vender', authMiddleware, async (req, res) => {
-  const { rifa_id, numero, nombre_comprador, telefono, observacion } = req.body;
+  const { rifa_id, numero, nombre_comprador, cedula, correo, telefono, observacion } = req.body;
 
   if (!rifa_id || !numero || !nombre_comprador) {
     return res.status(400).json({ error: 'rifa_id, numero y nombre_comprador son requeridos' });
@@ -240,12 +200,10 @@ router.post('/vender', authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Contar ventas de ESTE número en ESTA rifa (correcto: scoped por rifa_id)
     const checkResult = await client.query(
       `SELECT COUNT(*) AS veces FROM ventas WHERE rifa_id = $1 AND numero = $2`,
       [rifa_id, numero]
     );
-
     const veces = parseInt(checkResult.rows[0].veces);
 
     if (veces >= 2) {
@@ -262,12 +220,9 @@ router.post('/vender', authMiddleware, async (req, res) => {
         `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`,
         [rifa_id]
       );
-      const rifaTieneAsignaciones = parseInt(hayAsignados.rows[0].total) > 0;
-
-      if (rifaTieneAsignaciones) {
+      if (parseInt(hayAsignados.rows[0].total) > 0) {
         const essuyo = await client.query(
-          `SELECT 1 FROM numeros_vendedor
-           WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3`,
+          `SELECT 1 FROM numeros_vendedor WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3`,
           [req.user.id, rifa_id, numero]
         );
         if (!essuyo.rows[0]) {
@@ -286,9 +241,6 @@ router.post('/vender', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
 
-    // NUEVO: desestructura cedula y correo del body para ventas directas desde el admin
-    const { cedula: cedulaVenta, correo: correoVenta } = req.body;
-
     const venta = await client.query(
       `INSERT INTO ventas
          (rifa_id, numero, vendedor_id, nombre_comprador,
@@ -298,11 +250,11 @@ router.post('/vender', authMiddleware, async (req, res) => {
       [
         rifa_id, numero, req.user.id,
         nombre_comprador.trim(),
-        cedulaVenta?.trim() || null,
-        correoVenta?.trim() || null,
-        telefono || null,
+        cedula?.trim()  || null,
+        correo?.trim()  || null,
+        telefono        || null,
         rifaResult.rows[0].precio,
-        observacion || null,
+        observacion     || null,
       ]
     );
 
@@ -331,30 +283,22 @@ router.post('/vender', authMiddleware, async (req, res) => {
   }
 });
 
-/* ── POST /api/numeros/vender-bulk ───────────────────────────
-   Registrar venta de MÚLTIPLES números en una transacción
-   FIX PUNTO 3A: igual que /vender, la validación ya era scoped
-   por rifa_id — se mantiene. Solo se mejora el mensaje de error.
-─────────────────────────────────────────────────────────── */
+/* ── POST /api/numeros/vender-bulk ───────────────────────── */
 router.post('/vender-bulk', authMiddleware, async (req, res) => {
   const { rifa_id, numeros, nombre_comprador, cedula, correo, telefono, observacion } = req.body;
 
-  if (!rifa_id || !nombre_comprador) {
+  if (!rifa_id || !nombre_comprador)
     return res.status(400).json({ error: 'rifa_id y nombre_comprador son requeridos' });
-  }
 
-  if (!Array.isArray(numeros) || numeros.length === 0) {
+  if (!Array.isArray(numeros) || numeros.length === 0)
     return res.status(400).json({ error: 'numeros[] debe ser un array no vacío' });
-  }
 
-  if (numeros.length > 100) {
+  if (numeros.length > 100)
     return res.status(400).json({ error: 'Máximo 100 números por operación' });
-  }
 
   const invalidos = numeros.filter(n => !validarNumero(n));
-  if (invalidos.length > 0) {
+  if (invalidos.length > 0)
     return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
-  }
 
   const numerosUnicos = [...new Set(numeros)];
   const client = await pool.connect();
@@ -369,12 +313,10 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
     }
     const precioBoleto = rifaResult.rows[0].precio;
 
-    // Si el vendedor tiene asignaciones, verificar de antemano
     let numerosPermitidos = new Set(numerosUnicos);
     if (req.user.rol === 'vendedor') {
       const hayAsignados = await client.query(
-        `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`,
-        [rifa_id]
+        `SELECT COUNT(*) AS total FROM numeros_vendedor WHERE rifa_id = $1`, [rifa_id]
       );
       if (parseInt(hayAsignados.rows[0].total) > 0) {
         const asignados = await client.query(
@@ -385,11 +327,8 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
       }
     }
 
-    // Obtener estado actual de todos los números EN ESTA RIFA en una sola consulta
-    // (scoped por rifa_id — correcto para rifas simultáneas)
     const estadoActual = await client.query(
-      `SELECT numero, COUNT(*) AS veces
-       FROM ventas
+      `SELECT numero, COUNT(*) AS veces FROM ventas
        WHERE rifa_id = $1 AND numero = ANY($2)
        GROUP BY numero`,
       [rifa_id, numerosUnicos]
@@ -402,16 +341,12 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
 
     for (const numero of numerosUnicos) {
       if (!numerosPermitidos.has(numero) && req.user.rol === 'vendedor') {
-        fallidos.push({ numero, razon: 'no_asignado' });
-        continue;
+        fallidos.push({ numero, razon: 'no_asignado' }); continue;
       }
-
       const veces = vecesMap[numero] || 0;
       if (veces >= 2) {
-        fallidos.push({ numero, razon: 'agotado' });
-        continue;
+        fallidos.push({ numero, razon: 'agotado' }); continue;
       }
-
       try {
         const venta = await client.query(
           `INSERT INTO ventas
@@ -422,11 +357,11 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
           [
             rifa_id, numero, req.user.id,
             nombre_comprador.trim(),
-            cedula?.trim() || null,
-            correo?.trim() || null,
-            telefono || null,
+            cedula?.trim()  || null,
+            correo?.trim()  || null,
+            telefono        || null,
             precioBoleto,
-            observacion || `Venta múltiple`,
+            observacion     || `Venta múltiple`,
           ]
         );
         vendidos.push({ numero, estado: veces + 1 >= 2 ? 'agotado' : 'vendido_1', venta: venta.rows[0] });
@@ -438,18 +373,13 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
 
     if (vendidos.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: 'Ningún número pudo venderse',
-        fallidos,
-      });
+      return res.status(409).json({ error: 'Ningún número pudo venderse', fallidos });
     }
 
     await client.query('COMMIT');
-
     res.status(201).json({
       message: `✅ ${vendidos.length} número(s) vendidos exitosamente`,
-      vendidos,
-      fallidos,
+      vendidos, fallidos,
       total_vendido: vendidos.length,
       total_fallido: fallidos.length,
     });
@@ -482,7 +412,6 @@ router.get('/vendedor/mis-numeros', authMiddleware, async (req, res) => {
        ORDER BY nv.rifa_id, nv.numero`,
       [req.user.id]
     );
-
     res.json(result.rows);
   } catch (err) {
     console.error('Error obteniendo mis números:', err);
@@ -494,30 +423,24 @@ router.get('/vendedor/mis-numeros', authMiddleware, async (req, res) => {
 router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, rifa_id, numeros } = req.body;
 
-  if (!vendedor_id || !rifa_id || !Array.isArray(numeros) || numeros.length === 0) {
+  if (!vendedor_id || !rifa_id || !Array.isArray(numeros) || numeros.length === 0)
     return res.status(400).json({ error: 'vendedor_id, rifa_id y numeros[] son requeridos' });
-  }
 
   const numerosInvalidos = numeros.filter(n => !validarNumero(n));
-  if (numerosInvalidos.length > 0) {
+  if (numerosInvalidos.length > 0)
     return res.status(400).json({ error: `Números inválidos: ${numerosInvalidos.join(', ')}` });
-  }
 
   try {
     const conflictos = await pool.query(
       `SELECT nv.numero, u.nombre AS vendedor_actual
        FROM numeros_vendedor nv
        JOIN users u ON u.id = nv.vendedor_id
-       WHERE nv.rifa_id = $1
-         AND nv.numero = ANY($2)
-         AND nv.vendedor_id != $3`,
+       WHERE nv.rifa_id = $1 AND nv.numero = ANY($2) AND nv.vendedor_id != $3`,
       [rifa_id, numeros, vendedor_id]
     );
 
     if (conflictos.rows.length > 0) {
-      const detalle = conflictos.rows
-        .map(r => `${r.numero} (asignado a ${r.vendedor_actual})`)
-        .join(', ');
+      const detalle = conflictos.rows.map(r => `${r.numero} (asignado a ${r.vendedor_actual})`).join(', ');
       return res.status(409).json({
         error: 'NUMEROS_YA_ASIGNADOS',
         message: `Los siguientes números ya pertenecen a otro vendedor: ${detalle}`,
@@ -525,13 +448,11 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
     }
 
     const values = numeros.map((n, i) => `($1, $2, $${i + 3})`).join(', ');
-    const params = [vendedor_id, rifa_id, ...numeros];
-
     await pool.query(
       `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
        VALUES ${values}
        ON CONFLICT (vendedor_id, rifa_id, numero) DO NOTHING`,
-      params
+      [vendedor_id, rifa_id, ...numeros]
     );
 
     res.json({ message: `${numeros.length} número(s) asignados al vendedor` });
@@ -545,17 +466,14 @@ router.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
 router.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, rifa_id, numeros } = req.body;
 
-  if (!vendedor_id || !rifa_id || !Array.isArray(numeros)) {
+  if (!vendedor_id || !rifa_id || !Array.isArray(numeros))
     return res.status(400).json({ error: 'vendedor_id, rifa_id y numeros[] son requeridos' });
-  }
 
   try {
     await pool.query(
-      `DELETE FROM numeros_vendedor
-       WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = ANY($3)`,
+      `DELETE FROM numeros_vendedor WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = ANY($3)`,
       [vendedor_id, rifa_id, numeros]
     );
-
     res.json({ message: 'Números removidos del vendedor' });
   } catch (err) {
     console.error('Error removiendo números:', err);
@@ -576,7 +494,6 @@ router.get('/ventas/historial', authMiddleware, async (req, res) => {
       params.push(rifa_id);
       whereClause += ` AND v.rifa_id = $${params.length}`;
     }
-
     params.push(limit, offset);
 
     const result = await pool.query(
@@ -590,11 +507,7 @@ router.get('/ventas/historial', authMiddleware, async (req, res) => {
       params
     );
 
-    res.json({
-      ventas: result.rows,
-      page: parseInt(page),
-      limit: parseInt(limit),
-    });
+    res.json({ ventas: result.rows, page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
     console.error('Error obteniendo historial:', err);
     res.status(500).json({ error: 'Error del servidor' });
@@ -608,14 +521,8 @@ router.delete('/venta/:id', authMiddleware, soloDueno, async (req, res) => {
       'DELETE FROM ventas WHERE id = $1 RETURNING numero, rifa_id',
       [req.params.id]
     );
-
-    if (!result.rows[0]) {
-      return res.status(404).json({ error: 'Venta no encontrada' });
-    }
-
-    res.json({
-      message: `Venta anulada. Número ${result.rows[0].numero} vuelve a estar disponible.`,
-    });
+    if (!result.rows[0]) return res.status(404).json({ error: 'Venta no encontrada' });
+    res.json({ message: `Venta anulada. Número ${result.rows[0].numero} vuelve a estar disponible.` });
   } catch (err) {
     console.error('Error anulando venta:', err);
     res.status(500).json({ error: 'Error del servidor' });

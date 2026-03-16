@@ -30,6 +30,7 @@ app.use('/api/reportes',   require('./routes/reportes'));
 app.use('/api/caja',       require('./routes/caja'));
 app.use('/api/publico',    require('./routes/Publico'));  
 app.use('/api/tasas', require('./routes/tasas'));
+app.use('/api/ticket-design', require('./routes/ticketDesign'));
 
 // ── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {

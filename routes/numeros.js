@@ -286,11 +286,24 @@ router.post('/vender', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
 
+    // NUEVO: desestructura cedula y correo del body para ventas directas desde el admin
+    const { cedula: cedulaVenta, correo: correoVenta } = req.body;
+
     const venta = await client.query(
-      `INSERT INTO ventas (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO ventas
+         (rifa_id, numero, vendedor_id, nombre_comprador,
+          cedula, correo, telefono, precio_venta, observacion)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [rifa_id, numero, req.user.id, nombre_comprador.trim(), telefono || null, rifaResult.rows[0].precio, observacion || null]
+      [
+        rifa_id, numero, req.user.id,
+        nombre_comprador.trim(),
+        cedulaVenta?.trim() || null,
+        correoVenta?.trim() || null,
+        telefono || null,
+        rifaResult.rows[0].precio,
+        observacion || null,
+      ]
     );
 
     const nuevasVeces = veces + 1;
@@ -324,7 +337,7 @@ router.post('/vender', authMiddleware, async (req, res) => {
    por rifa_id — se mantiene. Solo se mejora el mensaje de error.
 ─────────────────────────────────────────────────────────── */
 router.post('/vender-bulk', authMiddleware, async (req, res) => {
-  const { rifa_id, numeros, nombre_comprador, telefono, observacion } = req.body;
+  const { rifa_id, numeros, nombre_comprador, cedula, correo, telefono, observacion } = req.body;
 
   if (!rifa_id || !nombre_comprador) {
     return res.status(400).json({ error: 'rifa_id y nombre_comprador son requeridos' });
@@ -402,12 +415,15 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
       try {
         const venta = await client.query(
           `INSERT INTO ventas
-             (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (rifa_id, numero, vendedor_id, nombre_comprador,
+              cedula, correo, telefono, precio_venta, observacion)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING *`,
           [
             rifa_id, numero, req.user.id,
             nombre_comprador.trim(),
+            cedula?.trim() || null,
+            correo?.trim() || null,
             telefono || null,
             precioBoleto,
             observacion || `Venta múltiple`,

@@ -2,97 +2,45 @@
 //   RIFAS JORDYN — Rutas Públicas (sin autenticación)
 //   ✅ ACTUALIZADO: campo `ofertas` expuesto, precio real en aprobación
 //   ✅ FIX PUNTO 1: fecha_sorteo devuelta como ISO 8601 con to_char()
-//      para evitar desfases de zona horaria en el frontend.
+//   ✅ NUEVO: cedula (obligatoria) y correo (opcional) en reservas y ventas
 // ============================================================
 const router = require('express').Router();
 const pool   = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
-/* ──────────────────────────────────────────────────────────
-   Helper: calcula el precio total aplicando ofertas
-   Replica la lógica del frontend para que el admin
-   registre el monto real pagado por el cliente.
-────────────────────────────────────────────────────────── */
 function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
-  if (!Array.isArray(ofertas) || ofertas.length === 0 || cantidad === 0) {
+  if (!Array.isArray(ofertas) || ofertas.length === 0 || cantidad === 0)
     return precioUnitario * cantidad;
-  }
-  let mejorTotal = precioUnitario * cantidad; // precio sin oferta
+  let mejorTotal = precioUnitario * cantidad;
   for (const o of ofertas) {
     if (cantidad >= o.cantidad && cantidad % o.cantidad === 0) {
-      const veces = cantidad / o.cantidad;
-      const totalConOferta = o.precio_total * veces;
-      if (totalConOferta < mejorTotal) {
-        mejorTotal = totalConOferta;
-      }
+      const total = o.precio_total * (cantidad / o.cantidad);
+      if (total < mejorTotal) mejorTotal = total;
     }
   }
   return mejorTotal;
 }
 
-/*
-  FIX PUNTO 1 — HELPER SQL para fecha_sorteo
-  ─────────────────────────────────────────────────────────
-  Problema original:
-    El campo fecha_sorteo salía de PostgreSQL como un objeto
-    Date serializado sin zona horaria explícita, p.ej.:
-      "2025-07-15T08:00:00.000Z"
-    El frontend lo parseaba con new Date(f) que en algunos
-    navegadores (Safari, Firefox) falla con strings "YYYY-MM-DD HH:MM:SS"
-    (con espacio, sin T), devolviendo NaN y rompiendo el countdown.
-
-  Solución:
-    Usamos to_char() en cada SELECT para emitir siempre un string
-    ISO 8601 limpio: "2025-07-15T08:00:00Z"
-
-  ⚠️ ZONA HORARIA:
-    Si tu columna fecha_sorteo almacena la hora en UTC y quieres
-    mostrarla en UTC:
-      to_char(r.fecha_sorteo AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-
-    Si tu columna almacena la hora en hora local (Venezuela UTC-4)
-    y NO quieres conversión:
-      to_char(r.fecha_sorteo, 'YYYY-MM-DD"T"HH24:MI:SS')
-
-    El valor por defecto aquí es WITHOUT TIME ZONE (sin conversión),
-    que es el más común en instalaciones sin configuración de TZ.
-    Cámbialo según tu setup.
-─────────────────────────────────────────────────────────
-*/
 const FECHA_SQL = (alias = 'r') =>
   `to_char(${alias}.fecha_sorteo, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_sorteo`;
 
-/* ──────────────────────────────────────────────────────────
-   GET /api/publico/rifas
-   ✅ Incluye campo `ofertas` para que el frontend pueda
-      mostrar los packs y calcular descuentos.
-   ✅ FIX: fecha_sorteo como ISO string limpio
-────────────────────────────────────────────────────────── */
+/* ── GET /api/publico/rifas ─────────────────────────────── */
 router.get('/rifas', async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT
-        r.id,
-        r.nombre,
-        r.descripcion,
-        r.premio,
-        r.precio,
+        r.id, r.nombre, r.descripcion, r.premio, r.precio,
         ${FECHA_SQL('r')},
-        r.loteria_ref,
-        r.activa,
-        r.imagen_url,
+        r.loteria_ref, r.activa, r.imagen_url,
         COALESCE(r.tipo,   'sencilla') AS tipo,
         COALESCE(r.estado, 'activa')   AS estado,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
-        COALESCE(COUNT(DISTINCT v.numero), 0)::int           AS numeros_vendidos,
-        COALESCE(SUM(v.precio_venta), 0)                     AS recaudado,
-        ROUND(
-          COALESCE(COUNT(DISTINCT v.numero), 0)::numeric / 10, 2
-        )                                                    AS porcentaje
+        COALESCE(COUNT(DISTINCT v.numero), 0)::int AS numeros_vendidos,
+        COALESCE(SUM(v.precio_venta), 0)           AS recaudado,
+        ROUND(COALESCE(COUNT(DISTINCT v.numero), 0)::numeric / 10, 2) AS porcentaje
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id
-      WHERE r.activa = TRUE
-        AND COALESCE(r.estado, 'activa') != 'archivada'
+      WHERE r.activa = TRUE AND COALESCE(r.estado, 'activa') != 'archivada'
       GROUP BY r.id
       ORDER BY r.created_at DESC
     `);
@@ -103,83 +51,58 @@ router.get('/rifas', async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────
-   GET /api/publico/rifas/:id/numeros-disponibles
-────────────────────────────────────────────────────────── */
+/* ── GET /api/publico/rifas/:id/numeros-disponibles ─────── */
 router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
   try {
-    const vendidos = await pool.query(
-      `SELECT numero, COUNT(*) AS veces FROM ventas WHERE rifa_id=$1 GROUP BY numero`,
-      [req.params.id]
-    );
-    const reservados = await pool.query(
-      `SELECT numero FROM reservas_cliente
-       WHERE rifa_id=$1 AND estado='pendiente'`,
-      [req.params.id]
-    );
-    const asignadosVendedor = await pool.query(
-      `SELECT numero FROM numeros_vendedor WHERE rifa_id=$1`,
-      [req.params.id]
-    );
+    const vendidos          = await pool.query(`SELECT numero, COUNT(*) AS veces FROM ventas WHERE rifa_id=$1 GROUP BY numero`, [req.params.id]);
+    const reservados        = await pool.query(`SELECT numero FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente'`, [req.params.id]);
+    const asignadosVendedor = await pool.query(`SELECT numero FROM numeros_vendedor WHERE rifa_id=$1`, [req.params.id]);
 
     const mapa = {};
-    vendidos.rows.forEach(r => {
-      mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1';
-    });
-    reservados.rows.forEach(r => {
-      if (!mapa[r.numero]) mapa[r.numero] = 'reservado';
-    });
-    asignadosVendedor.rows.forEach(r => {
-      if (!mapa[r.numero]) mapa[r.numero] = 'vendedor';
-    });
+    vendidos.rows.forEach(r => { mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1'; });
+    reservados.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'reservado'; });
+    asignadosVendedor.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'vendedor'; });
 
     const numeros = [];
     for (let i = 0; i < 1000; i++) {
       const n = String(i).padStart(3, '0');
       const estado = mapa[n] || 'disponible';
-      if (estado !== 'vendedor') {
-        numeros.push({ numero: n, estado });
-      }
+      if (estado !== 'vendedor') numeros.push({ numero: n, estado });
     }
     res.json(numeros);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar
-   ✅ Acepta `numeros` (array) además del legacy `numero` (string)
+   NUEVO: acepta cedula (obligatoria) y correo (opcional)
    Body:
      {
-       rifa_id, nombre_cliente, telefono, metodo_pago,
+       rifa_id, nombre_cliente,
+       cedula,            ← NUEVO obligatorio
+       correo,            ← NUEVO opcional
+       telefono, metodo_pago,
        comprobante_base64, comprobante_nombre,
-       numeros: ['001','045','123']
-       // o en modo legacy:
-       numero: '001'
+       numeros: ['001','045']
      }
-   Respuesta:
-     { ok, reservas: [...], mensaje }
 ────────────────────────────────────────────────────────── */
 router.post('/reservar', async (req, res) => {
   const {
-    rifa_id,
-    nombre_cliente,
-    telefono,
-    metodo_pago,
-    comprobante_base64,
-    comprobante_nombre,
+    rifa_id, nombre_cliente,
+    cedula, correo,
+    telefono, metodo_pago,
+    comprobante_base64, comprobante_nombre,
   } = req.body;
 
-  // Soporte legacy (numero string) y nuevo (numeros array)
   let numeros = req.body.numeros;
-  if (!numeros && req.body.numero) {
-    numeros = [req.body.numero];
-  }
+  if (!numeros && req.body.numero) numeros = [req.body.numero];
 
-  // ── Validaciones básicas ──────────────────────────────
+  // ── Validaciones ─────────────────────────────────────
   if (!rifa_id || !nombre_cliente)
     return res.status(400).json({ error: 'rifa_id y nombre_cliente son requeridos' });
+
+  if (!cedula || !cedula.trim())
+    return res.status(400).json({ error: 'La cédula es obligatoria' });
 
   if (!numeros || !Array.isArray(numeros) || numeros.length === 0)
     return res.status(400).json({ error: 'Debes seleccionar al menos un número' });
@@ -191,99 +114,87 @@ router.post('/reservar', async (req, res) => {
   if (invalidos.length > 0)
     return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
 
-  // Eliminar duplicados
-  const numerosUnicos = [...new Set(numeros)];
+  if (correo && correo.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo.trim()))
+    return res.status(400).json({ error: 'El correo electrónico no tiene un formato válido' });
 
   if (!comprobante_base64)
     return res.status(400).json({ error: 'El comprobante de pago es obligatorio para reservar' });
 
+  const numerosUnicos = [...new Set(numeros)];
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
 
     const reservasCreadas = [];
-    const conflictos = [];
+    const conflictos      = [];
 
     for (const numero of numerosUnicos) {
-      // Verificar si está agotado (2 ventas)
       const vendidos = await client.query(
         `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
         [rifa_id, numero]
       );
       if (parseInt(vendidos.rows[0].count) >= 2) {
-        conflictos.push({ numero, razon: 'agotado' });
-        continue;
+        conflictos.push({ numero, razon: 'agotado' }); continue;
       }
 
-      // Verificar si ya tiene reserva pendiente
       const reservaExiste = await client.query(
         `SELECT id FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`,
         [rifa_id, numero]
       );
       if (reservaExiste.rows.length > 0) {
-        conflictos.push({ numero, razon: 'reserva_pendiente' });
-        continue;
+        conflictos.push({ numero, razon: 'reserva_pendiente' }); continue;
       }
 
-      // Crear la reserva
       const r = await client.query(`
         INSERT INTO reservas_cliente
-          (rifa_id, numero, nombre_cliente, telefono, metodo_pago,
-           comprobante_base64, comprobante_nombre)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
-        RETURNING id, numero, nombre_cliente, estado, created_at
+          (rifa_id, numero, nombre_cliente, cedula, correo,
+           telefono, metodo_pago, comprobante_base64, comprobante_nombre)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING id, numero, nombre_cliente, cedula, correo, estado, created_at
       `, [
-        rifa_id,
-        numero,
+        rifa_id, numero,
         nombre_cliente.trim(),
-        telefono || null,
-        metodo_pago || null,
+        cedula.trim(),
+        correo?.trim() || null,
+        telefono       || null,
+        metodo_pago    || null,
         comprobante_base64,
         comprobante_nombre || null,
       ]);
       reservasCreadas.push(r.rows[0]);
     }
 
-    // Si todos los números tuvieron conflicto, rollback
     if (reservasCreadas.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: 'Ningún número pudo reservarse',
-        conflictos,
-      });
+      return res.status(409).json({ error: 'Ningún número pudo reservarse', conflictos });
     }
 
     await client.query('COMMIT');
 
     const respuesta = {
-      ok: true,
-      reservas: reservasCreadas,
+      ok: true, reservas: reservasCreadas,
       total_reservados: reservasCreadas.length,
       mensaje: reservasCreadas.length === 1
         ? '¡Reserva enviada! El administrador verificará tu pago pronto.'
         : `¡${reservasCreadas.length} números reservados! El administrador verificará tu pago pronto.`,
     };
     if (conflictos.length > 0) respuesta.conflictos = conflictos;
-    if (reservasCreadas.length === 1) respuesta.reserva = reservasCreadas[0]; // legacy
+    if (reservasCreadas.length === 1) respuesta.reserva = reservasCreadas[0];
 
     res.status(201).json(respuesta);
   } catch (e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
-/* ──────────────────────────────────────────────────────────
-   GET /api/publico/reserva/:id
-   FIX: fecha_sorteo como ISO string limpio
-────────────────────────────────────────────────────────── */
+/* ── GET /api/publico/reserva/:id ───────────────────────── */
 router.get('/reserva/:id', async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
-              rc.created_at, rc.updated_at,
+      `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.cedula, rc.correo,
+              rc.estado, rc.nota_admin, rc.created_at, rc.updated_at,
               r.nombre AS rifa_nombre, r.premio, r.precio,
               ${FECHA_SQL('r')},
               COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
@@ -297,25 +208,19 @@ router.get('/reserva/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ──────────────────────────────────────────────────────────
-   GET /api/publico/reservas-cliente
-   Busca TODAS las reservas de un cliente por nombre + rifa
-   Query params: nombre_cliente, rifa_id
-   FIX: fecha_sorteo como ISO string limpio
-────────────────────────────────────────────────────────── */
+/* ── GET /api/publico/reservas-cliente ─────────────────── */
 router.get('/reservas-cliente', async (req, res) => {
   const { nombre_cliente, rifa_id } = req.query;
   if (!nombre_cliente)
     return res.status(400).json({ error: 'nombre_cliente es requerido' });
-
   try {
     const params = [nombre_cliente.trim()];
     let extra = '';
     if (rifa_id) { params.push(rifa_id); extra = `AND rc.rifa_id = $${params.length}`; }
 
     const r = await pool.query(`
-      SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
-             rc.created_at, rc.updated_at,
+      SELECT rc.id, rc.numero, rc.nombre_cliente, rc.cedula, rc.correo,
+             rc.estado, rc.nota_admin, rc.created_at, rc.updated_at,
              r.nombre AS rifa_nombre, r.premio, r.precio,
              ${FECHA_SQL('r')},
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
@@ -332,20 +237,15 @@ router.get('/reservas-cliente', async (req, res) => {
    ADMIN
 ══════════════════════════════════════════════════════════ */
 
-/* ── GET /api/publico/admin/reservas ──────────────────────
-   FIX: fecha_sorteo como ISO string limpio
-*/
+/* ── GET /api/publico/admin/reservas ─────────────────────  */
 router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
   const { estado } = req.query;
   try {
     const r = await pool.query(`
-      SELECT
-        rc.*,
-        r.nombre  AS rifa_nombre,
-        r.precio,
-        r.premio,
-        ${FECHA_SQL('r')},
-        COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
+      SELECT rc.*,
+             r.nombre AS rifa_nombre, r.precio, r.premio,
+             ${FECHA_SQL('r')},
+             COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
       ${estado && estado !== 'todos' ? 'WHERE rc.estado=$1' : ''}
@@ -355,7 +255,9 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ── PUT /api/publico/admin/reservas/:id ──────────────── */
+/* ── PUT /api/publico/admin/reservas/:id ──────────────────
+   Al aprobar: propaga cedula y correo de la reserva a la venta
+────────────────────────────────────────────────────────── */
 router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) => {
   const { estado, nota_admin } = req.body;
   if (!['aprobado', 'rechazado'].includes(estado))
@@ -381,26 +283,23 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
       const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
       const vendedorId = dueno.rows[0]?.id;
 
-      // ✅ Obtener precio Y ofertas para calcular el precio real con descuento
       const rifa = await client.query(
-        `SELECT precio, COALESCE(ofertas, '[]'::jsonb) AS ofertas FROM rifas WHERE id=$1`,
-        [reserva.rifa_id]
+        `SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id]
       );
-      const rifaData = rifa.rows[0];
-
-      // Buscar cuántas reservas aprobadas tiene este cliente en esta rifa
-      // para determinar el precio unitario correcto (no aplica oferta por número individual)
-      const precioVenta = rifaData?.precio || 0;
+      const precioVenta = rifa.rows[0]?.precio || 0;
 
       await client.query(`
         INSERT INTO ventas
-          (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
+          (rifa_id, numero, vendedor_id, nombre_comprador,
+           cedula, correo, telefono, precio_venta, observacion)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       `, [
         reserva.rifa_id,
         reserva.numero,
         vendedorId,
         reserva.nombre_cliente,
+        reserva.cedula  || null,
+        reserva.correo  || null,
         reserva.telefono,
         precioVenta,
         `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
@@ -416,9 +315,7 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
 });
 
 /* ── PUT /api/publico/admin/reservas-bulk ─────────────────
-   Aprobar / rechazar múltiples reservas a la vez
-   Body: { ids: [...], estado, nota_admin }
-   ✅ ACTUALIZADO: aplica precio real con oferta agrupada por cliente+rifa
+   Al aprobar en bloque: propaga cedula y correo a cada venta
 ────────────────────────────────────────────────────────── */
 router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) => {
   const { ids, estado, nota_admin } = req.body;
@@ -434,13 +331,12 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
     const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
     const vendedorId = dueno.rows[0]?.id;
 
-    // ── Si aprobamos, cargar todas las reservas de una vez para agrupar por cliente+rifa
-    // y calcular precio con oferta correctamente
-    let reservasInfo = {};
+    let preciosMap = {};
+    let extrasMap  = {}; // { id: { cedula, correo } }
+
     if (estado === 'aprobado') {
-      // Agrupar ids por (cliente, rifa) para calcular oferta en bloque
       const reservasQ = await client.query(
-        `SELECT rc.id, rc.rifa_id, rc.nombre_cliente,
+        `SELECT rc.id, rc.rifa_id, rc.nombre_cliente, rc.cedula, rc.correo,
                 r.precio, COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
          FROM reservas_cliente rc
          JOIN rifas r ON r.id = rc.rifa_id
@@ -448,21 +344,17 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
         [ids]
       );
 
-      // Agrupar por cliente+rifa → calcular precio unitario proporcional con oferta
       const grupos = {};
       for (const row of reservasQ.rows) {
         const key = `${row.nombre_cliente}||${row.rifa_id}`;
         if (!grupos[key]) grupos[key] = { precio: row.precio, ofertas: row.ofertas, ids: [] };
         grupos[key].ids.push(row.id);
+        extrasMap[row.id] = { cedula: row.cedula || null, correo: row.correo || null };
       }
-
       for (const [, g] of Object.entries(grupos)) {
-        const totalCantidad = g.ids.length;
-        const totalReal     = calcularPrecioReal(totalCantidad, g.ofertas, g.precio);
-        const precioUnit    = totalReal / totalCantidad;
-        for (const id of g.ids) {
-          reservasInfo[id] = precioUnit;
-        }
+        const totalReal  = calcularPrecioReal(g.ids.length, g.ofertas, g.precio);
+        const precioUnit = totalReal / g.ids.length;
+        for (const id of g.ids) preciosMap[id] = precioUnit;
       }
     }
 
@@ -477,19 +369,22 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       const reserva = res_r.rows[0];
 
       if (estado === 'aprobado') {
-        const precioVenta = reservasInfo[id] ?? (
-          // fallback: precio unitario normal
+        const precioVenta = preciosMap[id] ?? (
           (await client.query(`SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id])).rows[0]?.precio || 0
         );
+        const { cedula = null, correo = null } = extrasMap[id] || {};
 
         await client.query(`
           INSERT INTO ventas
-            (rifa_id, numero, vendedor_id, nombre_comprador, telefono, precio_venta, observacion)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
+            (rifa_id, numero, vendedor_id, nombre_comprador,
+             cedula, correo, telefono, precio_venta, observacion)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
           ON CONFLICT DO NOTHING
         `, [
           reserva.rifa_id, reserva.numero, vendedorId,
-          reserva.nombre_cliente, reserva.telefono,
+          reserva.nombre_cliente,
+          cedula, correo,
+          reserva.telefono,
           precioVenta,
           `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
         ]);

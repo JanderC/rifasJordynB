@@ -1,6 +1,8 @@
 // ============================================================
 //   RIFAS JORDYN — Rutas Públicas (sin autenticación)
 //   ✅ ACTUALIZADO: campo `ofertas` expuesto, precio real en aprobación
+//   ✅ FIX PUNTO 1: fecha_sorteo devuelta como ISO 8601 con to_char()
+//      para evitar desfases de zona horaria en el frontend.
 // ============================================================
 const router = require('express').Router();
 const pool   = require('../config/db');
@@ -28,10 +30,43 @@ function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
   return mejorTotal;
 }
 
+/*
+  FIX PUNTO 1 — HELPER SQL para fecha_sorteo
+  ─────────────────────────────────────────────────────────
+  Problema original:
+    El campo fecha_sorteo salía de PostgreSQL como un objeto
+    Date serializado sin zona horaria explícita, p.ej.:
+      "2025-07-15T08:00:00.000Z"
+    El frontend lo parseaba con new Date(f) que en algunos
+    navegadores (Safari, Firefox) falla con strings "YYYY-MM-DD HH:MM:SS"
+    (con espacio, sin T), devolviendo NaN y rompiendo el countdown.
+
+  Solución:
+    Usamos to_char() en cada SELECT para emitir siempre un string
+    ISO 8601 limpio: "2025-07-15T08:00:00Z"
+
+  ⚠️ ZONA HORARIA:
+    Si tu columna fecha_sorteo almacena la hora en UTC y quieres
+    mostrarla en UTC:
+      to_char(r.fecha_sorteo AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+
+    Si tu columna almacena la hora en hora local (Venezuela UTC-4)
+    y NO quieres conversión:
+      to_char(r.fecha_sorteo, 'YYYY-MM-DD"T"HH24:MI:SS')
+
+    El valor por defecto aquí es WITHOUT TIME ZONE (sin conversión),
+    que es el más común en instalaciones sin configuración de TZ.
+    Cámbialo según tu setup.
+─────────────────────────────────────────────────────────
+*/
+const FECHA_SQL = (alias = 'r') =>
+  `to_char(${alias}.fecha_sorteo, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_sorteo`;
+
 /* ──────────────────────────────────────────────────────────
    GET /api/publico/rifas
    ✅ Incluye campo `ofertas` para que el frontend pueda
       mostrar los packs y calcular descuentos.
+   ✅ FIX: fecha_sorteo como ISO string limpio
 ────────────────────────────────────────────────────────── */
 router.get('/rifas', async (req, res) => {
   try {
@@ -42,7 +77,7 @@ router.get('/rifas', async (req, res) => {
         r.descripcion,
         r.premio,
         r.precio,
-        r.fecha_sorteo,
+        ${FECHA_SQL('r')},
         r.loteria_ref,
         r.activa,
         r.imagen_url,
@@ -242,13 +277,15 @@ router.post('/reservar', async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────
    GET /api/publico/reserva/:id
+   FIX: fecha_sorteo como ISO string limpio
 ────────────────────────────────────────────────────────── */
 router.get('/reserva/:id', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
               rc.created_at, rc.updated_at,
-              r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo,
+              r.nombre AS rifa_nombre, r.premio, r.precio,
+              ${FECHA_SQL('r')},
               COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
        FROM reservas_cliente rc
        JOIN rifas r ON r.id = rc.rifa_id
@@ -264,6 +301,7 @@ router.get('/reserva/:id', async (req, res) => {
    GET /api/publico/reservas-cliente
    Busca TODAS las reservas de un cliente por nombre + rifa
    Query params: nombre_cliente, rifa_id
+   FIX: fecha_sorteo como ISO string limpio
 ────────────────────────────────────────────────────────── */
 router.get('/reservas-cliente', async (req, res) => {
   const { nombre_cliente, rifa_id } = req.query;
@@ -278,7 +316,8 @@ router.get('/reservas-cliente', async (req, res) => {
     const r = await pool.query(`
       SELECT rc.id, rc.numero, rc.nombre_cliente, rc.estado, rc.nota_admin,
              rc.created_at, rc.updated_at,
-             r.nombre AS rifa_nombre, r.premio, r.precio, r.fecha_sorteo,
+             r.nombre AS rifa_nombre, r.premio, r.precio,
+             ${FECHA_SQL('r')},
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
@@ -293,7 +332,9 @@ router.get('/reservas-cliente', async (req, res) => {
    ADMIN
 ══════════════════════════════════════════════════════════ */
 
-/* ── GET /api/publico/admin/reservas ──────────────────── */
+/* ── GET /api/publico/admin/reservas ──────────────────────
+   FIX: fecha_sorteo como ISO string limpio
+*/
 router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
   const { estado } = req.query;
   try {
@@ -303,7 +344,7 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
         r.nombre  AS rifa_nombre,
         r.precio,
         r.premio,
-        r.fecha_sorteo,
+        ${FECHA_SQL('r')},
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id

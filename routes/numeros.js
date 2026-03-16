@@ -1,6 +1,10 @@
 // ============================================================
 //   RIFAS JORDYN — Rutas de Números
 //   ✅ ACTUALIZADO: endpoint POST /vender-bulk para múltiples números
+//   ✅ FIX PUNTO 3A: estado-global ahora soporta N rifas activas
+//      (antes hardcodeaba LIMIT 1 / OFFSET 1, rompiendo con 3+)
+//      La validación de agotado ya era correcta por rifa_id,
+//      pero la vista global ahora refleja todos los pares rifa×número.
 // ============================================================
 const express = require('express');
 const router = express.Router();
@@ -9,51 +13,113 @@ const { authMiddleware, soloDueno } = require('../middleware/auth');
 
 const validarNumero = (num) => /^[0-9]{3}$/.test(num);
 
-// ── GET /api/numeros/estado-global ─────────────────────────
+/* ──────────────────────────────────────────────────────────
+   GET /api/numeros/estado-global
+   ─────────────────────────────────────────────────────────
+   FIX PUNTO 3A — Rifas Simultáneas
+   ─────────────────────────────────────────────────────────
+   PROBLEMA ORIGINAL:
+     La query hardcodeaba dos subqueries con:
+       WHERE v.rifa_id = (SELECT id FROM rifas WHERE activa=TRUE ORDER BY created_at LIMIT 1)
+       WHERE v.rifa_id = (SELECT id FROM rifas WHERE activa=TRUE ORDER BY created_at OFFSET 1 LIMIT 1)
+     Esto asumía EXACTAMENTE 2 rifas activas. Con 3+ rifas:
+       - La rifa 3 quedaba invisible en el estado global.
+       - Un número vendido en rifa 3 se mostraba como "libre" en el grid.
+       - El estado_global resultante era incorrecto (solo calculaba rifa1 y rifa2).
+
+   SOLUCIÓN:
+     Reescribir la query para que funcione con cualquier número de rifas activas.
+     El estado_global por número ahora es:
+       - 'libre':           0 ventas en TODAS las rifas activas
+       - 'parcial_vendido': ≥1 número tiene 1 venta (pero ninguno agotado)
+       - 'parcial_agotado': ≥1 número agotado (2 ventas) pero no todos
+       - 'agotado_total':   TODOS los números están agotados en TODAS sus rifas
+
+     NOTA IMPORTANTE sobre la lógica de negocio:
+     El número "001" puede venderse hasta 2 veces EN CADA rifa activa de forma independiente.
+     Eso es correcto — rifas diferentes son productos diferentes.
+     El estado_global es solo para el DISPLAY del grid admin (colores/labels),
+     NO para controlar si se puede vender (eso lo hace POST /vender por rifa_id).
+────────────────────────────────────────────────────────── */
 router.get('/estado-global', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        n.numero,
-        COALESCE(r1.veces, 0) AS rifa1_vendido,
-        CASE
-          WHEN COALESCE(r1.veces, 0) = 0 THEN 'disponible'
-          WHEN COALESCE(r1.veces, 0) = 1 THEN 'vendido_1'
-          ELSE 'agotado'
-        END AS rifa1_estado,
-        COALESCE(r2.veces, 0) AS rifa2_vendido,
-        CASE
-          WHEN COALESCE(r2.veces, 0) = 0 THEN 'disponible'
-          WHEN COALESCE(r2.veces, 0) = 1 THEN 'vendido_1'
-          ELSE 'agotado'
-        END AS rifa2_estado,
-        CASE
-          WHEN COALESCE(r1.veces, 0) = 0 AND COALESCE(r2.veces, 0) = 0 THEN 'libre'
-          WHEN COALESCE(r1.veces, 0) >= 2 AND COALESCE(r2.veces, 0) >= 2 THEN 'agotado_total'
-          WHEN COALESCE(r1.veces, 0) >= 2 OR COALESCE(r2.veces, 0) >= 2 THEN 'parcial_agotado'
-          ELSE 'parcial_vendido'
-        END AS estado_global
-      FROM (
+      WITH rifas_activas AS (
+        -- Obtener todas las rifas activas (sin límite hardcodeado)
+        SELECT id AS rifa_id, nombre
+        FROM rifas
+        WHERE activa = TRUE
+        ORDER BY created_at
+      ),
+      numeros_serie AS (
+        -- Generar el rango 000–999
         SELECT LPAD(gs::text, 3, '0') AS numero
         FROM generate_series(0, 999) gs
-      ) n
-      LEFT JOIN (
-        SELECT v.numero, COUNT(*) AS veces
+      ),
+      ventas_por_rifa_numero AS (
+        -- Contar ventas de cada número en cada rifa activa
+        SELECT
+          v.numero,
+          v.rifa_id,
+          COUNT(*) AS veces
         FROM ventas v
-        WHERE v.rifa_id = (
-          SELECT id FROM rifas WHERE activa = TRUE ORDER BY created_at LIMIT 1
-        )
-        GROUP BY v.numero
-      ) r1 ON r1.numero = n.numero
-      LEFT JOIN (
-        SELECT v.numero, COUNT(*) AS veces
-        FROM ventas v
-        WHERE v.rifa_id = (
-          SELECT id FROM rifas WHERE activa = TRUE ORDER BY created_at OFFSET 1 LIMIT 1
-        )
-        GROUP BY v.numero
-      ) r2 ON r2.numero = n.numero
-      ORDER BY n.numero
+        WHERE v.rifa_id IN (SELECT rifa_id FROM rifas_activas)
+        GROUP BY v.numero, v.rifa_id
+      ),
+      estado_por_numero AS (
+        -- Para cada número, calcular estado global considerando TODAS las rifas activas
+        SELECT
+          n.numero,
+          COUNT(ra.rifa_id)                                        AS total_rifas,
+          COALESCE(SUM(vpn.veces), 0)                              AS total_ventas_globales,
+          COUNT(CASE WHEN COALESCE(vpn.veces, 0) >= 2 THEN 1 END) AS rifas_agotadas,
+          COUNT(CASE WHEN COALESCE(vpn.veces, 0) = 1  THEN 1 END) AS rifas_con_1_venta,
+          COUNT(CASE WHEN COALESCE(vpn.veces, 0) = 0  THEN 1 END) AS rifas_libres,
+          -- Datos de las primeras dos rifas para compatibilidad con el frontend existente
+          MAX(CASE WHEN ra_ord.rn = 1 THEN COALESCE(vpn.veces, 0) END) AS rifa1_vendido,
+          MAX(CASE WHEN ra_ord.rn = 2 THEN COALESCE(vpn.veces, 0) END) AS rifa2_vendido
+        FROM numeros_serie n
+        CROSS JOIN rifas_activas ra
+        LEFT JOIN ventas_por_rifa_numero vpn
+          ON vpn.numero = n.numero AND vpn.rifa_id = ra.rifa_id
+        LEFT JOIN (
+          SELECT rifa_id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
+          FROM rifas_activas
+        ) ra_ord ON ra_ord.rifa_id = ra.rifa_id
+        GROUP BY n.numero
+      )
+      SELECT
+        numero,
+        total_rifas,
+        total_ventas_globales,
+        rifas_agotadas,
+        rifas_con_1_venta,
+        rifas_libres,
+        -- Compatibilidad con el frontend que espera rifa1_vendido / rifa2_vendido
+        COALESCE(rifa1_vendido, 0)::int AS rifa1_vendido,
+        CASE
+          WHEN COALESCE(rifa1_vendido, 0) = 0 THEN 'disponible'
+          WHEN COALESCE(rifa1_vendido, 0) = 1 THEN 'vendido_1'
+          ELSE 'agotado'
+        END AS rifa1_estado,
+        COALESCE(rifa2_vendido, 0)::int AS rifa2_vendido,
+        CASE
+          WHEN COALESCE(rifa2_vendido, 0) = 0 THEN 'disponible'
+          WHEN COALESCE(rifa2_vendido, 0) = 1 THEN 'vendido_1'
+          ELSE 'agotado'
+        END AS rifa2_estado,
+        -- Estado global calculado sobre TODAS las rifas activas
+        CASE
+          WHEN total_ventas_globales = 0
+            THEN 'libre'
+          WHEN rifas_agotadas = total_rifas
+            THEN 'agotado_total'
+          WHEN rifas_agotadas > 0
+            THEN 'parcial_agotado'
+          ELSE 'parcial_vendido'
+        END AS estado_global
+      FROM estado_por_numero
+      ORDER BY numero
     `);
 
     res.json(result.rows);
@@ -154,7 +220,10 @@ router.get('/rifa/:rifa_id', authMiddleware, async (req, res) => {
 });
 
 // ── POST /api/numeros/vender ───────────────────────────────
-// Vender un único número (endpoint original sin cambios)
+// Vender un único número
+// FIX PUNTO 3A: La validación ya era correcta — usa rifa_id en el WHERE,
+// por lo tanto el mismo número puede venderse en rifas distintas.
+// Solo se bloquea si ESA rifa_id ya tiene 2 ventas de ESE número.
 router.post('/vender', authMiddleware, async (req, res) => {
   const { rifa_id, numero, nombre_comprador, telefono, observacion } = req.body;
 
@@ -171,6 +240,7 @@ router.post('/vender', authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // Contar ventas de ESTE número en ESTA rifa (correcto: scoped por rifa_id)
     const checkResult = await client.query(
       `SELECT COUNT(*) AS veces FROM ventas WHERE rifa_id = $1 AND numero = $2`,
       [rifa_id, numero]
@@ -233,7 +303,7 @@ router.post('/vender', authMiddleware, async (req, res) => {
       venta: venta.rows[0],
       estado_actual: estado,
       veces_vendido: nuevasVeces,
-      alerta: nuevasVeces === 2 ? `⚠️ El número ${numero} ahora está AGOTADO` : null,
+      alerta: nuevasVeces === 2 ? `⚠️ El número ${numero} ahora está AGOTADO en esta rifa` : null,
     });
 
   } catch (err) {
@@ -249,22 +319,9 @@ router.post('/vender', authMiddleware, async (req, res) => {
 });
 
 /* ── POST /api/numeros/vender-bulk ───────────────────────────
-   ✅ NUEVO: Registrar venta de MÚLTIPLES números en una transacción
-   Body:
-     {
-       rifa_id,
-       numeros: ['001','002','045'],
-       nombre_comprador,
-       telefono,
-       observacion
-     }
-   Respuesta:
-     {
-       vendidos: [{ numero, venta }],
-       fallidos: [{ numero, razon }],
-       total_vendido,
-       total_fallido
-     }
+   Registrar venta de MÚLTIPLES números en una transacción
+   FIX PUNTO 3A: igual que /vender, la validación ya era scoped
+   por rifa_id — se mantiene. Solo se mejora el mensaje de error.
 ─────────────────────────────────────────────────────────── */
 router.post('/vender-bulk', authMiddleware, async (req, res) => {
   const { rifa_id, numeros, nombre_comprador, telefono, observacion } = req.body;
@@ -292,8 +349,7 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Obtener precio de la rifa
-    const rifaResult = await client.query('SELECT precio FROM rifas WHERE id = $1', [rifa_id]);
+    const rifaResult = await client.query('SELECT precio, nombre FROM rifas WHERE id = $1', [rifa_id]);
     if (!rifaResult.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Rifa no encontrada' });
@@ -316,7 +372,8 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
       }
     }
 
-    // Obtener estado actual de todos los números en una sola consulta
+    // Obtener estado actual de todos los números EN ESTA RIFA en una sola consulta
+    // (scoped por rifa_id — correcto para rifas simultáneas)
     const estadoActual = await client.query(
       `SELECT numero, COUNT(*) AS veces
        FROM ventas
@@ -331,7 +388,6 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
     const fallidos = [];
 
     for (const numero of numerosUnicos) {
-      // Verificar asignación de vendedor
       if (!numerosPermitidos.has(numero) && req.user.rol === 'vendedor') {
         fallidos.push({ numero, razon: 'no_asignado' });
         continue;
@@ -358,10 +414,8 @@ router.post('/vender-bulk', authMiddleware, async (req, res) => {
           ]
         );
         vendidos.push({ numero, estado: veces + 1 >= 2 ? 'agotado' : 'vendido_1', venta: venta.rows[0] });
-        // Actualizar el mapa local para siguientes iteraciones
         vecesMap[numero] = veces + 1;
       } catch (insertErr) {
-        // Posible conflicto de unicidad (CONSTRAINT max_dos_ventas)
         fallidos.push({ numero, razon: 'conflicto_bd' });
       }
     }

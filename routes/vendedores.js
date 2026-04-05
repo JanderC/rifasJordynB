@@ -347,17 +347,15 @@ router.post('/:id/categorias/:catId/numeros', authMiddleware, soloDueno, async (
         error: `La categoría solo admite ${disponible} número(s) más (límite: ${max_numeros})`
       });
 
-    // Verificar que no estén ocupados globalmente
-    const ocupados = await client.query(
-      `SELECT numero FROM categoria_numeros WHERE numero = ANY($1)
-       UNION
-       SELECT numero FROM numeros_vendedor_global WHERE numero = ANY($1)`,
-      [numeros]
+    // Solo verificar que no estén ya en ESTA misma categoría
+    const enEstaCat = await client.query(
+      `SELECT numero FROM categoria_numeros WHERE categoria_id = $1 AND numero = ANY($2)`,
+      [req.params.catId, numeros]
     );
-    if (ocupados.rows.length > 0) {
+    if (enEstaCat.rows.length > 0) {
       await client.query('ROLLBACK');
       return res.status(409).json({
-        error: `Números ya ocupados: ${ocupados.rows.map(r => r.numero).join(', ')}`
+        error: `Ya están en esta categoría: ${enEstaCat.rows.map(r => r.numero).join(', ')}`
       });
     }
 
@@ -423,8 +421,6 @@ router.get('/:id/categorias/numeros-disponibles', authMiddleware, soloDueno, asy
       `SELECT LPAD(gs::text, 3, '0') AS numero
        FROM generate_series(0, 999) gs
        WHERE LPAD(gs::text, 3, '0') NOT IN (
-         SELECT numero FROM categoria_numeros
-         UNION
          SELECT numero FROM numeros_vendedor_global
        )
        ${excluirArr.length > 0 ? `AND LPAD(gs::text, 3, '0') != ALL($2::char[])` : ''}

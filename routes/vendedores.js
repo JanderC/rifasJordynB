@@ -1,13 +1,15 @@
-
-
 const express = require('express');
-const router  = express.Router();
 const bcrypt  = require('bcryptjs');
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
+/* ════════════════════════════════════════════════════════════
+   ROUTER 1 — VENDEDORES  →  /api/vendedores
+════════════════════════════════════════════════════════════ */
+const vendedoresRouter = express.Router();
+
 // ── GET /api/vendedores ──────────────────────────────────────
-router.get('/', authMiddleware, soloDueno, async (req, res) => {
+vendedoresRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -41,7 +43,7 @@ router.get('/', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── GET /api/vendedores/:id ──────────────────────────────────
-router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
+vendedoresRouter.get('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const [userR, numerosR, rifasR, ventasR] = await Promise.all([
       pool.query(
@@ -87,7 +89,7 @@ router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── PUT /api/vendedores/:id ──────────────────────────────────
-router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
+vendedoresRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   const { nombre, password, activo, cedula } = req.body;
   try {
     const fields = []; const params = []; let i = 1;
@@ -114,7 +116,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/vendedores/:id ───────────────────────────────
-router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
+vendedoresRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const ventas = await pool.query('SELECT COUNT(*) FROM ventas WHERE vendedor_id = $1', [req.params.id]);
     if (parseInt(ventas.rows[0].count) > 0)
@@ -122,7 +124,6 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
 
     await pool.query('DELETE FROM numeros_vendedor_global WHERE vendedor_id = $1', [req.params.id]);
     await pool.query('DELETE FROM numeros_vendedor        WHERE vendedor_id = $1', [req.params.id]);
-    // Las asignaciones en cat_global_asignaciones se borran por CASCADE desde users
     await pool.query('DELETE FROM users                   WHERE id = $1',          [req.params.id]);
     res.json({ message: 'Vendedor eliminado exitosamente' });
   } catch (err) {
@@ -132,7 +133,7 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── GET /api/vendedores/:id/numeros-aleatorios ───────────────
-router.get('/:id/numeros-aleatorios', authMiddleware, soloDueno, async (req, res) => {
+vendedoresRouter.get('/:id/numeros-aleatorios', authMiddleware, soloDueno, async (req, res) => {
   const { cantidad = 10, excluir = '' } = req.query;
   const excluirArr = excluir ? excluir.split(',').map(n => n.trim()).filter(Boolean) : [];
   try {
@@ -151,21 +152,14 @@ router.get('/:id/numeros-aleatorios', authMiddleware, soloDueno, async (req, res
   }
 });
 
-// ── POST /api/numeros/asignar ────────────────────────────────
-router.post('/numeros-asignar', authMiddleware, soloDueno, async (req, res) => {
-  // Ruta real: /api/numeros/asignar — se registra en index/app.js con prefijo /numeros
-  // Dejamos compatibilidad aquí también
-  return res.status(404).json({ error: 'Usar /api/numeros/asignar' });
-});
 
 /* ════════════════════════════════════════════════════════════
-   RUTAS DE CATEGORÍAS GLOBALES
-   Prefijo: /api/categorias-globales
+   ROUTER 2 — CATEGORÍAS GLOBALES  →  /api/categorias-globales
 ════════════════════════════════════════════════════════════ */
-const catRouter = express.Router();
+const categoriasGlobalesRouter = express.Router();
 
 // ── GET /api/categorias-globales ────────────────────────────
-catRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
+categoriasGlobalesRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -192,7 +186,7 @@ catRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── POST /api/categorias-globales ───────────────────────────
-catRouter.post('/', authMiddleware, soloDueno, async (req, res) => {
+categoriasGlobalesRouter.post('/', authMiddleware, soloDueno, async (req, res) => {
   const { nombre, tipo = 'parcial', monto, descripcion } = req.body;
   if (!nombre?.trim()) return res.status(400).json({ error: 'El nombre es requerido' });
   if (!['parcial', 'simultanea'].includes(tipo))
@@ -214,9 +208,8 @@ catRouter.post('/', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── PUT /api/categorias-globales/:id ────────────────────────
-catRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
+categoriasGlobalesRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   const { nombre, monto, descripcion } = req.body;
-  // NOTA: el tipo NO se puede cambiar
   try {
     const fields = []; const params = []; let i = 1;
     if (nombre      !== undefined) { fields.push(`nombre = $${i++}`);      params.push(nombre.trim()); }
@@ -240,7 +233,7 @@ catRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/categorias-globales/:id ─────────────────────
-catRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
+categoriasGlobalesRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const result = await pool.query(
       'DELETE FROM categorias_globales WHERE id = $1 RETURNING id',
@@ -254,13 +247,9 @@ catRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────
-   GET /api/categorias-globales/:id/vendedores
-   Retorna todas las asignaciones de vendedores en la categoría
-────────────────────────────────────────────────────────── */
-catRouter.get('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
+// ── GET /api/categorias-globales/:id/vendedores ──────────────
+categoriasGlobalesRouter.get('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
   try {
-    // Verificar que la categoría existe
     const catR = await pool.query('SELECT id, tipo FROM categorias_globales WHERE id = $1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
 
@@ -285,15 +274,14 @@ catRouter.get('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => 
   }
 });
 
-catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
+// ── POST /api/categorias-globales/:id/vendedores ─────────────
+categoriasGlobalesRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
   let { vendedor_id, numero, serie = 'A' } = req.body;
 
-  // Validaciones básicas
   if (!vendedor_id) return res.status(400).json({ error: 'vendedor_id es requerido' });
   if (!numero || !/^\d{1,3}$/.test(String(numero)))
     return res.status(400).json({ error: 'Número inválido. Debe ser 000–999' });
 
-  // Normalizar número a 3 dígitos
   numero = String(parseInt(numero)).padStart(3, '0');
   serie  = String(serie).toUpperCase();
   if (!['A', 'B'].includes(serie))
@@ -303,7 +291,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
   try {
     await client.query('BEGIN');
 
-    // 1. Obtener categoría y bloquear para escritura
     const catR = await client.query(
       'SELECT id, tipo FROM categorias_globales WHERE id = $1 FOR UPDATE',
       [req.params.id]
@@ -314,10 +301,8 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
     }
     const { tipo } = catR.rows[0];
 
-    // 2. Para PARCIAL forzar serie = 'A'
     if (tipo === 'parcial') serie = 'A';
 
-    // 3. Verificar vendedor
     const vendR = await client.query(
       'SELECT id, nombre, activo FROM users WHERE id = $1 AND rol = $2',
       [vendedor_id, 'vendedor']
@@ -329,7 +314,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
 
     const vendedorNombre = vendR.rows[0].nombre;
 
-    // 4. Verificar colisión: ¿ya está ese número en esa serie para esta categoría?
     const colR = await client.query(
       `SELECT cga.id, u.nombre AS dueno_nombre
        FROM cat_global_asignaciones cga
@@ -343,10 +327,9 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       const dueno = colR.rows[0].dueno_nombre;
       if (tipo === 'parcial') {
         return res.status(409).json({
-          error: `El número ${numero} ya está asignado a ${dueno} en esta categoría (parcial). Cada número pertenece a un solo vendedor.`
+          error: `El número ${numero} ya está asignado a ${dueno} en esta categoría (parcial).`
         });
       } else {
-        // Simultánea: verificar si la otra serie está libre
         const otraSerie = serie === 'A' ? 'B' : 'A';
         const otraR = await client.query(
           `SELECT id FROM cat_global_asignaciones
@@ -363,20 +346,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       }
     }
 
-    // 5. Para SIMULTÁNEA: verificar que el mismo vendedor no tenga YA ese número en AMBAS series
-    if (tipo === 'simultanea') {
-      const yaEnAmbasR = await client.query(
-        `SELECT COUNT(*) FROM cat_global_asignaciones
-         WHERE categoria_id = $1 AND vendedor_id = $2 AND numero = $3`,
-        [req.params.id, vendedor_id, numero]
-      );
-      // Solo se bloquea si ya tiene el número en la serie opuesta Y está intentando agregarlo en la misma
-      // (ya controlado por UNIQUE en cat_global_asig_unica)
-      // Este check adicional es semántico: un vendedor puede tener 001-A y 001-B
-      // pero no 001-A y 001-A (cubierto por UNIQUE)
-    }
-
-    // 6. Insertar
     const insR = await client.query(
       `INSERT INTO cat_global_asignaciones (categoria_id, vendedor_id, numero, serie)
        VALUES ($1, $2, $3, $4)
@@ -402,14 +371,9 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
   }
 });
 
-/* ──────────────────────────────────────────────────────────
-   DELETE /api/categorias-globales/:id/vendedores/:asigId
-   Quita una asignación específica
-────────────────────────────────────────────────────────── */
-catRouter.delete('/:id/vendedores/:asigId', authMiddleware, soloDueno, async (req, res) => {
+// ── DELETE /api/categorias-globales/:id/vendedores/:asigId ───
+categoriasGlobalesRouter.delete('/:id/vendedores/:asigId', authMiddleware, soloDueno, async (req, res) => {
   try {
-    // Verificar si hay ventas activas relacionadas con este número en rifas donde se usa esta categoría
-    // (lógica de protección futura — por ahora permitir quitar libremente)
     const result = await pool.query(
       `DELETE FROM cat_global_asignaciones
        WHERE id = $1 AND categoria_id = $2
@@ -417,7 +381,6 @@ catRouter.delete('/:id/vendedores/:asigId', authMiddleware, soloDueno, async (re
       [req.params.asigId, req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Asignación no encontrada' });
-
     res.json({ message: 'Asignación removida', numero: result.rows[0].numero });
   } catch (err) {
     console.error('Error eliminando asignación:', err);
@@ -425,7 +388,8 @@ catRouter.delete('/:id/vendedores/:asigId', authMiddleware, soloDueno, async (re
   }
 });
 
-catRouter.get('/:id/numeros-disponibles', authMiddleware, soloDueno, async (req, res) => {
+// ── GET /api/categorias-globales/:id/numeros-disponibles ─────
+categoriasGlobalesRouter.get('/:id/numeros-disponibles', authMiddleware, soloDueno, async (req, res) => {
   const { serie = 'A', cantidad = 100 } = req.query;
   try {
     const catR = await pool.query('SELECT tipo FROM categorias_globales WHERE id = $1', [req.params.id]);
@@ -451,14 +415,14 @@ catRouter.get('/:id/numeros-disponibles', authMiddleware, soloDueno, async (req,
   }
 });
 
+
 /* ════════════════════════════════════════════════════════════
-   RUTAS DE NÚMEROS GLOBALES DEL VENDEDOR
-   Prefijo: /api/numeros
+   ROUTER 3 — NÚMEROS GLOBALES  →  /api/numeros
 ════════════════════════════════════════════════════════════ */
-const numRouter = express.Router();
+const numerosRouter = express.Router();
 
 // ── POST /api/numeros/asignar ────────────────────────────────
-numRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
+numerosRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, numeros } = req.body;
   if (!vendedor_id || !Array.isArray(numeros) || !numeros.length)
     return res.status(400).json({ error: 'vendedor_id y numeros[] son requeridos' });
@@ -470,9 +434,6 @@ numRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Verificar que los números no estén ya en numeros_vendedor_global de OTRO vendedor
-    // OJO: Los números SÍ pueden repetirse entre vendedores en el nuevo sistema
-    // Solo bloqueamos si ya los tiene EL MISMO vendedor (duplicado)
     const yaDelVendedor = await client.query(
       `SELECT numero FROM numeros_vendedor_global
        WHERE vendedor_id = $1 AND numero = ANY($2)`,
@@ -502,13 +463,12 @@ numRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/numeros/asignar ──────────────────────────────
-numRouter.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
+numerosRouter.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, numeros } = req.body;
   if (!vendedor_id || !Array.isArray(numeros) || !numeros.length)
     return res.status(400).json({ error: 'vendedor_id y numeros[] son requeridos' });
 
   try {
-    // Verificar que no estén vendidos en rifas activas
     const conVenta = await pool.query(
       `SELECT DISTINCT ng.numero
        FROM numeros_vendedor_global ng
@@ -533,4 +493,8 @@ numRouter.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-module.exports = { vendedoresRouter: router, categoriasGlobalesRouter: catRouter, numerosRouter: numRouter };
+
+/* ════════════════════════════════════════════════════════════
+   EXPORTS
+════════════════════════════════════════════════════════════ */
+module.exports = { vendedoresRouter, categoriasGlobalesRouter, numerosRouter };

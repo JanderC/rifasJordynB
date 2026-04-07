@@ -1,18 +1,12 @@
-// ============================================================
-//   RIFAS JORDYN — Rutas de Vendedores
-//   ✅ ACTUALIZADO: números globales en numeros_vendedor_global
-//      GET /  → incluye numeros_asignados (array de números)
-//      GET /:id → numeros_asignados desde tabla global
-//      POST /numeros/asignar y DELETE usan tabla global
-//      GET /:id/numeros-aleatorios usa tabla global
-// ============================================================
+
+
 const express = require('express');
 const router  = express.Router();
 const bcrypt  = require('bcryptjs');
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
-// ── GET /api/vendedores ────────────────────────────────────
+// ── GET /api/vendedores ──────────────────────────────────────
 router.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -24,22 +18,21 @@ router.get('/', authMiddleware, soloDueno, async (req, res) => {
         u.rol,
         u.activo,
         u.created_at,
-        COUNT(DISTINCT v.id)::int             AS total_ventas,
-        COALESCE(SUM(v.precio_venta), 0)      AS total_ingresos,
-        COUNT(DISTINCT ng.numero)::int        AS numeros_count,
+        COUNT(DISTINCT v.id)::int              AS total_ventas,
+        COALESCE(SUM(v.precio_venta), 0)       AS total_ingresos,
+        COUNT(DISTINCT ng.numero)::int         AS numeros_count,
         COALESCE(
           JSON_AGG(ng.numero ORDER BY ng.numero)
           FILTER (WHERE ng.numero IS NOT NULL),
           '[]'
         ) AS numeros_asignados
       FROM users u
-      LEFT JOIN ventas v             ON v.vendedor_id = u.id
+      LEFT JOIN ventas v                  ON v.vendedor_id = u.id
       LEFT JOIN numeros_vendedor_global ng ON ng.vendedor_id = u.id
       WHERE u.rol = 'vendedor'
       GROUP BY u.id, u.nombre, u.usuario, u.cedula, u.rol, u.activo, u.created_at
       ORDER BY u.nombre
     `);
-
     res.json(result.rows);
   } catch (err) {
     console.error('Error obteniendo vendedores:', err);
@@ -47,60 +40,45 @@ router.get('/', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-// ── GET /api/vendedores/:id ────────────────────────────────
+// ── GET /api/vendedores/:id ──────────────────────────────────
 router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
-    const userResult = await pool.query(
-      'SELECT id, nombre, usuario, cedula, rol, activo, created_at FROM users WHERE id = $1',
-      [req.params.id]
-    );
+    const [userR, numerosR, rifasR, ventasR] = await Promise.all([
+      pool.query(
+        'SELECT id, nombre, usuario, cedula, rol, activo, created_at FROM users WHERE id = $1',
+        [req.params.id]
+      ),
+      pool.query(
+        'SELECT numero FROM numeros_vendedor_global WHERE vendedor_id = $1 ORDER BY numero',
+        [req.params.id]
+      ),
+      pool.query(
+        `SELECT nv.rifa_id, r.nombre AS rifa_nombre, r.activa,
+                COUNT(nv.numero)::int AS numeros_en_rifa,
+                COUNT(v.id)::int      AS ventas_en_rifa
+         FROM numeros_vendedor nv
+         JOIN rifas r ON r.id = nv.rifa_id
+         LEFT JOIN ventas v ON v.rifa_id = nv.rifa_id AND v.numero = nv.numero AND v.vendedor_id = nv.vendedor_id
+         WHERE nv.vendedor_id = $1
+         GROUP BY nv.rifa_id, r.nombre, r.activa
+         ORDER BY r.activa DESC, nv.rifa_id DESC`,
+        [req.params.id]
+      ),
+      pool.query(
+        `SELECT v.*, r.nombre AS rifa_nombre FROM ventas v
+         JOIN rifas r ON r.id = v.rifa_id
+         WHERE v.vendedor_id = $1 ORDER BY v.created_at DESC LIMIT 20`,
+        [req.params.id]
+      ),
+    ]);
 
-    if (!userResult.rows[0]) {
-      return res.status(404).json({ error: 'Vendedor no encontrado' });
-    }
-
-    // Números globales del vendedor
-    const numerosResult = await pool.query(
-      `SELECT numero FROM numeros_vendedor_global
-       WHERE vendedor_id = $1
-       ORDER BY numero`,
-      [req.params.id]
-    );
-
-    // Rifas donde participa este vendedor (con cuántos números)
-    const rifasResult = await pool.query(
-      `SELECT
-         nv.rifa_id,
-         r.nombre   AS rifa_nombre,
-         r.activa,
-         COUNT(nv.numero)::int AS numeros_en_rifa,
-         COUNT(v.id)::int      AS ventas_en_rifa
-       FROM numeros_vendedor nv
-       JOIN rifas r ON r.id = nv.rifa_id
-       LEFT JOIN ventas v ON v.rifa_id = nv.rifa_id
-         AND v.numero = nv.numero
-         AND v.vendedor_id = nv.vendedor_id
-       WHERE nv.vendedor_id = $1
-       GROUP BY nv.rifa_id, r.nombre, r.activa
-       ORDER BY r.activa DESC, nv.rifa_id DESC`,
-      [req.params.id]
-    );
-
-    // Ventas recientes
-    const ventasResult = await pool.query(
-      `SELECT v.*, r.nombre AS rifa_nombre
-       FROM ventas v
-       JOIN rifas r ON r.id = v.rifa_id
-       WHERE v.vendedor_id = $1
-       ORDER BY v.created_at DESC LIMIT 20`,
-      [req.params.id]
-    );
+    if (!userR.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
 
     res.json({
-      vendedor:         userResult.rows[0],
-      numeros_asignados: numerosResult.rows.map(r => r.numero),
-      rifas_participando: rifasResult.rows,
-      ventas_recientes: ventasResult.rows,
+      vendedor:           userR.rows[0],
+      numeros_asignados:  numerosR.rows.map(r => r.numero),
+      rifas_participando: rifasR.rows,
+      ventas_recientes:   ventasR.rows,
     });
   } catch (err) {
     console.error('Error obteniendo vendedor:', err);
@@ -108,38 +86,26 @@ router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-// ── PUT /api/vendedores/:id ────────────────────────────────
+// ── PUT /api/vendedores/:id ──────────────────────────────────
 router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   const { nombre, password, activo, cedula } = req.body;
-
   try {
-    let updateFields = [];
-    let params       = [];
-    let i            = 1;
-
-    if (nombre)                     { updateFields.push(`nombre = $${i++}`);  params.push(nombre); }
-    if (typeof activo === 'boolean') { updateFields.push(`activo = $${i++}`);  params.push(activo); }
-    if (cedula !== undefined)        { updateFields.push(`cedula = $${i++}`);  params.push(cedula || null); }
+    const fields = []; const params = []; let i = 1;
+    if (nombre)                      { fields.push(`nombre = $${i++}`);  params.push(nombre); }
+    if (typeof activo === 'boolean')  { fields.push(`activo = $${i++}`);  params.push(activo); }
+    if (cedula !== undefined)         { fields.push(`cedula = $${i++}`);  params.push(cedula || null); }
     if (password) {
-      if (password.length < 6)
-        return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+      if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
       const hash = await bcrypt.hash(password, 10);
-      updateFields.push(`password = $${i++}`);
-      params.push(hash);
+      fields.push(`password = $${i++}`); params.push(hash);
     }
-
-    if (updateFields.length === 0)
-      return res.status(400).json({ error: 'No hay campos para actualizar' });
-
+    if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
     params.push(req.params.id);
     const result = await pool.query(
-      `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${i} RETURNING id, nombre, usuario, cedula, rol, activo`,
+      `UPDATE users SET ${fields.join(', ')} WHERE id = $${i} RETURNING id, nombre, usuario, cedula, rol, activo`,
       params
     );
-
-    if (!result.rows[0])
-      return res.status(404).json({ error: 'Vendedor no encontrado' });
-
+    if (!result.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
     res.json({ message: 'Vendedor actualizado', vendedor: result.rows[0] });
   } catch (err) {
     console.error('Error actualizando vendedor:', err);
@@ -147,24 +113,17 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-// ── DELETE /api/vendedores/:id ─────────────────────────────
+// ── DELETE /api/vendedores/:id ───────────────────────────────
 router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
-    const ventas = await pool.query(
-      'SELECT COUNT(*) FROM ventas WHERE vendedor_id = $1',
-      [req.params.id]
-    );
-    if (parseInt(ventas.rows[0].count) > 0) {
-      return res.status(400).json({
-        error: 'No se puede eliminar un vendedor con ventas registradas. Desactívalo en su lugar.'
-      });
-    }
+    const ventas = await pool.query('SELECT COUNT(*) FROM ventas WHERE vendedor_id = $1', [req.params.id]);
+    if (parseInt(ventas.rows[0].count) > 0)
+      return res.status(400).json({ error: 'No se puede eliminar un vendedor con ventas registradas. Desactívalo en su lugar.' });
 
-    // Limpiar números globales y asignaciones por rifa
     await pool.query('DELETE FROM numeros_vendedor_global WHERE vendedor_id = $1', [req.params.id]);
     await pool.query('DELETE FROM numeros_vendedor        WHERE vendedor_id = $1', [req.params.id]);
+    // Las asignaciones en cat_global_asignaciones se borran por CASCADE desde users
     await pool.query('DELETE FROM users                   WHERE id = $1',          [req.params.id]);
-
     res.json({ message: 'Vendedor eliminado exitosamente' });
   } catch (err) {
     console.error('Error eliminando vendedor:', err);
@@ -172,228 +131,391 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
-// ── GET /api/vendedores/:id/numeros-aleatorios ────────────
-// Genera números aleatorios disponibles en el pool global
-// (excluye los que ya tienen otros vendedores y los del mismo)
+// ── GET /api/vendedores/:id/numeros-aleatorios ───────────────
 router.get('/:id/numeros-aleatorios', authMiddleware, soloDueno, async (req, res) => {
   const { cantidad = 10, excluir = '' } = req.query;
-
-  // excluir puede venir como "001,002,003" desde el frontend
   const excluirArr = excluir ? excluir.split(',').map(n => n.trim()).filter(Boolean) : [];
-
   try {
-    // Números ya asignados a cualquier vendedor en la tabla global
     const result = await pool.query(
       `SELECT LPAD(gs::text, 3, '0') AS numero
        FROM generate_series(0, 999) gs
-       WHERE LPAD(gs::text, 3, '0') NOT IN (
-         SELECT numero FROM numeros_vendedor_global
-       )
+       WHERE LPAD(gs::text, 3, '0') NOT IN (SELECT numero FROM numeros_vendedor_global)
        ${excluirArr.length > 0 ? `AND LPAD(gs::text, 3, '0') != ALL($2)` : ''}
-       ORDER BY RANDOM()
-       LIMIT $1`,
-      excluirArr.length > 0
-        ? [parseInt(cantidad), excluirArr]
-        : [parseInt(cantidad)]
+       ORDER BY RANDOM() LIMIT $1`,
+      excluirArr.length > 0 ? [parseInt(cantidad), excluirArr] : [parseInt(cantidad)]
     );
-
-    res.json({
-      numeros_sugeridos: result.rows.map(r => r.numero),
-      cantidad:          result.rows.length,
-    });
+    res.json({ numeros_sugeridos: result.rows.map(r => r.numero) });
   } catch (err) {
-    console.error('Error generando números aleatorios:', err);
+    console.error('Error generando aleatorios:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
+// ── POST /api/numeros/asignar ────────────────────────────────
+router.post('/numeros-asignar', authMiddleware, soloDueno, async (req, res) => {
+  // Ruta real: /api/numeros/asignar — se registra en index/app.js con prefijo /numeros
+  // Dejamos compatibilidad aquí también
+  return res.status(404).json({ error: 'Usar /api/numeros/asignar' });
+});
 
-// ══════════════════════════════════════════════════════════════
-//  RUTAS DE CATEGORÍAS DE NÚMEROS (por vendedor)
-// ══════════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
+   RUTAS DE CATEGORÍAS GLOBALES
+   Prefijo: /api/categorias-globales
+════════════════════════════════════════════════════════════ */
+const catRouter = express.Router();
 
-// ── GET /api/vendedores/:id/categorias ────────────────────────
-// Devuelve todas las categorías del vendedor con sus números
-router.get('/:id/categorias', authMiddleware, soloDueno, async (req, res) => {
+// ── GET /api/categorias-globales ────────────────────────────
+catRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
-    const cats = await pool.query(
-      `SELECT
-         cv.id,
-         cv.nombre,
-         cv.max_numeros,
-         cv.created_at,
-         COUNT(cn.numero)::int            AS numeros_count,
-         COALESCE(
-           JSON_AGG(cn.numero ORDER BY cn.numero)
-           FILTER (WHERE cn.numero IS NOT NULL),
-           '[]'
-         )                                AS numeros
-       FROM categorias_vendedor cv
-       LEFT JOIN categoria_numeros cn ON cn.categoria_id = cv.id
-       WHERE cv.vendedor_id = $1
-       GROUP BY cv.id, cv.nombre, cv.max_numeros, cv.created_at
-       ORDER BY cv.created_at ASC`,
-      [req.params.id]
-    );
-    res.json(cats.rows);
+    const result = await pool.query(`
+      SELECT
+        cg.id,
+        cg.nombre,
+        cg.tipo,
+        cg.monto,
+        cg.descripcion,
+        cg.created_at,
+        COUNT(DISTINCT cga.vendedor_id)::int                             AS total_vendedores,
+        COUNT(cga.id)::int                                               AS total_numeros,
+        COUNT(CASE WHEN cga.serie = 'A' THEN 1 END)::int                AS numeros_serie_a,
+        COUNT(CASE WHEN cga.serie = 'B' THEN 1 END)::int                AS numeros_serie_b
+      FROM categorias_globales cg
+      LEFT JOIN cat_global_asignaciones cga ON cga.categoria_id = cg.id
+      GROUP BY cg.id, cg.nombre, cg.tipo, cg.monto, cg.descripcion, cg.created_at
+      ORDER BY cg.nombre
+    `);
+    res.json(result.rows);
   } catch (err) {
     console.error('Error obteniendo categorías:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// ── POST /api/vendedores/:id/categorias ───────────────────────
-// Crea una nueva categoría para el vendedor
-router.post('/:id/categorias', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, max_numeros } = req.body;
-  if (!nombre || !nombre.trim())
-    return res.status(400).json({ error: 'El nombre de la categoría es requerido' });
-  if (!Number.isInteger(max_numeros) || max_numeros < 1)
-    return res.status(400).json({ error: 'max_numeros debe ser un entero mayor a 0' });
+// ── POST /api/categorias-globales ───────────────────────────
+catRouter.post('/', authMiddleware, soloDueno, async (req, res) => {
+  const { nombre, tipo = 'parcial', monto, descripcion } = req.body;
+  if (!nombre?.trim()) return res.status(400).json({ error: 'El nombre es requerido' });
+  if (!['parcial', 'simultanea'].includes(tipo))
+    return res.status(400).json({ error: 'Tipo debe ser "parcial" o "simultanea"' });
 
   try {
     const result = await pool.query(
-      `INSERT INTO categorias_vendedor (vendedor_id, nombre, max_numeros)
-       VALUES ($1, $2, $3)
-       RETURNING id, nombre, max_numeros, created_at`,
-      [req.params.id, nombre.trim(), max_numeros]
+      `INSERT INTO categorias_globales (nombre, tipo, monto, descripcion, created_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, nombre, tipo, monto, descripcion, created_at`,
+      [nombre.trim(), tipo, monto || null, descripcion || null, req.user?.id || null]
     );
-    res.status(201).json({ ...result.rows[0], numeros_count: 0, numeros: [] });
+    res.status(201).json({ ...result.rows[0], total_vendedores: 0, total_numeros: 0, numeros_serie_a: 0, numeros_serie_b: 0 });
   } catch (err) {
-    if (err.code === '23505')
-      return res.status(409).json({ error: 'Ya existe una categoría con ese nombre para este vendedor' });
+    if (err.code === '23505') return res.status(409).json({ error: 'Ya existe una categoría con ese nombre' });
     console.error('Error creando categoría:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// ── PUT /api/vendedores/:id/categorias/:catId ─────────────────
-// Edita nombre o max_numeros de una categoría
-router.put('/:id/categorias/:catId', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, max_numeros } = req.body;
+// ── PUT /api/categorias-globales/:id ────────────────────────
+catRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
+  const { nombre, monto, descripcion } = req.body;
+  // NOTA: el tipo NO se puede cambiar
   try {
     const fields = []; const params = []; let i = 1;
-    if (nombre !== undefined)      { fields.push(`nombre = $${i++}`);      params.push(nombre.trim()); }
-    if (max_numeros !== undefined) { fields.push(`max_numeros = $${i++}`); params.push(max_numeros); }
+    if (nombre      !== undefined) { fields.push(`nombre = $${i++}`);      params.push(nombre.trim()); }
+    if (monto       !== undefined) { fields.push(`monto = $${i++}`);       params.push(monto || null); }
+    if (descripcion !== undefined) { fields.push(`descripcion = $${i++}`); params.push(descripcion || null); }
     if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
 
-    params.push(req.params.catId, req.params.id);
+    params.push(req.params.id);
     const result = await pool.query(
-      `UPDATE categorias_vendedor SET ${fields.join(', ')}
-       WHERE id = $${i} AND vendedor_id = $${i + 1}
-       RETURNING id, nombre, max_numeros`,
+      `UPDATE categorias_globales SET ${fields.join(', ')}, updated_at = now()
+       WHERE id = $${i} RETURNING id, nombre, tipo, monto, descripcion`,
       params
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
     res.json(result.rows[0]);
   } catch (err) {
-    if (err.code === '23505')
-      return res.status(409).json({ error: 'Ya existe una categoría con ese nombre' });
+    if (err.code === '23505') return res.status(409).json({ error: 'Ya existe una categoría con ese nombre' });
     console.error('Error actualizando categoría:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// ── DELETE /api/vendedores/:id/categorias/:catId ──────────────
-// Elimina categoría y desvincula sus números (quedan libres)
-router.delete('/:id/categorias/:catId', authMiddleware, soloDueno, async (req, res) => {
+// ── DELETE /api/categorias-globales/:id ─────────────────────
+catRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
-    // Verificar que la categoría no esté asignada a rifas activas
-    const enRifas = await pool.query(
-      `SELECT COUNT(*)::int AS total
-       FROM rifa_categorias rc
-       JOIN rifas r ON r.id = rc.rifa_id
-       WHERE rc.categoria_id = $1 AND r.activa = true`,
-      [req.params.catId]
+    const result = await pool.query(
+      'DELETE FROM categorias_globales WHERE id = $1 RETURNING id',
+      [req.params.id]
     );
-    if (enRifas.rows[0].total > 0)
-      return res.status(400).json({ error: 'No se puede eliminar: la categoría está asignada a una rifa activa' });
-
-    await pool.query(
-      `DELETE FROM categorias_vendedor WHERE id = $1 AND vendedor_id = $2`,
-      [req.params.catId, req.params.id]
-    );
-    res.json({ message: 'Categoría eliminada. Sus números quedaron libres.' });
+    if (!result.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+    res.json({ message: 'Categoría eliminada. Las asignaciones se removieron automáticamente.' });
   } catch (err) {
     console.error('Error eliminando categoría:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// ── POST /api/vendedores/:id/categorias/:catId/numeros ────────
-// Asigna números a una categoría (respeta max_numeros)
-router.post('/:id/categorias/:catId/numeros', authMiddleware, soloDueno, async (req, res) => {
-  const { numeros } = req.body; // array de strings '000'–'999'
-  if (!Array.isArray(numeros) || !numeros.length)
-    return res.status(400).json({ error: 'Envía un array de números' });
+/* ──────────────────────────────────────────────────────────
+   GET /api/categorias-globales/:id/vendedores
+   Retorna todas las asignaciones de vendedores en la categoría
+────────────────────────────────────────────────────────── */
+catRouter.get('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    // Verificar que la categoría existe
+    const catR = await pool.query('SELECT id, tipo FROM categorias_globales WHERE id = $1', [req.params.id]);
+    if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+
+    const result = await pool.query(
+      `SELECT
+         cga.id,
+         cga.vendedor_id,
+         u.nombre    AS vendedor_nombre,
+         cga.numero,
+         cga.serie,
+         cga.created_at
+       FROM cat_global_asignaciones cga
+       JOIN users u ON u.id = cga.vendedor_id
+       WHERE cga.categoria_id = $1
+       ORDER BY u.nombre, cga.serie, cga.numero`,
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error obteniendo vendedores de categoría:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
+  let { vendedor_id, numero, serie = 'A' } = req.body;
+
+  // Validaciones básicas
+  if (!vendedor_id) return res.status(400).json({ error: 'vendedor_id es requerido' });
+  if (!numero || !/^\d{1,3}$/.test(String(numero)))
+    return res.status(400).json({ error: 'Número inválido. Debe ser 000–999' });
+
+  // Normalizar número a 3 dígitos
+  numero = String(parseInt(numero)).padStart(3, '0');
+  serie  = String(serie).toUpperCase();
+  if (!['A', 'B'].includes(serie))
+    return res.status(400).json({ error: 'Serie debe ser A o B' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Datos de la categoría
-    const catRes = await client.query(
-      `SELECT max_numeros,
-              (SELECT COUNT(*) FROM categoria_numeros WHERE categoria_id = $1) AS actuales
-       FROM categorias_vendedor WHERE id = $1 AND vendedor_id = $2`,
-      [req.params.catId, req.params.id]
+    // 1. Obtener categoría y bloquear para escritura
+    const catR = await client.query(
+      'SELECT id, tipo FROM categorias_globales WHERE id = $1 FOR UPDATE',
+      [req.params.id]
     );
-    if (!catRes.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Categoría no encontrada' }); }
-
-    const { max_numeros, actuales } = catRes.rows[0];
-    const disponible = max_numeros - parseInt(actuales);
-    if (numeros.length > disponible)
-      return res.status(400).json({
-        error: `La categoría solo admite ${disponible} número(s) más (límite: ${max_numeros})`
-      });
-
-    // Solo verificar que no estén ya en ESTA misma categoría
-    const enEstaCat = await client.query(
-      `SELECT numero FROM categoria_numeros WHERE categoria_id = $1 AND numero = ANY($2)`,
-      [req.params.catId, numeros]
-    );
-    if (enEstaCat.rows.length > 0) {
+    if (!catR.rows[0]) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: `Ya están en esta categoría: ${enEstaCat.rows.map(r => r.numero).join(', ')}`
-      });
+      return res.status(404).json({ error: 'Categoría no encontrada' });
+    }
+    const { tipo } = catR.rows[0];
+
+    // 2. Para PARCIAL forzar serie = 'A'
+    if (tipo === 'parcial') serie = 'A';
+
+    // 3. Verificar vendedor
+    const vendR = await client.query(
+      'SELECT id, nombre, activo FROM users WHERE id = $1 AND rol = $2',
+      [vendedor_id, 'vendedor']
+    );
+    if (!vendR.rows[0])
+      return res.status(404).json({ error: 'Vendedor no encontrado' });
+    if (!vendR.rows[0].activo)
+      return res.status(400).json({ error: 'El vendedor está inactivo' });
+
+    const vendedorNombre = vendR.rows[0].nombre;
+
+    // 4. Verificar colisión: ¿ya está ese número en esa serie para esta categoría?
+    const colR = await client.query(
+      `SELECT cga.id, u.nombre AS dueno_nombre
+       FROM cat_global_asignaciones cga
+       JOIN users u ON u.id = cga.vendedor_id
+       WHERE cga.categoria_id = $1 AND cga.numero = $2 AND cga.serie = $3`,
+      [req.params.id, numero, serie]
+    );
+
+    if (colR.rows[0]) {
+      await client.query('ROLLBACK');
+      const dueno = colR.rows[0].dueno_nombre;
+      if (tipo === 'parcial') {
+        return res.status(409).json({
+          error: `El número ${numero} ya está asignado a ${dueno} en esta categoría (parcial). Cada número pertenece a un solo vendedor.`
+        });
+      } else {
+        // Simultánea: verificar si la otra serie está libre
+        const otraSerie = serie === 'A' ? 'B' : 'A';
+        const otraR = await client.query(
+          `SELECT id FROM cat_global_asignaciones
+           WHERE categoria_id = $1 AND numero = $2 AND serie = $3`,
+          [req.params.id, numero, otraSerie]
+        );
+        const mensajeSugerencia = otraR.rows.length === 0
+          ? ` Sin embargo, el número ${numero} en Serie ${otraSerie} está disponible.`
+          : ` Tampoco está disponible en Serie ${otraSerie}.`;
+        return res.status(409).json({
+          error: `El número ${numero} en Serie ${serie} ya lo tiene ${dueno}.${mensajeSugerencia}`,
+          serie_alternativa: otraR.rows.length === 0 ? otraSerie : null,
+        });
+      }
     }
 
-    // Insertar
-    for (const num of numeros) {
-      await client.query(
-        `INSERT INTO categoria_numeros (categoria_id, vendedor_id, numero)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-        [req.params.catId, req.params.id, num]
+    // 5. Para SIMULTÁNEA: verificar que el mismo vendedor no tenga YA ese número en AMBAS series
+    if (tipo === 'simultanea') {
+      const yaEnAmbasR = await client.query(
+        `SELECT COUNT(*) FROM cat_global_asignaciones
+         WHERE categoria_id = $1 AND vendedor_id = $2 AND numero = $3`,
+        [req.params.id, vendedor_id, numero]
       );
+      // Solo se bloquea si ya tiene el número en la serie opuesta Y está intentando agregarlo en la misma
+      // (ya controlado por UNIQUE en cat_global_asig_unica)
+      // Este check adicional es semántico: un vendedor puede tener 001-A y 001-B
+      // pero no 001-A y 001-A (cubierto por UNIQUE)
     }
+
+    // 6. Insertar
+    const insR = await client.query(
+      `INSERT INTO cat_global_asignaciones (categoria_id, vendedor_id, numero, serie)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, categoria_id, vendedor_id, numero, serie, created_at`,
+      [req.params.id, vendedor_id, numero, serie]
+    );
 
     await client.query('COMMIT');
-    res.status(201).json({ message: `${numeros.length} número(s) asignados` });
+
+    res.status(201).json({
+      ...insR.rows[0],
+      vendedor_nombre: vendedorNombre,
+      message: `✅ ${vendedorNombre} asignado con el número ${numero}${tipo === 'simultanea' ? ` (Serie ${serie})` : ''}`
+    });
   } catch (err) {
     await client.query('ROLLBACK');
-    if (err.code === '23505') return res.status(409).json({ error: 'Uno o más números ya están ocupados' });
+    if (err.code === '23505')
+      return res.status(409).json({ error: 'Ese número ya está asignado en esa serie para esta categoría' });
+    console.error('Error asignando vendedor a categoría:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+});
+
+/* ──────────────────────────────────────────────────────────
+   DELETE /api/categorias-globales/:id/vendedores/:asigId
+   Quita una asignación específica
+────────────────────────────────────────────────────────── */
+catRouter.delete('/:id/vendedores/:asigId', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    // Verificar si hay ventas activas relacionadas con este número en rifas donde se usa esta categoría
+    // (lógica de protección futura — por ahora permitir quitar libremente)
+    const result = await pool.query(
+      `DELETE FROM cat_global_asignaciones
+       WHERE id = $1 AND categoria_id = $2
+       RETURNING id, numero, vendedor_id`,
+      [req.params.asigId, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Asignación no encontrada' });
+
+    res.json({ message: 'Asignación removida', numero: result.rows[0].numero });
+  } catch (err) {
+    console.error('Error eliminando asignación:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+catRouter.get('/:id/numeros-disponibles', authMiddleware, soloDueno, async (req, res) => {
+  const { serie = 'A', cantidad = 100 } = req.query;
+  try {
+    const catR = await pool.query('SELECT tipo FROM categorias_globales WHERE id = $1', [req.params.id]);
+    if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+
+    const serieQ = catR.rows[0].tipo === 'parcial' ? 'A' : serie.toUpperCase();
+
+    const result = await pool.query(
+      `SELECT LPAD(gs::text, 3, '0') AS numero
+       FROM generate_series(0, 999) gs
+       WHERE LPAD(gs::text, 3, '0') NOT IN (
+         SELECT numero FROM cat_global_asignaciones
+         WHERE categoria_id = $1 AND serie = $2
+       )
+       ORDER BY gs
+       LIMIT $3`,
+      [req.params.id, serieQ, parseInt(cantidad)]
+    );
+    res.json({ numeros: result.rows.map(r => r.numero), serie: serieQ });
+  } catch (err) {
+    console.error('Error obteniendo números disponibles:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+/* ════════════════════════════════════════════════════════════
+   RUTAS DE NÚMEROS GLOBALES DEL VENDEDOR
+   Prefijo: /api/numeros
+════════════════════════════════════════════════════════════ */
+const numRouter = express.Router();
+
+// ── POST /api/numeros/asignar ────────────────────────────────
+numRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
+  const { vendedor_id, numeros } = req.body;
+  if (!vendedor_id || !Array.isArray(numeros) || !numeros.length)
+    return res.status(400).json({ error: 'vendedor_id y numeros[] son requeridos' });
+
+  const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
+  if (invalidos.length) return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Verificar que los números no estén ya en numeros_vendedor_global de OTRO vendedor
+    // OJO: Los números SÍ pueden repetirse entre vendedores en el nuevo sistema
+    // Solo bloqueamos si ya los tiene EL MISMO vendedor (duplicado)
+    const yaDelVendedor = await client.query(
+      `SELECT numero FROM numeros_vendedor_global
+       WHERE vendedor_id = $1 AND numero = ANY($2)`,
+      [vendedor_id, numeros]
+    );
+    if (yaDelVendedor.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `Este vendedor ya tiene asignados: ${yaDelVendedor.rows.map(r => r.numero).join(', ')}`
+      });
+    }
+
+    for (const num of numeros) {
+      await client.query(
+        `INSERT INTO numeros_vendedor_global (vendedor_id, numero)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [vendedor_id, num]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ message: `${numeros.length} número(s) asignados al vendedor` });
+  } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Error asignando números:', err);
     res.status(500).json({ error: 'Error del servidor' });
   } finally { client.release(); }
 });
 
-// ── DELETE /api/vendedores/:id/categorias/:catId/numeros ──────
-// Quita números de una categoría
-router.delete('/:id/categorias/:catId/numeros', authMiddleware, soloDueno, async (req, res) => {
-  const { numeros } = req.body;
-  if (!Array.isArray(numeros) || !numeros.length)
-    return res.status(400).json({ error: 'Envía un array de números' });
+// ── DELETE /api/numeros/asignar ──────────────────────────────
+numRouter.delete('/asignar', authMiddleware, soloDueno, async (req, res) => {
+  const { vendedor_id, numeros } = req.body;
+  if (!vendedor_id || !Array.isArray(numeros) || !numeros.length)
+    return res.status(400).json({ error: 'vendedor_id y numeros[] son requeridos' });
 
   try {
-    // Verificar que ningún número tenga venta activa en rifas donde esta categoría esté asignada
+    // Verificar que no estén vendidos en rifas activas
     const conVenta = await pool.query(
-      `SELECT DISTINCT cn.numero
-       FROM categoria_numeros cn
-       JOIN rifa_categorias rc ON rc.categoria_id = cn.categoria_id
-       JOIN ventas v ON v.rifa_id = rc.rifa_id AND v.numero = cn.numero AND v.vendedor_id = cn.vendedor_id
-       WHERE cn.categoria_id = $1 AND cn.numero = ANY($2)`,
-      [req.params.catId, numeros]
+      `SELECT DISTINCT ng.numero
+       FROM numeros_vendedor_global ng
+       JOIN ventas v ON v.vendedor_id = ng.vendedor_id AND v.numero = ng.numero
+       JOIN rifas r  ON r.id = v.rifa_id AND r.activa = true
+       WHERE ng.vendedor_id = $1 AND ng.numero = ANY($2)`,
+      [vendedor_id, numeros]
     );
     if (conVenta.rows.length > 0)
       return res.status(400).json({
@@ -401,8 +523,8 @@ router.delete('/:id/categorias/:catId/numeros', authMiddleware, soloDueno, async
       });
 
     await pool.query(
-      `DELETE FROM categoria_numeros WHERE categoria_id = $1 AND numero = ANY($2)`,
-      [req.params.catId, numeros]
+      'DELETE FROM numeros_vendedor_global WHERE vendedor_id = $1 AND numero = ANY($2)',
+      [vendedor_id, numeros]
     );
     res.json({ message: `${numeros.length} número(s) removidos` });
   } catch (err) {
@@ -411,28 +533,4 @@ router.delete('/:id/categorias/:catId/numeros', authMiddleware, soloDueno, async
   }
 });
 
-// ── GET /api/vendedores/:id/categorias/numeros-disponibles ────
-// Devuelve números libres del pool global para sugerir
-router.get('/:id/categorias/numeros-disponibles', authMiddleware, soloDueno, async (req, res) => {
-  const { cantidad = 10, excluir = '' } = req.query;
-  const excluirArr = excluir ? excluir.split(',').map(n => n.trim()).filter(Boolean) : [];
-  try {
-    const result = await pool.query(
-      `SELECT LPAD(gs::text, 3, '0') AS numero
-       FROM generate_series(0, 999) gs
-       WHERE LPAD(gs::text, 3, '0') NOT IN (
-         SELECT numero FROM numeros_vendedor_global
-       )
-       ${excluirArr.length > 0 ? `AND LPAD(gs::text, 3, '0') != ALL($2::char[])` : ''}
-       ORDER BY RANDOM()
-       LIMIT $1`,
-      excluirArr.length > 0 ? [parseInt(cantidad), excluirArr] : [parseInt(cantidad)]
-    );
-    res.json({ numeros: result.rows.map(r => r.numero) });
-  } catch (err) {
-    console.error('Error obteniendo números disponibles:', err);
-    res.status(500).json({ error: 'Error del servidor' });
-  }
-});
-
-module.exports = router;
+module.exports = { vendedoresRouter: router, categoriasGlobalesRouter: catRouter, numerosRouter: numRouter };

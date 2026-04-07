@@ -29,8 +29,8 @@ if (process.env.NODE_ENV === "development") {
 // ── Rutas de la API ────────────────────────────────────────
 app.use("/api/auth",              require("./routes/auth"));
 app.use("/api/rifas",             require("./routes/rifas"));
-app.use("/api/numeros",           require("./routes/numeros"));      // tu archivo numeros.js existente
 app.use("/api/numeros",           numerosRouter);                    // POST/DELETE /api/numeros/asignar
+app.use("/api/numeros",           require("./routes/numeros"));      // tu archivo numeros.js existente
 app.use("/api/vendedores",        vendedoresRouter);
 app.use("/api/reportes",          require("./routes/reportes"));
 app.use("/api/caja",              require("./routes/caja"));

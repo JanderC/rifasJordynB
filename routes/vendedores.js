@@ -205,7 +205,7 @@ numRouter.post('/asignar', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Solo rechazar si el MISMO vendedor ya tiene ese número
+    // ✅ Solo rechazar si EL MISMO vendedor ya tiene ese número
     const yaDelVendedor = await client.query(
       `SELECT numero FROM numeros_vendedor_global
        WHERE vendedor_id = $1 AND numero = ANY($2::char[])`,

@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { vendedoresRouter, categoriasGlobalesRouter, numerosRouter } = require('./routes/vendedores');
+const { vendedoresRouter, categoriasGlobalesRouter } = require('./routes/vendedores');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -27,16 +27,15 @@ if (process.env.NODE_ENV === "development") {
 }
 
 // ── Rutas de la API ────────────────────────────────────────
-app.use("/api/auth",              require("./routes/auth"));
-app.use("/api/rifas",             require("./routes/rifas"));
-app.use("/api/numeros",           numerosRouter);                    // POST/DELETE /api/numeros/asignar
-app.use("/api/numeros",           require("./routes/numeros"));      // tu archivo numeros.js existente
-app.use("/api/vendedores",        vendedoresRouter);
-app.use("/api/reportes",          require("./routes/reportes"));
-app.use("/api/caja",              require("./routes/caja"));
-app.use("/api/publico",           require("./routes/Publico"));
-app.use("/api/tasas",             require("./routes/tasas"));
-app.use("/api/ticket-design",     require("./routes/ticketDesign"));
+app.use("/api/auth",               require("./routes/auth"));
+app.use("/api/rifas",              require("./routes/rifas"));
+app.use("/api/numeros",            require("./routes/numeros"));   // numeros.js existente (vender, verificar)
+app.use("/api/vendedores",         vendedoresRouter);
+app.use("/api/reportes",           require("./routes/reportes"));
+app.use("/api/caja",               require("./routes/caja"));
+app.use("/api/publico",            require("./routes/Publico"));
+app.use("/api/tasas",              require("./routes/tasas"));
+app.use("/api/ticket-design",      require("./routes/ticketDesign"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);
 
 // ── Health check ───────────────────────────────────────────
@@ -76,12 +75,12 @@ app.listen(PORT, () => {
   console.log(`    GET    /api/rifas`);
   console.log(`    GET    /api/numeros/verificar/:numero`);
   console.log(`    POST   /api/numeros/vender`);
-  console.log(`    POST   /api/numeros/asignar`);
-  console.log(`    DELETE /api/numeros/asignar`);
   console.log(`    GET    /api/vendedores`);
   console.log(`    GET    /api/vendedores/:id`);
   console.log(`    GET    /api/categorias-globales`);
   console.log(`    POST   /api/categorias-globales`);
+  console.log(`    POST   /api/categorias-globales/:id/vendedores/:vid/numeros`);
+  console.log(`    POST   /api/categorias-globales/:id/vendedores/:vid/asignar`);
   console.log(`    GET    /api/reportes/dashboard`);
   console.log(`    GET    /api/publico/rifas              (público)`);
   console.log(`    POST   /api/publico/reservar           (público)`);

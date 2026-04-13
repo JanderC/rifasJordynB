@@ -1,32 +1,32 @@
 // ============================================================
-//   RIFAS JORDYN — Vendedores + Categorías Globales  (v5 FINAL)
+//   RIFAS JORDYN — Vendedores + Categorías Globales  (v6)
 //
-//   ARQUITECTURA DEFINITIVA — Se elimina el concepto de "slots".
+//   CAMBIOS v6:
+//   ─────────────────────────────────────────────────────────
+//   • resolverSerie (SIMULTÁNEA): un vendedor SÍ puede tener
+//     el mismo número en Serie A y en Serie B.
+//     - Vendedor tiene A, B libre   → asignar B  ← NUEVO
+//     - Vendedor tiene B, A libre   → asignar A  ← edge-case
+//     - Vendedor tiene A y B        → sin espacio ← NUEVO
+//     - Vendedor tiene A, B tomada por otro → sin espacio
 //
-//   TABLAS (sin cambios de schema respecto a v2):
+//   • asignarSeriesParaVendedor: "pendiente" = número que NO
+//     tiene AMBAS series asignadas (simultánea). Parcial = igual.
+//
+//   • POST /numeros: si número ya está en pool y categoría es
+//     simultánea, auto-asigna la siguiente serie disponible.
+//
+//   • GET /vendedores-resumen: COUNT(DISTINCT cvn.numero) para
+//     evitar doble-conteo cuando vendedor tiene A y B del mismo
+//     número.
+//
+//   TABLAS (sin cambios de schema):
 //   ─────────────────────────────────────────────
 //   cat_vendedor_numeros
-//     (categoria_id, vendedor_id, numero)
-//     UNIQUE (categoria_id, vendedor_id, numero)   ← UN registro por número/vendedor
+//     UNIQUE (categoria_id, vendedor_id, numero)
 //
 //   cat_global_asignaciones
-//     (categoria_id, vendedor_id, numero, serie)
-//     UNIQUE (categoria_id, numero, serie)          ← garantiza 1 dueño por serie
-//
-//   REGLAS DE NEGOCIO (implementadas en resolverSerie):
-//   ────────────────────────────────────────────────────
-//   PARCIAL:
-//     • Serie A libre para ese número → asignar.
-//     • Serie A ocupada → conflicto, no se asigna.
-//
-//   SIMULTÁNEA:
-//     • Serie A libre → asignar en A.
-//     • Serie A ocupada, Serie B libre → asignar en B (automático).
-//     • Serie A y B ocupadas → conflicto, informar quién tiene cada una.
-//
-//   El vendedor NO puede tener el mismo número dos veces.
-//   Lo que sí puede ocurrir: Juan tiene 123 en Serie A,
-//   Pedro también tiene 123 en Serie B — son dos vendedores distintos.
+//     UNIQUE (categoria_id, numero, serie)   ← 1 dueño por serie
 // ============================================================
 
 const express = require('express');
@@ -36,30 +36,9 @@ const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
 /* ══════════════════════════════════════════════════════════════
-   FUNCIÓN CENTRAL: resolverSerie
-   ──────────────────────────────────────────────────────────────
-   Recibe:
-     client        — conexión pg (dentro de transacción)
-     categoriaId   — id de la categoría
-     numero        — string '000'-'999'
-     vendedorId    — id del vendedor que quiere el número
-     tipo          — 'parcial' | 'simultanea'
-
-   Retorna:
-   {
-     serie:      'A' | 'B' | null,   // null = sin espacio
-     disponible: boolean,
-     ocupadaA:   { vendedor_id, nombre } | null,
-     ocupadaB:   { vendedor_id, nombre } | null,
-     mensaje:    string,
-   }
-
-   Esta función es la ÚNICA fuente de verdad para decidir
-   en qué serie entra un número. Se usa en /asignar, en
-   /validar-numero y en el helper de asignación masiva.
+   FUNCIÓN CENTRAL: resolverSerie  (v6)
 ══════════════════════════════════════════════════════════════ */
 async function resolverSerie(client, categoriaId, numero, vendedorId, tipo) {
-  // Quién ocupa cada serie de este número (puede ser el propio vendedor u otro)
   const r = await client.query(
     `SELECT cga.serie, cga.vendedor_id, u.nombre
      FROM cat_global_asignaciones cga
@@ -76,52 +55,71 @@ async function resolverSerie(client, categoriaId, numero, vendedorId, tipo) {
   if (tipo === 'parcial') {
     if (!ocupadaA) {
       return { serie: 'A', disponible: true, ocupadaA: null, ocupadaB: null,
-        mensaje: `Número libre. Se asignará en Serie A.` };
+        mensaje: 'Número libre. Se asignará en Serie A.' };
     }
-    // Ocupado: ¿es el propio vendedor?
     if (String(ocupadaA.vendedor_id) === String(vendedorId)) {
       return { serie: null, disponible: false, ocupadaA, ocupadaB: null,
-        mensaje: `Ya tienes este número asignado (Serie A).` };
+        mensaje: 'Ya tienes este número asignado (Serie A).' };
     }
     return { serie: null, disponible: false, ocupadaA, ocupadaB: null,
       mensaje: `Número ocupado por ${ocupadaA.nombre} (Serie A).` };
   }
 
-  // ── SIMULTÁNEA ────────────────────────────────────────────
-  // Verificar si el propio vendedor ya tiene este número
-  if (ocupadaA && String(ocupadaA.vendedor_id) === String(vendedorId)) {
+  // ── SIMULTÁNEA (v6) ───────────────────────────────────────
+  const selfA = ocupadaA && String(ocupadaA.vendedor_id) === String(vendedorId);
+  const selfB = ocupadaB && String(ocupadaB.vendedor_id) === String(vendedorId);
+
+  // Vendedor ya tiene AMBAS series → sin espacio
+  if (selfA && selfB) {
     return { serie: null, disponible: false, ocupadaA, ocupadaB,
-      mensaje: `Ya tienes este número en Serie A.` };
-  }
-  if (ocupadaB && String(ocupadaB.vendedor_id) === String(vendedorId)) {
-    return { serie: null, disponible: false, ocupadaA, ocupadaB,
-      mensaje: `Ya tienes este número en Serie B.` };
+      mensaje: `Ya tienes el ${numero} en Serie A y en Serie B. No hay más espacio.` };
   }
 
-  // Paso 1-2: Serie A libre → asignar en A
+  // Vendedor tiene A, B libre → asignar B (segunda serie del mismo vendedor)
+  if (selfA && !ocupadaB) {
+    return { serie: 'B', disponible: true, ocupadaA, ocupadaB: null,
+      mensaje: `Ya tienes Serie A. Se asignará en Serie B.` };
+  }
+
+  // Vendedor tiene A, B ocupada por otro → sin espacio
+  if (selfA && ocupadaB && !selfB) {
+    return { serie: null, disponible: false, ocupadaA, ocupadaB,
+      mensaje: `Ya tienes Serie A. Serie B está ocupada por ${ocupadaB.nombre}.` };
+  }
+
+  // Vendedor tiene B, A libre → asignar A (edge-case: puede pasar si A fue liberada)
+  if (selfB && !ocupadaA) {
+    return { serie: 'A', disponible: true, ocupadaA: null, ocupadaB,
+      mensaje: `Ya tienes Serie B. Se asignará en Serie A.` };
+  }
+
+  // Vendedor tiene B, A ocupada por otro → sin espacio
+  if (selfB && ocupadaA && !selfA) {
+    return { serie: null, disponible: false, ocupadaA, ocupadaB,
+      mensaje: `Ya tienes Serie B. Serie A está ocupada por ${ocupadaA.nombre}.` };
+  }
+
+  // Flujo normal: vendedor no tiene ninguna serie de este número
   if (!ocupadaA) {
     return { serie: 'A', disponible: true, ocupadaA: null, ocupadaB,
-      mensaje: `Serie A libre. Se asignará en Serie A.` };
+      mensaje: 'Serie A libre. Se asignará en Serie A.' };
   }
-
-  // Paso 3: Serie A ocupada → intentar Serie B
   if (!ocupadaB) {
     return { serie: 'B', disponible: true, ocupadaA, ocupadaB: null,
       mensaje: `Serie A ocupada por ${ocupadaA.nombre}. Se asignará en Serie B.` };
   }
 
-  // Paso 4: Ambas series ocupadas → conflicto
+  // Ambas tomadas por otros
   return { serie: null, disponible: false, ocupadaA, ocupadaB,
-    mensaje: `Número sin espacio. Serie A: ${ocupadaA.nombre} / Serie B: ${ocupadaB.nombre}.` };
+    mensaje: `Sin espacio. Serie A: ${ocupadaA.nombre} / Serie B: ${ocupadaB.nombre}.` };
 }
 
 /* ══════════════════════════════════════════════════════════════
-   HELPER: asignarSeriesParaVendedor
-   Procesa TODOS los números pendientes de un vendedor en la
-   categoría usando resolverSerie como única fuente de verdad.
+   HELPER: asignarSeriesParaVendedor  (v6)
+   Para simultánea: "pendiente" = no tiene AÚN las 2 series.
+   Para parcial: "pendiente" = sin ninguna asignación (igual).
 ══════════════════════════════════════════════════════════════ */
 async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo) {
-  // Números del vendedor en el pool
   const poolR = await client.query(
     `SELECT numero FROM cat_vendedor_numeros
      WHERE categoria_id = $1 AND vendedor_id = $2
@@ -130,25 +128,40 @@ async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo) 
   );
   if (!poolR.rows.length) return { insertados: [], colisiones: [] };
 
-  // Filtrar los que YA tienen asignación (de cualquier serie para este vendedor)
+  // Obtener todas las asignaciones existentes del vendedor (numero + serie)
   const asigR = await client.query(
-    `SELECT numero FROM cat_global_asignaciones
+    `SELECT numero, serie FROM cat_global_asignaciones
      WHERE categoria_id = $1 AND vendedor_id = $2`,
     [categoriaId, vendedorId]
   );
-  const yaAsignados = new Set(asigR.rows.map(r => r.numero));
-  const pendientes  = poolR.rows.map(r => r.numero).filter(n => !yaAsignados.has(n));
+
+  // Mapa: numero → ['A'], ['B'], o ['A','B']
+  const seriesMap = {};
+  asigR.rows.forEach(row => {
+    if (!seriesMap[row.numero]) seriesMap[row.numero] = [];
+    seriesMap[row.numero].push(row.serie);
+  });
+
+  // Filtrar los pendientes
+  const pendientes = poolR.rows.map(r => r.numero).filter(n => {
+    if (tipo === 'simultanea') {
+      // Pendiente si tiene 0 o 1 series (puede obtener otra)
+      return (seriesMap[n] || []).length < 2;
+    } else {
+      // Parcial: pendiente si no tiene ninguna
+      return !(seriesMap[n] && seriesMap[n].length > 0);
+    }
+  });
 
   if (!pendientes.length) return { insertados: [], colisiones: [] };
 
-  const insertados  = [];
-  const colisiones  = [];
+  const insertados = [];
+  const colisiones = [];
 
   for (const numero of pendientes) {
     const resolucion = await resolverSerie(client, categoriaId, numero, vendedorId, tipo);
 
     if (resolucion.disponible) {
-      // Insertar la asignación con ON CONFLICT por si acaso hay concurrencia
       const ins = await client.query(
         `INSERT INTO cat_global_asignaciones (categoria_id, vendedor_id, numero, serie)
          VALUES ($1, $2, $3, $4)
@@ -159,7 +172,7 @@ async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo) 
       if (ins.rows[0]) {
         insertados.push({ numero, serie: resolucion.serie, mensaje: resolucion.mensaje });
       } else {
-        // Raro: conflicto de concurrencia — re-resolver
+        // Rarísimo: concurrencia → re-resolver
         const reintento = await resolverSerie(client, categoriaId, numero, vendedorId, tipo);
         if (reintento.disponible) {
           const ins2 = await client.query(
@@ -343,7 +356,9 @@ catRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────────
-   GET /api/categorias-globales/:id/vendedores-resumen
+   GET /api/categorias-globales/:id/vendedores-resumen  (v6)
+   FIX: COUNT(DISTINCT cvn.numero) para evitar doble-conteo cuando
+   un vendedor tiene el mismo número en Serie A y en Serie B.
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, res) => {
   try {
@@ -355,16 +370,16 @@ catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, 
          cvn.vendedor_id,
          u.nombre  AS vendedor_nombre,
          u.cedula,
-         COUNT(cvn.numero)::int                            AS total_numeros,
-         COUNT(cga.id)::int                                AS total_asignados,
-         COUNT(CASE WHEN cga.serie='A' THEN 1 END)::int   AS serie_a,
-         COUNT(CASE WHEN cga.serie='B' THEN 1 END)::int   AS serie_b,
+         COUNT(DISTINCT cvn.numero)::int                          AS total_numeros,
+         COUNT(cga.id)::int                                       AS total_asignados,
+         COUNT(CASE WHEN cga.serie='A' THEN 1 END)::int          AS serie_a,
+         COUNT(CASE WHEN cga.serie='B' THEN 1 END)::int          AS serie_b,
          JSON_AGG(
            JSON_BUILD_OBJECT(
              'numero',        cvn.numero,
              'serie',         cga.serie,
              'asignacion_id', cga.id
-           ) ORDER BY cvn.numero
+           ) ORDER BY cvn.numero, cga.serie NULLS LAST
          ) AS numeros
        FROM cat_vendedor_numeros cvn
        JOIN users u ON u.id = cvn.vendedor_id
@@ -382,11 +397,8 @@ catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, 
 });
 
 /* ──────────────────────────────────────────────────────────────────
-   GET /api/categorias-globales/:id/validar-numero
-   ?numero=012&vendedor_id=5
-
-   Usa resolverSerie directamente — misma lógica que la asignación real.
-   No modifica nada. Respuesta inmediata para el frontend.
+   GET /api/categorias-globales/:id/validar-numero  (v6)
+   Ahora retorna: ya_tiene_a, ya_tiene_b para el frontend.
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/validar-numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero, vendedor_id } = req.query;
@@ -401,21 +413,26 @@ catRouter.get('/:id/validar-numero', authMiddleware, soloDueno, async (req, res)
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
     const { tipo } = catR.rows[0];
 
-    // ¿El vendedor ya tiene este número en su pool?
     const enPoolR = await client.query(
       `SELECT id FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=$3`,
       [req.params.id, vendedor_id, numero]
     );
     const yaEnPool = enPoolR.rows.length > 0;
 
-    // Resolver usando la función central
+    // Qué series ya tiene el vendedor para este número
+    const misSeriesR = await client.query(
+      `SELECT serie FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=$3`,
+      [req.params.id, vendedor_id, numero]
+    );
+    const mySeries = misSeriesR.rows.map(r => r.serie);
+
     const resolucion = await resolverSerie(client, req.params.id, numero, vendedor_id, tipo);
 
     res.json({
       numero,
       tipo,
       disponible:    resolucion.disponible,
-      serie_destino: resolucion.serie,         // 'A', 'B' o null
+      serie_destino: resolucion.serie,
       serie_a: {
         libre: !resolucion.ocupadaA,
         dueno: resolucion.ocupadaA?.nombre || null,
@@ -424,8 +441,10 @@ catRouter.get('/:id/validar-numero', authMiddleware, soloDueno, async (req, res)
         libre: !resolucion.ocupadaB,
         dueno: resolucion.ocupadaB?.nombre || null,
       } : undefined,
-      ya_en_pool: yaEnPool,
-      mensaje:    resolucion.mensaje,
+      ya_en_pool:  yaEnPool,
+      ya_tiene_a:  mySeries.includes('A'),
+      ya_tiene_b:  mySeries.includes('B'),
+      mensaje:     resolucion.mensaje,
     });
   } catch (err) {
     console.error('GET /validar-numero:', err);
@@ -435,8 +454,8 @@ catRouter.get('/:id/validar-numero', authMiddleware, soloDueno, async (req, res)
 
 /* ──────────────────────────────────────────────────────────────────
    POST /api/categorias-globales/:id/vendedores/:vendedorId/numeros
-   Agrega números al pool. No asigna series todavía.
-   Body: { numeros: ['001','050','123'] }
+   v6: Si número ya estaba en pool y categoría es SIMULTÁNEA,
+   auto-asigna la siguiente serie disponible (A→B ó B→A).
 ──────────────────────────────────────────────────────────────────*/
 catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno, async (req, res) => {
   const { numeros } = req.body;
@@ -447,7 +466,6 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
   if (invalidos.length)
     return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
 
-  // Deduplicar — un vendedor tiene un número una sola vez en el pool
   const numerosUnicos = [...new Set(numeros)];
 
   const client = await pool.connect();
@@ -462,7 +480,7 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
     if (!vendR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Vendedor no encontrado' }); }
     if (!vendR.rows[0].activo) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'El vendedor está inactivo' }); }
 
-    // Cuáles ya están en el pool del vendedor
+    // Cuáles ya están en el pool
     const existR = await client.query(
       `SELECT numero FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[])`,
       [req.params.id, req.params.vendedorId, numerosUnicos]
@@ -470,7 +488,7 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
     const yaExisten = new Set(existR.rows.map(r => r.numero));
     const nuevos    = numerosUnicos.filter(n => !yaExisten.has(n));
 
-    // Insertar los nuevos al pool
+    // Insertar nuevos al pool
     for (const num of nuevos) {
       await client.query(
         `INSERT INTO cat_vendedor_numeros (categoria_id, vendedor_id, numero) VALUES ($1,$2,$3)`,
@@ -478,26 +496,75 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
       );
     }
 
-    // Calcular previsualización de series para los recién insertados
+    // Info de series para los números nuevos
     const infoSeries = [];
     for (const num of nuevos) {
-      const res = await resolverSerie(client, req.params.id, num, req.params.vendedorId, tipo);
+      const r = await resolverSerie(client, req.params.id, num, req.params.vendedorId, tipo);
       infoSeries.push({
         numero:        num,
-        disponible:    res.disponible,
-        serie_destino: res.serie,
-        serie_a:       { libre: !res.ocupadaA, dueno: res.ocupadaA?.nombre || null },
-        ...(tipo === 'simultanea' ? { serie_b: { libre: !res.ocupadaB, dueno: res.ocupadaB?.nombre || null } } : {}),
-        mensaje:       res.mensaje,
+        disponible:    r.disponible,
+        serie_destino: r.serie,
+        serie_a:       { libre: !r.ocupadaA, dueno: r.ocupadaA?.nombre || null },
+        ...(tipo === 'simultanea' ? { serie_b: { libre: !r.ocupadaB, dueno: r.ocupadaB?.nombre || null } } : {}),
+        mensaje:       r.mensaje,
       });
     }
 
+    // v6: Para números ya en pool en SIMULTÁNEA → auto-asignar siguiente serie
+    const asignacionesExtra = [];
+    const colisionesExtra   = [];
+
+    if (tipo === 'simultanea' && yaExisten.size > 0) {
+      for (const num of [...yaExisten]) {
+        const r = await resolverSerie(client, req.params.id, num, req.params.vendedorId, tipo);
+        if (r.disponible) {
+          const ins = await client.query(
+            `INSERT INTO cat_global_asignaciones (categoria_id, vendedor_id, numero, serie)
+             VALUES ($1,$2,$3,$4) ON CONFLICT (categoria_id, numero, serie) DO NOTHING
+             RETURNING id, numero, serie`,
+            [req.params.id, req.params.vendedorId, num, r.serie]
+          );
+          if (ins.rows[0]) {
+            asignacionesExtra.push({ numero: num, serie: r.serie, mensaje: r.mensaje });
+          } else {
+            const r2 = await resolverSerie(client, req.params.id, num, req.params.vendedorId, tipo);
+            if (r2.disponible) {
+              const ins2 = await client.query(
+                `INSERT INTO cat_global_asignaciones (categoria_id, vendedor_id, numero, serie)
+                 VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id, numero, serie`,
+                [req.params.id, req.params.vendedorId, num, r2.serie]
+              );
+              if (ins2.rows[0]) asignacionesExtra.push({ numero: num, serie: r2.serie, mensaje: r2.mensaje });
+              else colisionesExtra.push({ numero: num, mensaje: r2.mensaje, dueno_a: r2.ocupadaA?.nombre || null, dueno_b: r2.ocupadaB?.nombre || null });
+            } else {
+              colisionesExtra.push({ numero: num, mensaje: r2.mensaje, dueno_a: r2.ocupadaA?.nombre || null, dueno_b: r2.ocupadaB?.nombre || null });
+            }
+          }
+        } else {
+          colisionesExtra.push({
+            numero:  num,
+            mensaje: r.mensaje,
+            dueno_a: r.ocupadaA?.nombre || null,
+            dueno_b: r.ocupadaB?.nombre || null,
+          });
+        }
+      }
+    }
+
     await client.query('COMMIT');
+
+    const mensajes = [];
+    if (nuevos.length)             mensajes.push(`${nuevos.length} número(s) agregados al pool`);
+    if (asignacionesExtra.length)  mensajes.push(`${asignacionesExtra.length} número(s) asignados a segunda serie`);
+    if (colisionesExtra.length)    mensajes.push(`${colisionesExtra.length} número(s) sin serie disponible`);
+
     res.status(201).json({
-      message:     `${nuevos.length} número(s) agregados al pool de ${vendR.rows[0].nombre}.`,
-      insertados:  nuevos.length,
-      ya_existian: [...yaExisten],
-      info_series: infoSeries,
+      message:            mensajes.join('. ') || 'Sin cambios.',
+      insertados:         nuevos.length,
+      ya_existian:        [...yaExisten],
+      info_series:        infoSeries,
+      asignaciones_extra: asignacionesExtra,
+      colisiones_extra:   colisionesExtra,
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -508,7 +575,6 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
 
 /* ──────────────────────────────────────────────────────────────────
    DELETE /api/categorias-globales/:id/vendedores/:vendedorId/numeros
-   Body: { numeros: ['001','050'] }
 ──────────────────────────────────────────────────────────────────*/
 catRouter.delete('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno, async (req, res) => {
   const { numeros } = req.body;
@@ -518,12 +584,10 @@ catRouter.delete('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDuen
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Eliminar asignaciones primero
     await client.query(
       `DELETE FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[])`,
       [req.params.id, req.params.vendedorId, numeros]
     );
-    // Eliminar del pool
     const r = await client.query(
       `DELETE FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[]) RETURNING numero`,
       [req.params.id, req.params.vendedorId, numeros]
@@ -538,8 +602,7 @@ catRouter.delete('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDuen
 
 /* ──────────────────────────────────────────────────────────────────
    POST /api/categorias-globales/:id/vendedores/:vendedorId/asignar
-   Asigna series a todos los números pendientes del vendedor.
-   Usa resolverSerie → sin números huérfanos, sin duplicados en serie.
+   v6: en simultánea también asigna serie B a números con solo A.
 ──────────────────────────────────────────────────────────────────*/
 catRouter.post('/:id/vendedores/:vendedorId/asignar', authMiddleware, soloDueno, async (req, res) => {
   const client = await pool.connect();
@@ -582,8 +645,7 @@ catRouter.post('/:id/vendedores/:vendedorId/asignar', authMiddleware, soloDueno,
 
 /* ──────────────────────────────────────────────────────────────────
    GET /api/categorias-globales/:id/preview/:vendedorId
-   Previsualiza la asignación sin modificar nada.
-   Usa resolverSerie → 100% fiel a lo que haría /asignar.
+   v6: usa la misma lógica de pendientes que asignarSeriesParaVendedor
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req, res) => {
   const client = await pool.connect();
@@ -595,7 +657,6 @@ catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req,
     const vendR = await client.query('SELECT id,nombre FROM users WHERE id=$1 AND rol=$2', [req.params.vendedorId, 'vendedor']);
     if (!vendR.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
 
-    // Números del vendedor en el pool
     const poolR = await client.query(
       `SELECT numero FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 ORDER BY numero`,
       [req.params.id, req.params.vendedorId]
@@ -603,13 +664,21 @@ catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req,
     if (!poolR.rows.length)
       return res.json({ tipo, libres:[], colisiones:[], puedeAgregar:false, sinNumeros:true, vendedor_nombre: vendR.rows[0].nombre });
 
-    // Ya asignados para este vendedor
     const asigR = await client.query(
-      `SELECT numero FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2`,
+      `SELECT numero, serie FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2`,
       [req.params.id, req.params.vendedorId]
     );
-    const yaAsignados = new Set(asigR.rows.map(r => r.numero));
-    const pendientes  = poolR.rows.map(r => r.numero).filter(n => !yaAsignados.has(n));
+
+    const seriesMap = {};
+    asigR.rows.forEach(row => {
+      if (!seriesMap[row.numero]) seriesMap[row.numero] = [];
+      seriesMap[row.numero].push(row.serie);
+    });
+
+    const pendientes = poolR.rows.map(r => r.numero).filter(n => {
+      if (tipo === 'simultanea') return (seriesMap[n] || []).length < 2;
+      else return !(seriesMap[n] && seriesMap[n].length > 0);
+    });
 
     if (!pendientes.length)
       return res.json({ tipo, libres:[], colisiones:[], puedeAgregar:false, todoAsignado:true, vendedor_nombre: vendR.rows[0].nombre });
@@ -630,9 +699,9 @@ catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req,
       } else {
         colisiones.push({
           numero,
-          mensaje: r.mensaje,
-          dueno_a: r.ocupadaA?.nombre || null,
-          dueno_b: r.ocupadaB?.nombre || null,
+          mensaje:  r.mensaje,
+          dueno_a:  r.ocupadaA?.nombre || null,
+          dueno_b:  r.ocupadaB?.nombre || null,
         });
       }
     }
@@ -652,7 +721,6 @@ catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req,
 
 /* ──────────────────────────────────────────────────────────────────
    POST /api/categorias-globales/:id/vendedores
-   Crea o vincula un vendedor y asigna sus números en un solo paso.
 ──────────────────────────────────────────────────────────────────*/
 catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) => {
   const { vendedor_id, nombre, cedula, usuario, password, numeros = [] } = req.body;
@@ -672,7 +740,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
     if (!catR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Categoría no encontrada' }); }
     const { tipo } = catR.rows[0];
 
-    // Obtener o crear el vendedor
     let vendedorFinal; let credencialesGeneradas = null;
     if (vendedor_id) {
       const vR = await client.query('SELECT id,nombre,usuario,cedula,activo FROM users WHERE id=$1 AND rol=$2', [vendedor_id, 'vendedor']);
@@ -693,7 +760,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       credencialesGeneradas = { usuario: creds.usuario, password: creds.password };
     }
 
-    // Insertar números al pool (ignorar los que ya existen)
     let numerosAgregados = 0;
     for (const num of numerosUnicos) {
       const eR = await client.query(
@@ -709,7 +775,6 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       }
     }
 
-    // Asignar series automáticamente
     const { insertados, colisiones } = await asignarSeriesParaVendedor(client, req.params.id, vendedorFinal.id, tipo);
 
     await client.query('COMMIT');
@@ -765,7 +830,6 @@ catRouter.delete('/:id/vendedores/:vendedorId', authMiddleware, soloDueno, async
 
 /* ──────────────────────────────────────────────────────────────────
    DELETE /api/categorias-globales/:id/asignaciones/:asigId
-   Libera la serie de un número (lo deja en el pool sin serie).
 ──────────────────────────────────────────────────────────────────*/
 catRouter.delete('/:id/asignaciones/:asigId', authMiddleware, soloDueno, async (req, res) => {
   try {

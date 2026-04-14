@@ -232,15 +232,12 @@ catRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT cg.id,cg.nombre,cg.tipo,cg.monto,cg.descripcion,cg.created_at,
-        COUNT(DISTINCT cga.vendedor_id)::int AS total_vendedores,
-        COUNT(DISTINCT cga.id)::int AS total_asignaciones,
-        COUNT(CASE WHEN cga.serie='A' THEN 1 END)::int AS numeros_serie_a,
-        COUNT(CASE WHEN cga.serie='B' THEN 1 END)::int AS numeros_serie_b,
-        COUNT(DISTINCT cvn.numero)::int AS total_numeros_definidos
+        (SELECT COUNT(DISTINCT cga.vendedor_id) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id)::int AS total_vendedores,
+        (SELECT COUNT(*) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id)::int AS total_asignaciones,
+        (SELECT COUNT(*) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id AND cga.serie='A')::int AS numeros_serie_a,
+        (SELECT COUNT(*) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id AND cga.serie='B')::int AS numeros_serie_b,
+        (SELECT COUNT(DISTINCT cvn.numero) FROM cat_vendedor_numeros cvn WHERE cvn.categoria_id=cg.id)::int AS total_numeros_definidos
       FROM categorias_globales cg
-      LEFT JOIN cat_global_asignaciones cga ON cga.categoria_id=cg.id
-      LEFT JOIN cat_vendedor_numeros cvn ON cvn.categoria_id=cg.id
-      GROUP BY cg.id,cg.nombre,cg.tipo,cg.monto,cg.descripcion,cg.created_at
       ORDER BY cg.nombre`);
     res.json(r.rows);
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }

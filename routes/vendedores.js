@@ -61,10 +61,12 @@ async function resolverSerie(client, categoriaId, numero, vendedorId, tipo) {
 
 /* ══════════════════════════════════════════════════════════════
    asignarSeriesParaVendedor
-   Procesa todos los numeros pendientes del pool.
-   En simultanea: pendiente = tiene <2 series asignadas.
+   Procesa los numeros pendientes del pool.
+   solicitudesMap: { '121': 1, '123': 2 } — cuantas series se
+   pidieron por numero. Si es null se usa logica de /asignar
+   (botón manual): simultanea=max 1 serie pendiente por numero.
 ══════════════════════════════════════════════════════════════ */
-async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo) {
+async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo, solicitudesMap = null) {
   const poolR = await client.query(
     `SELECT numero FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 ORDER BY numero`,
     [categoriaId, vendedorId]
@@ -81,14 +83,22 @@ async function asignarSeriesParaVendedor(client, categoriaId, vendedorId, tipo) 
     seriesMap[row.numero].push(row.serie);
   });
 
-  // En simultanea: cada numero del pool puede necesitar hasta 2 asignaciones.
-  // Construimos lista de "trabajos" a procesar.
   const trabajos = [];
   for (const { numero } of poolR.rows) {
     const series = seriesMap[numero] || [];
     if (tipo === 'simultanea') {
-      const necesita = 2 - series.length; // cuantas series faltan
-      for (let i = 0; i < necesita; i++) trabajos.push(numero);
+      if (solicitudesMap) {
+        // Cuantas series se pidieron explicitamente para este numero
+        const pedidas = solicitudesMap[numero] || 1;
+        // Cuantas ya tiene asignadas
+        const yaAsignadas = series.length;
+        // Solo agregar las que faltan hasta lo pedido (max 2)
+        const necesita = Math.min(pedidas, 2) - yaAsignadas;
+        for (let i = 0; i < necesita; i++) trabajos.push(numero);
+      } else {
+        // Modo /asignar manual: solo asignar UNA serie por numero pendiente
+        if (series.length === 0) trabajos.push(numero);
+      }
     } else {
       if (series.length === 0) trabajos.push(numero);
     }
@@ -609,9 +619,8 @@ catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req,
       seriesMap[row.numero].push(row.serie);
     });
 
-    const pendientes = poolR.rows.map(r=>r.numero).filter(n => {
-      return tipo==='simultanea' ? (seriesMap[n]||[]).length < 2 : !(seriesMap[n]?.length);
-    });
+    // Pendiente = sin ninguna serie asignada aun (el boton /asignar asigna 1 por numero)
+    const pendientes = poolR.rows.map(r=>r.numero).filter(n => !(seriesMap[n]?.length));
 
     if (!pendientes.length)
       return res.json({ tipo, libres:[], colisiones:[], puedeAgregar:false, todoAsignado:true, vendedor_nombre: vendR.rows[0].nombre });
@@ -671,7 +680,11 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       credencialesGeneradas = { usuario: creds.usuario, password: creds.password };
     }
 
-    // Insertar numeros al pool (solo unicos, una vez cada uno)
+    // Contar cuantas veces se pidio cada numero: [121,123,123] => {121:1, 123:2}
+    const solicitudesMap = {};
+    for (const num of numeros) solicitudesMap[num] = (solicitudesMap[num]||0) + 1;
+
+    // Insertar al pool solo los unicos (una entrada por numero)
     const numerosUnicos = [...new Set(numeros)];
     for (const num of numerosUnicos) {
       const eR = await client.query(
@@ -686,8 +699,8 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       }
     }
 
-    // Asignar series usando asignarSeriesParaVendedor que ya maneja [125,125] = A y B
-    const { insertados, colisiones } = await asignarSeriesParaVendedor(client, req.params.id, vendedorFinal.id, tipo);
+    // Pasar solicitudesMap: asigna exactamente las series pedidas (121->A, 123->A+B)
+    const { insertados, colisiones } = await asignarSeriesParaVendedor(client, req.params.id, vendedorFinal.id, tipo, solicitudesMap);
 
     await client.query('COMMIT');
 

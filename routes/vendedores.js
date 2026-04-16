@@ -763,4 +763,81 @@ catRouter.delete('/:id/asignaciones/:asigId', authMiddleware, soloDueno, async (
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
 });
 
+catRouter.get('/:id/para-rifa', authMiddleware, soloDueno, async (req, res) => {
+  const { rifa_id } = req.query;
+  const categoria_id = req.params.id;
+
+  try {
+    // 1. Categoría (necesitamos el tipo: parcial | simultanea)
+    const catR = await pool.query(
+      'SELECT id, nombre, tipo FROM categorias_globales WHERE id=$1',
+      [categoria_id]
+    );
+    if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+    const categoria = catR.rows[0];
+
+    // 2. Precio de la rifa (si se pasa rifa_id)
+    let precio_rifa = 0;
+    if (rifa_id) {
+      const rifaR = await pool.query('SELECT precio FROM rifas WHERE id=$1', [rifa_id]);
+      if (rifaR.rows[0]) precio_rifa = Number(rifaR.rows[0].precio) || 0;
+    }
+
+    // 3. Vendedores con sus números asignados en esta categoría
+    const r = await pool.query(`
+      SELECT
+        cvn.vendedor_id,
+        u.nombre        AS vendedor_nombre,
+        u.cedula,
+        -- Números del pool de este vendedor en la categoría
+        ARRAY_AGG(DISTINCT cvn.numero ORDER BY cvn.numero) AS numeros_pool,
+        -- Asignaciones confirmadas (serie A y/o B)
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT('numero', cga.numero, 'serie', cga.serie)
+            ORDER BY cga.numero, cga.serie
+          ) FILTER (WHERE cga.id IS NOT NULL),
+          '[]'
+        ) AS asignaciones
+      FROM cat_vendedor_numeros cvn
+      JOIN users u ON u.id = cvn.vendedor_id
+      LEFT JOIN cat_global_asignaciones cga
+        ON  cga.categoria_id = cvn.categoria_id
+        AND cga.vendedor_id  = cvn.vendedor_id
+        AND cga.numero       = cvn.numero
+      WHERE cvn.categoria_id = $1
+      GROUP BY cvn.vendedor_id, u.nombre, u.cedula
+      ORDER BY u.nombre
+    `, [categoria_id]);
+
+    // 4. Calcular monto por vendedor según tipo de categoría
+    const vendedores = r.rows.map(v => {
+      // Cantidad de series asignadas = cuántos números van a caja
+      // parcial   → 1 serie por número
+      // simultanea → hasta 2 series por número (A y B)
+      const total_series = v.asignaciones.length;
+      const monto_pendiente = total_series * precio_rifa;
+
+      return {
+        vendedor_id:      v.vendedor_id,
+        vendedor_nombre:  v.vendedor_nombre,
+        cedula:           v.cedula,
+        numeros_pool:     v.numeros_pool,       // todos los del pool
+        asignaciones:     v.asignaciones,        // [{numero, serie}]
+        total_numeros:    total_series,
+        monto_pendiente,                         // total_series × precio_rifa
+      };
+    });
+
+    res.json({
+      categoria,
+      precio_rifa,
+      vendedores,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = { vendedoresRouter: router, categoriasGlobalesRouter: catRouter };

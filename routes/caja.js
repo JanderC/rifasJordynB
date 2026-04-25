@@ -82,15 +82,13 @@ router.get('/rifa-activa', async (req, res) => {
   try {
     const hoy = new Date();
 
-    // 1. Buscar rifa cuyo rango incluya hoy
-    //    fecha_inicio <= hoy <= fecha_sorteo  (o activa=true si no hay fecha_inicio)
+    // 1. Buscar la rifa activa más próxima a sortear
     const rifaR = await client.query(`
       SELECT *
       FROM rifas
       WHERE activa = true
         AND fecha_sorteo IS NOT NULL
         AND fecha_sorteo::date >= CURRENT_DATE
-        AND (fecha_inicio IS NULL OR fecha_inicio::date <= CURRENT_DATE)
       ORDER BY fecha_sorteo ASC
       LIMIT 1
     `);

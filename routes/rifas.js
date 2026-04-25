@@ -1,9 +1,14 @@
 // ============================================================
 //   RIFAS JORDYN — Rutas de Rifas
 //   ✅ ACTUALIZADO: campo `ofertas` (jsonb) en crear/editar/leer
-//   ✅ NUEVO: vendedores_ids — al crear/editar una rifa se
-//      copian los números globales del vendedor a numeros_vendedor
-//      con el rifa_id correspondiente (reserva automática).
+//   ✅ ACTUALIZADO v3: flujo categorías globales
+//      - POST/PUT reciben `categoria_id` y `vendedores_categorias`
+//        [{vendedor_id, categoria_id}] desde el selector del frontend.
+//      - `categoria_seleccionada_id` se guarda en la tabla rifas para
+//        que caja.js pueda leer qué vendedores van en el lote.
+//      - sincronizarVendedoresRifa usa cat_global_asignaciones para
+//        copiar los números con sus series A/B a numeros_vendedor.
+//      - Se mantiene compatibilidad con `vendedores_ids` legado.
 // ============================================================
 const express = require('express');
 const router  = express.Router();
@@ -26,16 +31,17 @@ function validarOfertas(ofertas) {
 }
 
 /* ── Helper: sincronizar vendedores de una rifa ─────────────
-   1. Borra las asignaciones en numeros_vendedor para esta rifa
-      que ya NO están en la nueva lista de vendedores.
-   2. Para cada vendedor nuevo, copia sus números globales
-      (numeros_vendedor_global) a numeros_vendedor con rifa_id.
-   3. NO toca números de vendedores que siguen en la lista
-      (evita perder ventas ya registradas).
+   Fuente de verdad: cat_global_asignaciones (series A/B).
+   1. Elimina numeros_vendedor de vendedores que ya no están en
+      la lista (respetando ventas registradas).
+   2. Para cada vendedor seleccionado, copia sus asignaciones
+      confirmadas de cat_global_asignaciones a numeros_vendedor
+      con este rifa_id, incluyendo la serie (A o B).
+   3. Si se reciben vendedores_ids legado (sin categoria_id) se
+      usa numeros_vendedor_global como fallback.
 ──────────────────────────────────────────────────────────── */
-async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids) {
-  // 1. Quitar asignaciones de vendedores removidos de la rifa
-  //    (solo los que NO tienen ventas en esta rifa para no romper historial)
+async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vendedores_categorias = []) {
+  // 1. Quitar asignaciones de vendedores removidos
   if (vendedores_ids.length > 0) {
     await client.query(
       `DELETE FROM numeros_vendedor
@@ -47,7 +53,6 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids) {
       [rifa_id, vendedores_ids]
     );
   } else {
-    // Sin vendedores → limpiar todos los que no tengan ventas
     await client.query(
       `DELETE FROM numeros_vendedor
        WHERE rifa_id = $1
@@ -60,17 +65,51 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids) {
 
   if (vendedores_ids.length === 0) return;
 
-  // 2. Para cada vendedor seleccionado, insertar sus números globales
-  //    en numeros_vendedor con este rifa_id (ON CONFLICT DO NOTHING
-  //    para no duplicar si ya existían)
-  await client.query(
-    `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
-     SELECT ng.vendedor_id, $1 AS rifa_id, ng.numero
-     FROM numeros_vendedor_global ng
-     WHERE ng.vendedor_id = ANY($2::uuid[])
-     ON CONFLICT (vendedor_id, rifa_id, numero) DO NOTHING`,
-    [rifa_id, vendedores_ids]
-  );
+  if (vendedores_categorias.length > 0) {
+    // ── Flujo nuevo: usar cat_global_asignaciones (series A/B)
+    // Agrupar por categoria_id para un solo query por categoría
+    const porCategoria = {};
+    for (const { vendedor_id, categoria_id } of vendedores_categorias) {
+      if (!porCategoria[categoria_id]) porCategoria[categoria_id] = [];
+      porCategoria[categoria_id].push(vendedor_id);
+    }
+
+    for (const [categoria_id, vids] of Object.entries(porCategoria)) {
+      // Copiar las asignaciones confirmadas (A y/o B) como numeros_vendedor
+      // La columna `serie` debe existir en numeros_vendedor; si no existe
+      // se inserta solo el número (ON CONFLICT DO NOTHING en ambos casos).
+      await client.query(
+        `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero, serie)
+         SELECT cga.vendedor_id, $1, cga.numero, cga.serie
+         FROM cat_global_asignaciones cga
+         WHERE cga.categoria_id = $2
+           AND cga.vendedor_id = ANY($3::uuid[])
+         ON CONFLICT (vendedor_id, rifa_id, numero, serie) DO NOTHING`,
+        [rifa_id, categoria_id, vids]
+      ).catch(async () => {
+        // Fallback si la columna serie no existe aún en numeros_vendedor
+        await client.query(
+          `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
+           SELECT DISTINCT cga.vendedor_id, $1, cga.numero
+           FROM cat_global_asignaciones cga
+           WHERE cga.categoria_id = $2
+             AND cga.vendedor_id = ANY($3::uuid[])
+           ON CONFLICT (vendedor_id, rifa_id, numero) DO NOTHING`,
+          [rifa_id, categoria_id, vids]
+        );
+      });
+    }
+  } else {
+    // ── Flujo legado: numeros_vendedor_global
+    await client.query(
+      `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
+       SELECT ng.vendedor_id, $1 AS rifa_id, ng.numero
+       FROM numeros_vendedor_global ng
+       WHERE ng.vendedor_id = ANY($2::uuid[])
+       ON CONFLICT (vendedor_id, rifa_id, numero) DO NOTHING`,
+      [rifa_id, vendedores_ids]
+    );
+  }
 }
 
 // ── GET /api/rifas ─────────────────────────────────────────
@@ -188,11 +227,13 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   const {
     nombre, descripcion, premio, precio,
     fecha_sorteo, loteria_ref,
-    tipo           = 'sencilla',
-    imagen_url     = null,
-    estado         = 'activa',
-    ofertas        = [],
-    vendedores_ids = [],          // ← NUEVO
+    tipo                  = 'sencilla',
+    imagen_url            = null,
+    estado                = 'activa',
+    ofertas               = [],
+    vendedores_ids        = [],
+    vendedores_categorias = [],   // [{vendedor_id, categoria_id}] — desde SelectorCategoria
+    categoria_id          = null, // categoría global seleccionada
   } = req.body;
 
   if (!nombre || !premio || !precio)
@@ -207,27 +248,33 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Crear la rifa
+    // Construir ids desde vendedores_categorias si no vienen como vendedores_ids
+    const vids = vendedores_ids.length > 0
+      ? vendedores_ids
+      : vendedores_categorias.map(v => v.vendedor_id);
+
+    // Crear la rifa guardando categoria_seleccionada_id para que caja pueda leerla
     const result = await client.query(
       `INSERT INTO rifas
          (nombre, descripcion, premio, precio, fecha_sorteo, loteria_ref,
-          tipo, imagen_url, estado, ofertas, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        RETURNING *`,
       [
         nombre, descripcion || null, premio, precio,
         fecha_sorteo || null, loteria_ref || null,
         tipo, imagen_url, estado,
         JSON.stringify(ofertasOrdenadas),
+        categoria_id || null,
         req.user.id,
       ]
     );
 
     const rifa = result.rows[0];
 
-    // Reservar números de los vendedores seleccionados
-    if (vendedores_ids.length > 0) {
-      await sincronizarVendedoresRifa(client, rifa.id, vendedores_ids);
+    // Reservar números usando cat_global_asignaciones (series A/B)
+    if (vids.length > 0) {
+      await sincronizarVendedoresRifa(client, rifa.id, vids, vendedores_categorias);
     }
 
     await client.query('COMMIT');
@@ -264,7 +311,9 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     nombre, descripcion, premio, precio,
     fecha_sorteo, loteria_ref,
     activa, tipo, imagen_url, estado, ofertas,
-    vendedores_ids,               // ← NUEVO (puede ser undefined si no se envía)
+    vendedores_ids,
+    vendedores_categorias,        // [{vendedor_id, categoria_id}] — puede ser undefined
+    categoria_id,                 // categoría global seleccionada — puede ser undefined
   } = req.body;
 
   if (ofertas !== undefined) {
@@ -282,17 +331,18 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 
     const result = await client.query(
       `UPDATE rifas SET
-        nombre       = COALESCE($1,  nombre),
-        descripcion  = COALESCE($2,  descripcion),
-        premio       = COALESCE($3,  premio),
-        precio       = COALESCE($4,  precio),
-        fecha_sorteo = COALESCE($5,  fecha_sorteo),
-        loteria_ref  = COALESCE($6,  loteria_ref),
-        activa       = COALESCE($7,  activa),
-        tipo         = COALESCE($8,  tipo),
-        imagen_url   = CASE WHEN $9::text  IS NOT NULL THEN $9::text  ELSE imagen_url END,
-        estado       = COALESCE($10, estado),
-        ofertas      = CASE WHEN $11::text IS NOT NULL THEN $11::jsonb ELSE ofertas END
+        nombre                  = COALESCE($1,  nombre),
+        descripcion             = COALESCE($2,  descripcion),
+        premio                  = COALESCE($3,  premio),
+        precio                  = COALESCE($4,  precio),
+        fecha_sorteo            = COALESCE($5,  fecha_sorteo),
+        loteria_ref             = COALESCE($6,  loteria_ref),
+        activa                  = COALESCE($7,  activa),
+        tipo                    = COALESCE($8,  tipo),
+        imagen_url              = CASE WHEN $9::text  IS NOT NULL THEN $9::text  ELSE imagen_url END,
+        estado                  = COALESCE($10, estado),
+        ofertas                 = CASE WHEN $11::text IS NOT NULL THEN $11::jsonb ELSE ofertas END,
+        categoria_seleccionada_id = COALESCE($13::uuid, categoria_seleccionada_id)
        WHERE id = $12
        RETURNING *`,
       [
@@ -308,6 +358,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         estado       ?? null,
         ofertasOrdenadas ?? null,
         req.params.id,
+        categoria_id ?? null,
       ]
     );
 
@@ -316,9 +367,20 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
 
-    // Si se enviaron vendedores_ids, sincronizar reservas
-    if (Array.isArray(vendedores_ids)) {
-      await sincronizarVendedoresRifa(client, req.params.id, vendedores_ids);
+    // Sincronizar reservas si vienen vendedores (ya sea formato nuevo o legado)
+    const vids = Array.isArray(vendedores_ids) && vendedores_ids.length > 0
+      ? vendedores_ids
+      : Array.isArray(vendedores_categorias) && vendedores_categorias.length > 0
+        ? vendedores_categorias.map(v => v.vendedor_id)
+        : null;
+
+    if (vids !== null) {
+      await sincronizarVendedoresRifa(
+        client,
+        req.params.id,
+        vids,
+        Array.isArray(vendedores_categorias) ? vendedores_categorias : []
+      );
     }
 
     await client.query('COMMIT');

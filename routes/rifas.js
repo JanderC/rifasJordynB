@@ -412,22 +412,70 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/rifas/:id ──────────────────────────────────
+// Query param: ?force=true  → borra también ventas y números
 router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
+  const force = req.query.force === 'true';
+  const client = await pool.connect();
   try {
-    const ventas = await pool.query(
-      'SELECT COUNT(*) FROM ventas WHERE rifa_id = $1',
+    await client.query('BEGIN');
+
+    // Verificar que la rifa existe
+    const rifaR = await client.query(
+      `SELECT r.id, r.nombre, r.activa,
+              COUNT(DISTINCT v.id)::int  AS total_ventas,
+              COUNT(DISTINCT nv.vendedor_id)::int AS total_vendedores,
+              COALESCE(
+                JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('id', u.id, 'nombre', u.nombre))
+                FILTER (WHERE u.id IS NOT NULL), '[]'
+              ) AS vendedores
+       FROM rifas r
+       LEFT JOIN ventas v         ON v.rifa_id = r.id
+       LEFT JOIN numeros_vendedor nv ON nv.rifa_id = r.id
+       LEFT JOIN users u          ON u.id = nv.vendedor_id
+       WHERE r.id = $1
+       GROUP BY r.id`,
       [req.params.id]
     );
-    if (parseInt(ventas.rows[0].count) > 0)
-      return res.status(400).json({ error: 'No se puede eliminar una rifa con ventas. Archívala en su lugar.' });
 
-    // Limpiar asignaciones de números antes de borrar
-    await pool.query('DELETE FROM numeros_vendedor WHERE rifa_id = $1', [req.params.id]);
-    await pool.query('DELETE FROM rifas WHERE id = $1', [req.params.id]);
-    res.json({ message: 'Rifa eliminada exitosamente' });
+    if (!rifaR.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+
+    const rifa = rifaR.rows[0];
+
+    // Si tiene ventas y no es force → devolver info para que el frontend muestre la advertencia
+    if (rifa.total_ventas > 0 && !force) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error:            'La rifa tiene ventas registradas.',
+        requiere_fuerza:  true,
+        rifa_nombre:      rifa.nombre,
+        activa:           rifa.activa,
+        total_ventas:     rifa.total_ventas,
+        total_vendedores: rifa.total_vendedores,
+        vendedores:       rifa.vendedores,
+      });
+    }
+
+    // Eliminar en orden: ventas → numeros_vendedor → rifa
+    if (force) {
+      await client.query('DELETE FROM ventas          WHERE rifa_id = $1', [req.params.id]);
+    }
+    await client.query('DELETE FROM numeros_vendedor WHERE rifa_id = $1', [req.params.id]);
+    await client.query('DELETE FROM rifas            WHERE id      = $1', [req.params.id]);
+
+    await client.query('COMMIT');
+    res.json({
+      message:      `Rifa "${rifa.nombre}" eliminada exitosamente.`,
+      ventas_borradas: force ? rifa.total_ventas : 0,
+    });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Error eliminando rifa:', err);
     res.status(500).json({ error: 'Error del servidor' });
+  } finally {
+    client.release();
   }
 });
 

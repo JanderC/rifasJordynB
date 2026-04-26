@@ -445,7 +445,7 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
     // Cuales ya estan en el pool
     const numerosUnicos = [...new Set(numeros)];
     const existR = await client.query(
-      `SELECT numero FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[])`,
+      `SELECT numero FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::text[])`,
       [req.params.id, req.params.vendedorId, numerosUnicos]
     );
     const yaEnPool = new Set(existR.rows.map(r => r.numero));
@@ -536,6 +536,7 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
 /* ──────────────────────────────────────────────────────────────────
    DELETE /api/categorias-globales/:id/vendedores/:vendedorId/numeros
 ──────────────────────────────────────────────────────────────────*/
+// ✅ CORRECTO
 catRouter.delete('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno, async (req, res) => {
   const { numeros } = req.body;
   if (!Array.isArray(numeros)||!numeros.length) return res.status(400).json({ error: 'numeros[] es requerido' });
@@ -543,11 +544,11 @@ catRouter.delete('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDuen
   try {
     await client.query('BEGIN');
     await client.query(
-      `DELETE FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[])`,
+      `DELETE FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::text[])`,
       [req.params.id, req.params.vendedorId, numeros]
     );
     const r = await client.query(
-      `DELETE FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::char[]) RETURNING numero`,
+      `DELETE FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 AND numero=ANY($3::text[]) RETURNING numero`,
       [req.params.id, req.params.vendedorId, numeros]
     );
     await client.query('COMMIT');

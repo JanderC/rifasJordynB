@@ -134,7 +134,10 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
       }
     }
 
-    res.json(numeros);
+    // Agregar idx unico para que el frontend pueda identificar
+    // cada entrada por separado (un mismo numero puede aparecer 2 veces en simultanea)
+    const numerosConIdx = numeros.map((item, idx) => ({ ...item, idx }));
+    res.json(numerosConIdx);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

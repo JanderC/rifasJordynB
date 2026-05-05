@@ -54,21 +54,87 @@ router.get('/rifas', async (req, res) => {
 /* ── GET /api/publico/rifas/:id/numeros-disponibles ─────── */
 router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
   try {
-    const vendidos          = await pool.query(`SELECT numero, COUNT(*) AS veces FROM ventas WHERE rifa_id=$1 GROUP BY numero`, [req.params.id]);
-    const reservados        = await pool.query(`SELECT numero FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente'`, [req.params.id]);
-    const asignadosVendedor = await pool.query(`SELECT numero FROM numeros_vendedor WHERE rifa_id=$1`, [req.params.id]);
+    // 1. Obtener el tipo de la rifa para saber si es simultánea o no
+    const rifaR = await pool.query(
+      `SELECT COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+    const esSimultanea = rifaR.rows[0].tipo === 'simultanea';
 
+    // 2. Números vendidos y reservados (igual que antes)
+    const vendidos   = await pool.query(
+      `SELECT numero, COUNT(*) AS veces FROM ventas WHERE rifa_id=$1 GROUP BY numero`,
+      [req.params.id]
+    );
+    const reservados = await pool.query(
+      `SELECT numero FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente'`,
+      [req.params.id]
+    );
+
+    // 3. Números asignados a vendedores, con su serie (A o B si existe)
+    const asignadosVendedor = await pool.query(
+      `SELECT numero, COALESCE(serie, 'A') AS serie
+       FROM numeros_vendedor
+       WHERE rifa_id=$1`,
+      [req.params.id]
+    );
+
+    // Construir mapa de ventas/reservas (igual que antes)
     const mapa = {};
-    vendidos.rows.forEach(r => { mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1'; });
-    reservados.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'reservado'; });
-    asignadosVendedor.rows.forEach(r => { if (!mapa[r.numero]) mapa[r.numero] = 'vendedor'; });
+    vendidos.rows.forEach(r => {
+      mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1';
+    });
+    reservados.rows.forEach(r => {
+      if (!mapa[r.numero]) mapa[r.numero] = 'reservado';
+    });
 
+    // 4. Construir mapa de series ocupadas por vendedores
+    //    seriesOcupadas[numero] = Set de series que tiene algún vendedor
+    const seriesOcupadas = {};
+    asignadosVendedor.rows.forEach(r => {
+      if (!seriesOcupadas[r.numero]) seriesOcupadas[r.numero] = new Set();
+      seriesOcupadas[r.numero].add(r.serie.toUpperCase());
+    });
+
+    // 5. Generar el listado de números visibles al cliente
+    //    Regla simultánea: un número aparece (una sola vez) si tiene
+    //    al menos una serie (A o B) NO asignada a ningún vendedor.
+    //    Regla no-simultánea: el número aparece si no está asignado
+    //    a ningún vendedor en ninguna serie (comportamiento anterior).
     const numeros = [];
     for (let i = 0; i < 1000; i++) {
-      const n = String(i).padStart(3, '0');
+      const n      = String(i).padStart(3, '0');
       const estado = mapa[n] || 'disponible';
-      if (estado !== 'vendedor') numeros.push({ numero: n, estado });
+
+      // Si ya está vendido/reservado se muestra igual (no se oculta por vendedor)
+      if (estado === 'agotado' || estado === 'vendido_1' || estado === 'reservado') {
+        numeros.push({ numero: n, estado });
+        continue;
+      }
+
+      // Número disponible: evaluar asignaciones de vendedor
+      const ocupadas = seriesOcupadas[n] || new Set();
+
+      if (esSimultanea) {
+        // Simultánea: hay serie A y serie B.
+        // El número se muestra si al menos una de las dos series está libre.
+        const serieALibre = !ocupadas.has('A');
+        const serieBLibre = !ocupadas.has('B');
+        if (serieALibre || serieBLibre) {
+          // Se muestra una única vez, sin revelar a qué serie pertenece
+          numeros.push({ numero: n, estado: 'disponible' });
+        }
+        // Si ambas series están ocupadas por vendedores → no aparece
+      } else {
+        // No simultánea (sencilla/parcial): aparece si no tiene
+        // ninguna serie asignada a vendedor
+        if (ocupadas.size === 0) {
+          numeros.push({ numero: n, estado: 'disponible' });
+        }
+      }
     }
+
     res.json(numeros);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

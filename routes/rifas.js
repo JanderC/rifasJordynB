@@ -66,7 +66,15 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
   if (vendedores_ids.length === 0) return;
 
   if (vendedores_categorias.length > 0) {
-    // ── Flujo nuevo: usar cat_global_asignaciones (series A/B)
+    // Verificar si la columna serie existe ANTES de entrar al loop.
+    // Un query fallido dentro de una TX de Postgres la deja abortada (25P02);
+    // el .catch() de JS no puede recuperar eso, hay que decidir el path antes.
+    const colCheck = await client.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'numeros_vendedor' AND column_name = 'serie'`
+    );
+    const tieneColumnasSerie = colCheck.rows.length > 0;
+
     // Agrupar por categoria_id para un solo query por categoría
     const porCategoria = {};
     for (const { vendedor_id, categoria_id } of vendedores_categorias) {
@@ -75,19 +83,19 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
     }
 
     for (const [categoria_id, vids] of Object.entries(porCategoria)) {
-      // Copiar las asignaciones confirmadas (A y/o B) como numeros_vendedor
-      // La columna `serie` debe existir en numeros_vendedor; si no existe
-      // se inserta solo el número (ON CONFLICT DO NOTHING en ambos casos).
-      await client.query(
-        `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero, serie)
-         SELECT cga.vendedor_id, $1, cga.numero, cga.serie
-         FROM cat_global_asignaciones cga
-         WHERE cga.categoria_id = $2
-           AND cga.vendedor_id = ANY($3::uuid[])
-         ON CONFLICT (vendedor_id, rifa_id, numero, serie) DO NOTHING`,
-        [rifa_id, categoria_id, vids]
-      ).catch(async () => {
-        // Fallback si la columna serie no existe aún en numeros_vendedor
+      if (tieneColumnasSerie) {
+        // Flujo completo: copiar con serie A/B
+        await client.query(
+          `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero, serie)
+           SELECT cga.vendedor_id, $1, cga.numero, cga.serie
+           FROM cat_global_asignaciones cga
+           WHERE cga.categoria_id = $2
+             AND cga.vendedor_id = ANY($3::uuid[])
+           ON CONFLICT (vendedor_id, rifa_id, numero, serie) DO NOTHING`,
+          [rifa_id, categoria_id, vids]
+        );
+      } else {
+        // Fallback: la columna serie no existe aun en la BD
         await client.query(
           `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
            SELECT DISTINCT cga.vendedor_id, $1, cga.numero
@@ -97,7 +105,7 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
            ON CONFLICT (vendedor_id, rifa_id, numero) DO NOTHING`,
           [rifa_id, categoria_id, vids]
         );
-      });
+      }
     }
   } else {
     // ── Flujo legado: numeros_vendedor_global

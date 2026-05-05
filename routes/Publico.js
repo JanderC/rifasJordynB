@@ -118,14 +118,13 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
       if (esSimultanea) {
         // Simultánea: hay serie A y serie B.
-        // El número se muestra si al menos una de las dos series está libre.
-        const serieALibre = !ocupadas.has('A');
-        const serieBLibre = !ocupadas.has('B');
-        if (serieALibre || serieBLibre) {
-          // Se muestra una única vez, sin revelar a qué serie pertenece
-          numeros.push({ numero: n, estado: 'disponible' });
-        }
-        // Si ambas series están ocupadas por vendedores → no aparece
+        // El número aparece UNA VEZ por cada serie que esté libre.
+        // - Libre en A y libre en B  -> aparece 2 veces
+        // - Libre en A, ocupado en B -> aparece 1 vez
+        // - Ocupado en A, libre en B -> aparece 1 vez
+        // - Ocupado en A y ocupado en B -> no aparece
+        if (!ocupadas.has('A')) numeros.push({ numero: n, estado: 'disponible' });
+        if (!ocupadas.has('B')) numeros.push({ numero: n, estado: 'disponible' });
       } else {
         // No simultánea (sencilla/parcial): aparece si no tiene
         // ninguna serie asignada a vendedor

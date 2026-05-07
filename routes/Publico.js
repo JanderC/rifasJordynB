@@ -188,31 +188,48 @@ router.post('/reservar', async (req, res) => {
   if (!comprobante_base64)
     return res.status(400).json({ error: 'El comprobante de pago es obligatorio para reservar' });
 
-  const numerosUnicos = [...new Set(numeros)];
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
+    // Obtener tipo de rifa para saber si es simultánea
+    const rifaTipoR = await client.query(
+      `SELECT COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
+      [rifa_id]
+    );
+    const esSimultanea = rifaTipoR.rows[0]?.tipo === 'simultanea';
+
+    // En simultánea se permiten hasta 2 reservas del mismo número (serie A y B).
+    // El cliente puede enviar el mismo número dos veces si seleccionó ambas entradas.
+    // Preservamos duplicados para simultánea; deduplicamos en sencilla.
+    const numerosAProcesar = esSimultanea ? numeros : [...new Set(numeros)];
+
     const reservasCreadas = [];
     const conflictos      = [];
 
-    for (const numero of numerosUnicos) {
+    for (const numero of numerosAProcesar) {
       const vendidos = await client.query(
         `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
         [rifa_id, numero]
       );
-      if (parseInt(vendidos.rows[0].count) >= 2) {
-        conflictos.push({ numero, razon: 'agotado' }); continue;
-      }
+      const vecesVendidas = parseInt(vendidos.rows[0].count);
 
-      const reservaExiste = await client.query(
-        `SELECT id FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`,
+      const reservasPendientes = await client.query(
+        `SELECT COUNT(*) FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`,
         [rifa_id, numero]
       );
-      if (reservaExiste.rows.length > 0) {
-        conflictos.push({ numero, razon: 'reserva_pendiente' }); continue;
+      const vecesPendientes = parseInt(reservasPendientes.rows[0].count);
+
+      // Cuántas ranuras ya están ocupadas (vendidas + pendientes)
+      const ocupadas   = vecesVendidas + vecesPendientes;
+      const maxRanuras = esSimultanea ? 2 : 1;
+
+      if (ocupadas >= maxRanuras) {
+        const razon = vecesVendidas >= maxRanuras ? 'agotado' : 'reserva_pendiente';
+        conflictos.push({ numero, razon }); continue;
       }
+
 
       const r = await client.query(`
         INSERT INTO reservas_cliente

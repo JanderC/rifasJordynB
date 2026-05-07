@@ -54,92 +54,117 @@ router.get('/rifas', async (req, res) => {
 /* ── GET /api/publico/rifas/:id/numeros-disponibles ─────── */
 router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
   try {
-    // 1. Obtener el tipo de la rifa para saber si es simultánea o no
+    // 1. Tipo de rifa
     const rifaR = await pool.query(
       `SELECT COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id = $1`,
       [req.params.id]
     );
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     const esSimultanea = rifaR.rows[0].tipo === 'simultanea';
+    const maxRanuras   = esSimultanea ? 2 : 1;
 
-    // 2. Números vendidos y reservados (igual que antes)
-    const vendidos   = await pool.query(
+    // 2. Ventas por número
+    const vendidos = await pool.query(
       `SELECT numero, COUNT(*) AS veces FROM ventas WHERE rifa_id=$1 GROUP BY numero`,
       [req.params.id]
     );
+
+    // 3. Reservas pendientes por número (contamos cuántas hay, no solo si existe una)
     const reservados = await pool.query(
-      `SELECT numero FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente'`,
+      `SELECT numero, COUNT(*) AS veces FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente' GROUP BY numero`,
       [req.params.id]
     );
 
-    // 3. Números asignados a vendedores, con su serie (A o B si existe)
+    // 4. Asignaciones de vendedor por serie
     const asignadosVendedor = await pool.query(
-      `SELECT numero, COALESCE(serie, 'A') AS serie
-       FROM numeros_vendedor
-       WHERE rifa_id=$1`,
+      `SELECT numero, COALESCE(serie, 'A') AS serie FROM numeros_vendedor WHERE rifa_id=$1`,
       [req.params.id]
     );
 
-    // Construir mapa de ventas/reservas (igual que antes)
-    const mapa = {};
+    // Mapa de conteos por número: { "009": { vendidas: 1, pendientes: 1 } }
+    const conteos = {};
     vendidos.rows.forEach(r => {
-      mapa[r.numero] = parseInt(r.veces) >= 2 ? 'agotado' : 'vendido_1';
+      if (!conteos[r.numero]) conteos[r.numero] = { vendidas: 0, pendientes: 0 };
+      conteos[r.numero].vendidas = parseInt(r.veces);
     });
     reservados.rows.forEach(r => {
-      if (!mapa[r.numero]) mapa[r.numero] = 'reservado';
+      if (!conteos[r.numero]) conteos[r.numero] = { vendidas: 0, pendientes: 0 };
+      conteos[r.numero].pendientes = parseInt(r.veces);
     });
 
-    // 4. Construir mapa de series ocupadas por vendedores
-    //    seriesOcupadas[numero] = Set de series que tiene algún vendedor
+    // Mapa de series ocupadas por vendedores
     const seriesOcupadas = {};
     asignadosVendedor.rows.forEach(r => {
       if (!seriesOcupadas[r.numero]) seriesOcupadas[r.numero] = new Set();
       seriesOcupadas[r.numero].add(r.serie.toUpperCase());
     });
 
-    // 5. Generar el listado de números visibles al cliente
-    //    Regla simultánea: un número aparece (una sola vez) si tiene
-    //    al menos una serie (A o B) NO asignada a ningún vendedor.
-    //    Regla no-simultánea: el número aparece si no está asignado
-    //    a ningún vendedor en ninguna serie (comportamiento anterior).
+    // 5. Generar listado
     const numeros = [];
     for (let i = 0; i < 1000; i++) {
-      const n      = String(i).padStart(3, '0');
-      const estado = mapa[n] || 'disponible';
-
-      // Si ya está vendido/reservado se muestra igual (no se oculta por vendedor)
-      if (estado === 'agotado' || estado === 'vendido_1' || estado === 'reservado') {
-        numeros.push({ numero: n, estado });
-        continue;
-      }
-
-      // Número disponible: evaluar asignaciones de vendedor
+      const n       = String(i).padStart(3, '0');
+      const c       = conteos[n] || { vendidas: 0, pendientes: 0 };
       const ocupadas = seriesOcupadas[n] || new Set();
 
       if (esSimultanea) {
-        // Simultánea: hay serie A y serie B.
-        // El número aparece UNA VEZ por cada serie que esté libre.
-        // - Libre en A y libre en B  -> aparece 2 veces
-        // - Libre en A, ocupado en B -> aparece 1 vez
-        // - Ocupado en A, libre en B -> aparece 1 vez
-        // - Ocupado en A y ocupado en B -> no aparece
-        if (!ocupadas.has('A')) numeros.push({ numero: n, estado: 'disponible' });
-        if (!ocupadas.has('B')) numeros.push({ numero: n, estado: 'disponible' });
+        // En simultánea hay 2 ranuras (serie A y serie B).
+        // Cada ranura puede estar: libre, reservada (pendiente) o vendida.
+        // Calculamos cuántas ranuras están libres para mostrarlas disponibles.
+        const ranurasTomadas = c.vendidas + c.pendientes; // vendidas + pendientes cubren ranuras
+        const ranurasLibres  = Math.max(0, maxRanuras - ranurasTomadas);
+
+        // Ranuras bloqueadas por vendedor (serie A u B asignada)
+        const bloqueadasVendedor = ocupadas.size; // cuántas series tiene el vendedor
+
+        // De las ranuras libres, descontar las bloqueadas por vendedor
+        // (el vendedor ocupa serie A o B, esas no están disponibles para el cliente)
+        const disponiblesParaCliente = Math.max(0, ranurasLibres - bloqueadasVendedor);
+
+        // Ranuras que están pendientes (reservadas pero no vendidas) — se muestran como reservado
+        // Solo si el número tiene alguna reserva pendiente pero aún le quedan ranuras
+        const pendientesAMostrar = Math.min(c.pendientes, maxRanuras - c.vendidas - bloqueadasVendedor);
+
+        // Ranuras agotadas (todas vendidas)
+        if (c.vendidas >= maxRanuras) {
+          numeros.push({ numero: n, estado: 'agotado' });
+          continue;
+        }
+
+        // Mostrar cada ranura disponible
+        for (let r = 0; r < disponiblesParaCliente; r++) {
+          numeros.push({ numero: n, estado: 'disponible' });
+        }
+
+        // Mostrar ranuras pendientes (para información, no seleccionables)
+        for (let r = 0; r < pendientesAMostrar; r++) {
+          numeros.push({ numero: n, estado: 'reservado' });
+        }
+
+        // Si ninguna ranura queda disponible ni visible, pero todas están cubiertas por pendientes
+        if (disponiblesParaCliente === 0 && pendientesAMostrar === 0 && c.vendidas < maxRanuras) {
+          if (c.pendientes + c.vendidas >= maxRanuras) {
+            // Todas las ranuras están reservadas pendientes → mostrar como agotado al cliente
+            numeros.push({ numero: n, estado: 'agotado' });
+          }
+        }
+
       } else {
-        // No simultánea (sencilla/parcial): aparece si no tiene
-        // ninguna serie asignada a vendedor
-        if (ocupadas.size === 0) {
+        // Sencilla: 1 ranura por número
+        if (c.vendidas >= 1) {
+          numeros.push({ numero: n, estado: 'vendido_1' });
+        } else if (c.pendientes >= 1) {
+          numeros.push({ numero: n, estado: 'reservado' });
+        } else if (ocupadas.size === 0) {
           numeros.push({ numero: n, estado: 'disponible' });
         }
       }
     }
 
-    // Agregar idx unico para que el frontend pueda identificar
-    // cada entrada por separado (un mismo numero puede aparecer 2 veces en simultanea)
     const numerosConIdx = numeros.map((item, idx) => ({ ...item, idx }));
     res.json(numerosConIdx);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 
 /* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar

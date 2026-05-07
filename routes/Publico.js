@@ -394,9 +394,32 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
       const vendedorId = dueno.rows[0]?.id;
 
       const rifa = await client.query(
-        `SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id]
+        `SELECT precio, COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
+        [reserva.rifa_id]
       );
-      const precioVenta = rifa.rows[0]?.precio || 0;
+      const precioVenta  = rifa.rows[0]?.precio || 0;
+      const esSimultanea = rifa.rows[0]?.tipo === 'simultanea';
+      const maxVentas    = esSimultanea ? 2 : 1;
+
+      // Verificar cuántas ventas ya existen para este número en esta rifa
+      const ventasExistentes = await client.query(
+        `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
+        [reserva.rifa_id, reserva.numero]
+      );
+      const ventasActuales = parseInt(ventasExistentes.rows[0].count);
+
+      if (ventasActuales >= maxVentas) {
+        // Ya está al tope — rechazar esta reserva automáticamente en lugar de explotar
+        await client.query(
+          `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
+          [`Auto-rechazado: el número ${reserva.numero} ya alcanzó el máximo de ventas permitidas`, reserva.id]
+        );
+        await client.query('COMMIT');
+        return res.status(409).json({
+          error: `El número ${reserva.numero} ya tiene ${ventasActuales} venta(s) registrada(s) y no puede aprobarse nuevamente.`,
+          auto_rechazado: true,
+        });
+      }
 
       await client.query(`
         INSERT INTO ventas
@@ -468,6 +491,10 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       }
     }
 
+    // Contador en memoria de ventas insertadas en esta transacción por (rifa_id, numero)
+    // para respetar el límite de la constraint max_dos_ventas sin consultar la BD en cada iteración
+    const ventasEnTransaccion = {}; // key: "rifa_id|numero" → count
+
     let procesadas = 0;
     for (const id of ids) {
       const res_r = await client.query(
@@ -479,9 +506,35 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       const reserva = res_r.rows[0];
 
       if (estado === 'aprobado') {
-        const precioVenta = preciosMap[id] ?? (
-          (await client.query(`SELECT precio FROM rifas WHERE id=$1`, [reserva.rifa_id])).rows[0]?.precio || 0
+        // Verificar límite de ventas para este número
+        const claveNum = `${reserva.rifa_id}|${reserva.numero}`;
+        const rifaInfo = (await client.query(
+          `SELECT precio, COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
+          [reserva.rifa_id]
+        )).rows[0];
+        const esSimultanea = rifaInfo?.tipo === 'simultanea';
+        const maxVentas    = esSimultanea ? 2 : 1;
+
+        // Ventas ya existentes en BD + las que ya insertamos en esta transacción
+        const ventasEnBD = parseInt(
+          (await client.query(`SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
+            [reserva.rifa_id, reserva.numero])).rows[0].count
         );
+        const ventasTx   = ventasEnTransaccion[claveNum] || 0;
+        const totalOcupadas = ventasEnBD + ventasTx;
+
+        if (totalOcupadas >= maxVentas) {
+          // No se puede insertar más — auto-rechazar esta reserva
+          await client.query(
+            `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
+            [`Auto-rechazado: número ${reserva.numero} ya alcanzó el máximo de ventas`, id]
+          );
+          continue;
+        }
+
+        ventasEnTransaccion[claveNum] = ventasTx + 1;
+
+        const precioVenta = preciosMap[id] ?? (rifaInfo?.precio || 0);
         const { cedula = null, correo = null } = extrasMap[id] || {};
 
         await client.query(`

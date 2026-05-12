@@ -76,8 +76,19 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
     );
 
     // 4. Asignaciones de vendedor por serie
+    //    Incluye:
+    //      - numeros_vendedor       (números fijos del vendedor)
+    //      - boleteria_numeros_extra (números extra asignados solo a esta rifa)
+    //    Ambos bloquean al cliente: una vez asignados a un vendedor, ese
+    //    (numero, serie) deja de estar disponible para reservar.
     const asignadosVendedor = await pool.query(
-      `SELECT numero, COALESCE(serie, 'A') AS serie FROM numeros_vendedor WHERE rifa_id=$1`,
+      `SELECT numero, COALESCE(serie, 'A') AS serie
+         FROM numeros_vendedor
+        WHERE rifa_id = $1
+       UNION
+       SELECT numero, serie
+         FROM boleteria_numeros_extra
+        WHERE rifa_id = $1`,
       [req.params.id]
     );
 
@@ -246,12 +257,30 @@ router.post('/reservar', async (req, res) => {
       );
       const vecesPendientes = parseInt(reservasPendientes.rows[0].count);
 
-      // Cuántas ranuras ya están ocupadas (vendidas + pendientes)
-      const ocupadas   = vecesVendidas + vecesPendientes;
+      // Series del número ya asignadas a algún vendedor en esta rifa
+      // (fijos en numeros_vendedor + extras en boleteria_numeros_extra).
+      // Cada serie asignada a un vendedor BLOQUEA una ranura para el cliente.
+      const seriesVendedor = await client.query(
+        `SELECT COUNT(*)::int AS cnt FROM (
+           SELECT COALESCE(serie,'A') AS serie FROM numeros_vendedor
+            WHERE rifa_id = $1 AND numero = $2
+           UNION
+           SELECT serie FROM boleteria_numeros_extra
+            WHERE rifa_id = $1 AND numero = $2
+         ) AS s`,
+        [rifa_id, numero]
+      );
+      const bloqueadasVendedor = seriesVendedor.rows[0].cnt;
+
+      // Cuántas ranuras ya están ocupadas (vendidas + pendientes + asignadas a vendedor)
+      const ocupadas   = vecesVendidas + vecesPendientes + bloqueadasVendedor;
       const maxRanuras = esSimultanea ? 2 : 1;
 
       if (ocupadas >= maxRanuras) {
-        const razon = vecesVendidas >= maxRanuras ? 'agotado' : 'reserva_pendiente';
+        let razon = 'agotado';
+        if (vecesVendidas >= maxRanuras) razon = 'agotado';
+        else if (bloqueadasVendedor > 0 && (vecesVendidas + bloqueadasVendedor) >= maxRanuras) razon = 'asignado_vendedor';
+        else if (vecesPendientes > 0) razon = 'reserva_pendiente';
         conflictos.push({ numero, razon }); continue;
       }
 

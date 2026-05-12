@@ -665,42 +665,72 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     let disponiblesA = [];
     let disponiblesB = [];
 
-    if (rifa.categoria_seleccionada_id) {
-      const cat_id = rifa.categoria_seleccionada_id;
+    // ── Cálculo de disponibles ───────────────────────────────
+    // Universo: TODOS los números 000–999 por serie.
+    // Bloqueos por (numero, serie):
+    //   1. cat_global_asignaciones  → ya asignado como fijo a algún vendedor
+    //   2. boleteria_numeros_extra  → ya asignado como extra en esta rifa
+    //   3. ventas                   → ya vendido (cada venta consume 1 ranura empezando por A)
+    //   4. reservas_cliente pendiente → cada reserva consume 1 ranura empezando por A
+    //
+    // Las ventas y reservas no guardan serie, así que se asume que ocupan
+    // ranuras en orden A → B (consistente con el resto del sistema público).
+    const ocupadasPorNum = {};
+    const marcar = (numero, serie) => {
+      if (!ocupadasPorNum[numero]) ocupadasPorNum[numero] = new Set();
+      ocupadasPorNum[numero].add(serie);
+    };
 
-      // Ocupadas en la categoría global (fijos)
+    // 1) Fijos (categoría global) — solo si la rifa tiene categoría
+    if (rifa.categoria_seleccionada_id) {
       const asigR = await pool.query(
         `SELECT numero, serie FROM cat_global_asignaciones WHERE categoria_id = $1`,
-        [cat_id]
+        [rifa.categoria_seleccionada_id]
       );
-      const ocupadasPorNum = {};
-      asigR.rows.forEach(r => {
-        if (!ocupadasPorNum[r.numero]) ocupadasPorNum[r.numero] = new Set();
-        ocupadasPorNum[r.numero].add(r.serie);
-      });
+      asigR.rows.forEach(r => marcar(r.numero, r.serie));
+    }
 
-      // Ocupadas como EXTRA en esta rifa (también bloquean)
-      const extraR = await pool.query(
-        `SELECT numero, serie FROM boleteria_numeros_extra WHERE rifa_id = $1`,
-        [rifa_id]
-      );
-      extraR.rows.forEach(r => {
-        if (!ocupadasPorNum[r.numero]) ocupadasPorNum[r.numero] = new Set();
-        ocupadasPorNum[r.numero].add(r.serie);
-      });
+    // 2) Extras de esta rifa
+    const extraR = await pool.query(
+      `SELECT numero, serie FROM boleteria_numeros_extra WHERE rifa_id = $1`,
+      [rifa_id]
+    );
+    extraR.rows.forEach(r => marcar(r.numero, r.serie));
 
-      // Pool de números de la categoría
-      const poolR = await pool.query(
-        `SELECT DISTINCT numero FROM cat_vendedor_numeros
-          WHERE categoria_id = $1 ORDER BY numero`,
-        [cat_id]
-      );
-
-      for (const { numero } of poolR.rows) {
-        const ocupadas = ocupadasPorNum[numero] || new Set();
-        if (!ocupadas.has('A'))                disponiblesA.push(numero);
-        if (esSimultanea && !ocupadas.has('B')) disponiblesB.push(numero);
+    // 3) Ventas confirmadas — ocupan ranuras A → B según cantidad
+    //    Las ventas no guardan serie. Convención del sistema: 1ª venta = A, 2ª = B.
+    const ventasR = await pool.query(
+      `SELECT numero, COUNT(*)::int AS veces FROM ventas
+        WHERE rifa_id = $1 GROUP BY numero`,
+      [rifa_id]
+    );
+    ventasR.rows.forEach(r => {
+      for (let i = 0; i < r.veces; i++) {
+        if (!ocupadasPorNum[r.numero]?.has('A'))      marcar(r.numero, 'A');
+        else if (!ocupadasPorNum[r.numero]?.has('B')) marcar(r.numero, 'B');
       }
+    });
+
+    // 4) Reservas pendientes — bloquean ranuras también
+    const reservR = await pool.query(
+      `SELECT numero, COUNT(*)::int AS veces FROM reservas_cliente
+        WHERE rifa_id = $1 AND estado = 'pendiente' GROUP BY numero`,
+      [rifa_id]
+    );
+    reservR.rows.forEach(r => {
+      // Misma lógica que ventas: ocupar A primero, luego B si hace falta
+      for (let i = 0; i < r.veces; i++) {
+        if (!ocupadasPorNum[r.numero]?.has('A')) marcar(r.numero, 'A');
+        else if (!ocupadasPorNum[r.numero]?.has('B')) marcar(r.numero, 'B');
+      }
+    });
+
+    // Universo completo: 000–999
+    for (let i = 0; i < 1000; i++) {
+      const numero   = String(i).padStart(3, '0');
+      const ocupadas = ocupadasPorNum[numero] || new Set();
+      if (!ocupadas.has('A'))                disponiblesA.push(numero);
+      if (esSimultanea && !ocupadas.has('B')) disponiblesB.push(numero);
     }
 
     res.json({

@@ -32,16 +32,15 @@ function validarOfertas(ofertas) {
 
 /* ── Helper: sincronizar vendedores de una rifa ─────────────
    Fuente de verdad: cat_global_asignaciones (series A/B).
-   1. Elimina numeros_vendedor de vendedores que ya no están en
-      la lista (respetando ventas registradas).
-   2. Para cada vendedor seleccionado, copia sus asignaciones
-      confirmadas de cat_global_asignaciones a numeros_vendedor
-      con este rifa_id, incluyendo la serie (A o B).
-   3. Si se reciben vendedores_ids legado (sin categoria_id) se
-      usa numeros_vendedor_global como fallback.
+   ✅ FIX: el constraint UNIQUE en numeros_vendedor es
+   (rifa_id, numero, serie) — sin vendedor_id. Por eso, antes
+   de INSERT, hay que liberar de OTROS vendedores los (num,serie)
+   que la nueva categoría reasigna (siempre que no tengan venta).
+   También se limpia boleteria_numeros_extra cuando un (num,serie)
+   pasa a ser fijo.
 ──────────────────────────────────────────────────────────── */
 async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vendedores_categorias = []) {
-  // 1. Quitar asignaciones de vendedores removidos
+  // 1. Quitar asignaciones de vendedores removidos (respetando ventas)
   if (vendedores_ids.length > 0) {
     await client.query(
       `DELETE FROM numeros_vendedor
@@ -66,16 +65,21 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
   if (vendedores_ids.length === 0) return;
 
   if (vendedores_categorias.length > 0) {
-    // Verificar si la columna serie existe ANTES de entrar al loop.
-    // Un query fallido dentro de una TX de Postgres la deja abortada (25P02);
-    // el .catch() de JS no puede recuperar eso, hay que decidir el path antes.
+    // Verificar si la columna serie existe
     const colCheck = await client.query(
       `SELECT 1 FROM information_schema.columns
        WHERE table_name = 'numeros_vendedor' AND column_name = 'serie'`
     );
     const tieneColumnasSerie = colCheck.rows.length > 0;
 
-    // Agrupar por categoria_id para un solo query por categoría
+    // ¿Existe ya la tabla boleteria_numeros_extra?
+    const tablaExtraCheck = await client.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'boleteria_numeros_extra'`
+    );
+    const tieneTablaExtra = tablaExtraCheck.rows.length > 0;
+
+    // Agrupar por categoria_id
     const porCategoria = {};
     for (const { vendedor_id, categoria_id } of vendedores_categorias) {
       if (!porCategoria[categoria_id]) porCategoria[categoria_id] = [];
@@ -84,18 +88,72 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
 
     for (const [categoria_id, vids] of Object.entries(porCategoria)) {
       if (tieneColumnasSerie) {
-        // Flujo completo: copiar con serie A/B
+        // PASO A) Liberar (numero, serie) que pertenecían a OTRO vendedor
+        // en esta rifa pero que la nueva categoría reasigna a uno de
+        // estos vendedores. Solo si NO tiene venta.
+        await client.query(
+          `DELETE FROM numeros_vendedor nv
+           WHERE nv.rifa_id = $1
+             AND (nv.numero, nv.serie) IN (
+                SELECT cga.numero, cga.serie
+                FROM cat_global_asignaciones cga
+                WHERE cga.categoria_id = $2
+                  AND cga.vendedor_id = ANY($3::uuid[])
+             )
+             AND nv.vendedor_id <> ALL($3::uuid[])
+             AND NOT EXISTS (
+                SELECT 1 FROM ventas v
+                 WHERE v.rifa_id = nv.rifa_id AND v.numero = nv.numero
+             )`,
+          [rifa_id, categoria_id, vids]
+        );
+
+        // PASO B) Liberar de boleteria_numeros_extra los (num,serie)
+        // que ahora la categoría va a fijar. La asignación fija manda.
+        if (tieneTablaExtra) {
+          await client.query(
+            `DELETE FROM boleteria_numeros_extra bne
+             WHERE bne.rifa_id = $1
+               AND (bne.numero, bne.serie) IN (
+                  SELECT cga.numero, cga.serie
+                  FROM cat_global_asignaciones cga
+                  WHERE cga.categoria_id = $2
+                    AND cga.vendedor_id = ANY($3::uuid[])
+               )`,
+            [rifa_id, categoria_id, vids]
+          );
+        }
+
+        // PASO C) Insertar usando el constraint correcto.
+        // Si la terna (rifa_id, numero, serie) ya existe (porque era del
+        // mismo vendedor, o porque otro la tenía con venta), no se toca.
         await client.query(
           `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero, serie)
            SELECT cga.vendedor_id, $1, cga.numero, cga.serie
            FROM cat_global_asignaciones cga
            WHERE cga.categoria_id = $2
              AND cga.vendedor_id = ANY($3::uuid[])
-           ON CONFLICT (vendedor_id, rifa_id, numero, serie) DO NOTHING`,
+           ON CONFLICT ON CONSTRAINT numeros_vendedor_rifa_numero_serie_unico DO NOTHING`,
           [rifa_id, categoria_id, vids]
         );
       } else {
-        // Fallback: la columna serie no existe aun en la BD
+        // Fallback: la columna serie no existe aún en la BD
+        await client.query(
+          `DELETE FROM numeros_vendedor nv
+           WHERE nv.rifa_id = $1
+             AND nv.numero IN (
+                SELECT DISTINCT cga.numero FROM cat_global_asignaciones cga
+                WHERE cga.categoria_id = $2
+                  AND cga.vendedor_id = ANY($3::uuid[])
+             )
+             AND nv.vendedor_id <> ALL($3::uuid[])
+             AND NOT EXISTS (
+                SELECT 1 FROM ventas v
+                 WHERE v.rifa_id = nv.rifa_id AND v.numero = nv.numero
+             )`,
+          [rifa_id, categoria_id, vids]
+        );
+
         await client.query(
           `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
            SELECT DISTINCT cga.vendedor_id, $1, cga.numero
@@ -108,7 +166,22 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
       }
     }
   } else {
-    // ── Flujo legado: numeros_vendedor_global
+    // Flujo legado: numeros_vendedor_global
+    await client.query(
+      `DELETE FROM numeros_vendedor nv
+       WHERE nv.rifa_id = $1
+         AND nv.numero IN (
+            SELECT DISTINCT ng.numero FROM numeros_vendedor_global ng
+            WHERE ng.vendedor_id = ANY($2::uuid[])
+         )
+         AND nv.vendedor_id <> ALL($2::uuid[])
+         AND NOT EXISTS (
+            SELECT 1 FROM ventas v
+             WHERE v.rifa_id = nv.rifa_id AND v.numero = nv.numero
+         )`,
+      [rifa_id, vendedores_ids]
+    );
+
     await client.query(
       `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero)
        SELECT ng.vendedor_id, $1 AS rifa_id, ng.numero
@@ -527,14 +600,19 @@ router.put('/:id/ticket-design', authMiddleware, soloDueno, async (req, res) => 
 });
 
 
-// ── GET /api/rifas/:id/boleteria-vendedores ────────────────
-// Devuelve vendedores asignados a esta rifa con sus números fijos,
-// y los números disponibles por serie (A y B) para asignar más.
+// ════════════════════════════════════════════════════════════
+//  RUTAS BOLETERÍA — versión con tabla `boleteria_numeros_extra`
+//  Los números agregados desde boletería NO entran a las categorías
+//  globales del vendedor; viven solo en esta rifa.
+// ════════════════════════════════════════════════════════════
 
+// ── GET /api/rifas/:id/boleteria-vendedores ────────────────
+// Devuelve vendedores asignados a esta rifa con todos sus números
+// (fijos + extras), y los números disponibles por serie (A y B).
 router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, res) => {
   try {
     const rifa_id = req.params.id;
- 
+
     // 1. Info de la rifa
     const rifaR = await pool.query(
       `SELECT id, nombre, COALESCE(tipo, 'sencilla') AS tipo, categoria_seleccionada_id
@@ -544,8 +622,8 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     const rifa         = rifaR.rows[0];
     const esSimultanea = rifa.tipo === 'simultanea';
- 
-    // 2. Vendedores con TODOS sus números en esta rifa (fijos + extras)
+
+    // 2. Vendedores con TODOS sus números en esta rifa (fijos + extras).
     //    Se etiqueta cada número con `origen` para el frontend.
     const vendR = await pool.query(`
       WITH numeros_unidos AS (
@@ -582,18 +660,14 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       GROUP BY u.id, u.nombre, u.cedula
       ORDER BY u.nombre
     `, [rifa_id]);
- 
-    // 3. Disponibles por serie en la CATEGORÍA (lo que se puede repartir).
-    //    Un número está disponible para serie X si:
-    //      • está en el pool de la categoría (cat_vendedor_numeros), Y
-    //      • esa (numero, serie) NO está ya en cat_global_asignaciones, Y
-    //      • esa (numero, serie) NO está ya como extra en esta rifa.
+
+    // 3. Disponibles por serie en la CATEGORÍA.
     let disponiblesA = [];
     let disponiblesB = [];
- 
+
     if (rifa.categoria_seleccionada_id) {
       const cat_id = rifa.categoria_seleccionada_id;
- 
+
       // Ocupadas en la categoría global (fijos)
       const asigR = await pool.query(
         `SELECT numero, serie FROM cat_global_asignaciones WHERE categoria_id = $1`,
@@ -604,7 +678,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
         if (!ocupadasPorNum[r.numero]) ocupadasPorNum[r.numero] = new Set();
         ocupadasPorNum[r.numero].add(r.serie);
       });
- 
+
       // Ocupadas como EXTRA en esta rifa (también bloquean)
       const extraR = await pool.query(
         `SELECT numero, serie FROM boleteria_numeros_extra WHERE rifa_id = $1`,
@@ -614,21 +688,21 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
         if (!ocupadasPorNum[r.numero]) ocupadasPorNum[r.numero] = new Set();
         ocupadasPorNum[r.numero].add(r.serie);
       });
- 
+
       // Pool de números de la categoría
       const poolR = await pool.query(
         `SELECT DISTINCT numero FROM cat_vendedor_numeros
           WHERE categoria_id = $1 ORDER BY numero`,
         [cat_id]
       );
- 
+
       for (const { numero } of poolR.rows) {
         const ocupadas = ocupadasPorNum[numero] || new Set();
         if (!ocupadas.has('A'))                disponiblesA.push(numero);
         if (esSimultanea && !ocupadas.has('B')) disponiblesB.push(numero);
       }
     }
- 
+
     res.json({
       rifa_id,
       tipo:             rifa.tipo,
@@ -643,7 +717,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 // ── POST /api/rifas/:id/boleteria-vendedores/:vendedorId ───
 // Asigna números EXTRA a un vendedor SOLO para esta rifa.
 // NO se escriben en cat_global_asignaciones ni cat_vendedor_numeros.
@@ -652,18 +726,18 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
   const { numeros, serie } = req.body;
   const rifa_id     = req.params.id;
   const vendedor_id = req.params.vendedorId;
- 
+
   if (!Array.isArray(numeros) || numeros.length === 0)
     return res.status(400).json({ error: 'numeros[] es requerido' });
- 
+
   const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
   if (invalidos.length > 0)
     return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
- 
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
- 
+
     const rifaR = await client.query(
       `SELECT id, COALESCE(tipo,'sencilla') AS tipo, categoria_seleccionada_id
        FROM rifas WHERE id = $1`,
@@ -675,26 +749,23 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
     }
     const { tipo, categoria_seleccionada_id } = rifaR.rows[0];
     const esSimultanea = tipo === 'simultanea';
- 
-    // Verificar que el vendedor exista
+
     const vR = await client.query(`SELECT id FROM users WHERE id = $1`, [vendedor_id]);
     if (!vR.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Vendedor no encontrado' });
     }
- 
+
     const insertados = [];
     const colisiones = [];
- 
+
     for (const numero of numeros) {
       // ── Resolver la serie a usar ───────────────────────────
       let serieDestino = serie || 'A';
- 
+
       if (esSimultanea && !serie) {
-        // Auto-resolver: ver qué series están libres
-        // (en cat_global_asignaciones Y en boleteria_numeros_extra)
         const ocupadas = new Set();
- 
+
         if (categoria_seleccionada_id) {
           const ocR = await client.query(
             `SELECT serie FROM cat_global_asignaciones
@@ -709,7 +780,7 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
           [rifa_id, numero]
         );
         ocExtraR.rows.forEach(r => ocupadas.add(r.serie));
- 
+
         if (!ocupadas.has('A'))      serieDestino = 'A';
         else if (!ocupadas.has('B')) serieDestino = 'B';
         else {
@@ -717,9 +788,9 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
           continue;
         }
       }
- 
+
       // ── Verificar conflictos ───────────────────────────────
-      // a) ¿Ya lo tiene fijo el mismo vendedor (numeros_vendedor)?
+      // a) ¿Ya lo tiene fijo el mismo vendedor?
       const yaFijo = await client.query(
         `SELECT 1 FROM numeros_vendedor
           WHERE vendedor_id = $1 AND rifa_id = $2
@@ -730,7 +801,7 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         colisiones.push({ numero, razon: `Ya es número fijo del vendedor (Serie ${serieDestino})` });
         continue;
       }
- 
+
       // b) ¿Ya lo tiene como extra el mismo vendedor?
       const yaExtraMismo = await client.query(
         `SELECT 1 FROM boleteria_numeros_extra
@@ -742,8 +813,8 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         colisiones.push({ numero, razon: `Ya asignado como extra (Serie ${serieDestino})` });
         continue;
       }
- 
-      // c) ¿Otro vendedor ya lo tiene (fijo o extra) en esta rifa con esa serie?
+
+      // c) ¿Otro vendedor ya lo tiene (fijo o extra) en esta rifa?
       const ocupadoOtroR = await client.query(
         `SELECT u.nombre, src FROM (
            SELECT vendedor_id, 'fijo'  AS src FROM numeros_vendedor
@@ -765,9 +836,8 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         });
         continue;
       }
- 
+
       // ── Insertar SOLO en boleteria_numeros_extra ───────────
-      //  (NO se toca cat_global_asignaciones ni cat_vendedor_numeros)
       await client.query(
         `INSERT INTO boleteria_numeros_extra
            (rifa_id, vendedor_id, numero, serie, created_by)
@@ -775,10 +845,10 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
          ON CONFLICT (rifa_id, numero, serie) DO NOTHING`,
         [rifa_id, vendedor_id, numero, serieDestino, req.user.id]
       );
- 
+
       insertados.push({ numero, serie: serieDestino, origen: 'extra' });
     }
- 
+
     await client.query('COMMIT');
     res.json({
       ok: true,
@@ -794,31 +864,23 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
     client.release();
   }
 });
- 
+
 // ── DELETE /api/rifas/:id/boleteria-vendedores/:vendedorId/numero ──
-// Quita un número del vendedor en esta rifa.
 // Body: { numero: '001', serie?: 'A'|'B', origen?: 'fijo'|'extra' }
-//
-//   • Si origen === 'extra'  → solo borra de boleteria_numeros_extra.
-//   • Si origen === 'fijo'   → borra de numeros_vendedor Y libera la
-//                              asignación en cat_global_asignaciones
-//                              (comportamiento legado).
-//   • Si origen no viene     → intenta primero extra; si no existe, fijo.
-//     (Esto permite que el frontend siga llamando sin saber el origen.)
 router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero, serie, origen } = req.body;
   const rifa_id     = req.params.id;
   const vendedor_id = req.params.vendedorId;
- 
+
   if (!numero) return res.status(400).json({ error: 'numero es requerido' });
- 
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
- 
-    // ── 1) Intentar borrar como EXTRA si aplica ────────────
+
     let borradoComo = null;
- 
+
+    // 1) Intentar borrar como EXTRA si aplica
     if (origen === 'extra' || !origen) {
       const qExtra = serie
         ? `DELETE FROM boleteria_numeros_extra
@@ -831,16 +893,15 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
       const delExtra = await client.query(qExtra, pExtra);
       if (delExtra.rowCount > 0) borradoComo = 'extra';
     }
- 
-    // ── 2) Si no era extra (o el frontend pide fijo) → borrar fijo ──
+
+    // 2) Si no era extra, borrar fijo
     if (!borradoComo && (origen === 'fijo' || !origen)) {
-      // Rifa para saber su categoría (para liberar también en cat_global_asignaciones)
       const rifaR = await client.query(
         `SELECT categoria_seleccionada_id FROM rifas WHERE id = $1`,
         [rifa_id]
       );
       const cat_id = rifaR.rows[0]?.categoria_seleccionada_id;
- 
+
       const qFijo = serie
         ? `DELETE FROM numeros_vendedor
             WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3
@@ -849,10 +910,9 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
             WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3 RETURNING serie`;
       const pFijo = serie ? [vendedor_id, rifa_id, numero, serie] : [vendedor_id, rifa_id, numero];
       const delFijo = await client.query(qFijo, pFijo);
- 
+
       if (delFijo.rowCount > 0) {
         borradoComo = 'fijo';
-        // Liberar en cat_global_asignaciones (comportamiento legado del fijo)
         if (cat_id) {
           const q2 = serie
             ? `DELETE FROM cat_global_asignaciones
@@ -864,12 +924,12 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
         }
       }
     }
- 
+
     if (!borradoComo) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Ese número no estaba asignado al vendedor en esta rifa' });
     }
- 
+
     await client.query('COMMIT');
     res.json({ ok: true, numero, serie, origen: borradoComo });
   } catch (err) {
@@ -880,7 +940,5 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
     client.release();
   }
 });
-
-
 
 module.exports = router;

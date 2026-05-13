@@ -200,7 +200,7 @@ router.get('/', authMiddleware, async (req, res) => {
     const result = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
-        r.fecha_sorteo, r.loteria_ref, r.activa,
+        r.fecha_sorteo, r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
@@ -262,7 +262,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
     const result = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
-        r.fecha_sorteo, r.loteria_ref, r.activa,
+        r.fecha_sorteo, r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
@@ -307,7 +307,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 router.post('/', authMiddleware, soloDueno, async (req, res) => {
   const {
     nombre, descripcion, premio, precio,
-    fecha_sorteo, loteria_ref,
+    fecha_sorteo, hora_sorteo, loteria_ref,
     tipo                  = 'sencilla',
     imagen_url            = null,
     estado                = 'activa',
@@ -337,13 +337,13 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     // Crear la rifa guardando categoria_seleccionada_id para que caja pueda leerla
     const result = await client.query(
       `INSERT INTO rifas
-         (nombre, descripcion, premio, precio, fecha_sorteo, loteria_ref,
+         (nombre, descripcion, premio, precio, fecha_sorteo, hora_sorteo, loteria_ref,
           tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         nombre, descripcion || null, premio, precio,
-        fecha_sorteo || null, loteria_ref || null,
+        fecha_sorteo || null, hora_sorteo || null, loteria_ref || null,
         tipo, imagen_url, estado,
         JSON.stringify(ofertasOrdenadas),
         categoria_id || null,
@@ -390,7 +390,7 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
 router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   const {
     nombre, descripcion, premio, precio,
-    fecha_sorteo, loteria_ref,
+    fecha_sorteo, hora_sorteo, loteria_ref,
     activa, tipo, imagen_url, estado, ofertas,
     vendedores_ids,
     vendedores_categorias,        // [{vendedor_id, categoria_id}] — puede ser undefined
@@ -423,7 +423,10 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         imagen_url              = CASE WHEN $9::text  IS NOT NULL THEN $9::text  ELSE imagen_url END,
         estado                  = COALESCE($10, estado),
         ofertas                 = CASE WHEN $11::text IS NOT NULL THEN $11::jsonb ELSE ofertas END,
-        categoria_seleccionada_id = COALESCE($13::uuid, categoria_seleccionada_id)
+        categoria_seleccionada_id = COALESCE($13::uuid, categoria_seleccionada_id),
+        hora_sorteo             = CASE WHEN $14::text IS NOT NULL
+                                       THEN $14::text::time
+                                       ELSE hora_sorteo END
        WHERE id = $12
        RETURNING *`,
       [
@@ -440,6 +443,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         ofertasOrdenadas ?? null,
         req.params.id,
         categoria_id ?? null,
+        hora_sorteo  !== undefined ? (hora_sorteo || null) : null,
       ]
     );
 

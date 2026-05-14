@@ -200,6 +200,7 @@ router.get('/', authMiddleware, async (req, res) => {
     const result = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
+        r.fecha_sorteo::text AS fecha_sorteo, 
         r.fecha_sorteo, r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
         COALESCE(r.tipo,    'sencilla') AS tipo,

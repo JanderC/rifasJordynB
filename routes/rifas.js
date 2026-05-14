@@ -2,13 +2,7 @@
 //   RIFAS JORDYN — Rutas de Rifas
 //   ✅ ACTUALIZADO: campo `ofertas` (jsonb) en crear/editar/leer
 //   ✅ ACTUALIZADO v3: flujo categorías globales
-//      - POST/PUT reciben `categoria_id` y `vendedores_categorias`
-//        [{vendedor_id, categoria_id}] desde el selector del frontend.
-//      - `categoria_seleccionada_id` se guarda en la tabla rifas para
-//        que caja.js pueda leer qué vendedores van en el lote.
-//      - sincronizarVendedoresRifa usa cat_global_asignaciones para
-//        copiar los números con sus series A/B a numeros_vendedor.
-//      - Se mantiene compatibilidad con `vendedores_ids` legado.
+//   ✅ FIX: fecha_sorteo::text para evitar desfase de zona horaria
 // ============================================================
 const express = require('express');
 const router  = express.Router();
@@ -32,12 +26,6 @@ function validarOfertas(ofertas) {
 
 /* ── Helper: sincronizar vendedores de una rifa ─────────────
    Fuente de verdad: cat_global_asignaciones (series A/B).
-   ✅ FIX: el constraint UNIQUE en numeros_vendedor es
-   (rifa_id, numero, serie) — sin vendedor_id. Por eso, antes
-   de INSERT, hay que liberar de OTROS vendedores los (num,serie)
-   que la nueva categoría reasigna (siempre que no tengan venta).
-   También se limpia boleteria_numeros_extra cuando un (num,serie)
-   pasa a ser fijo.
 ──────────────────────────────────────────────────────────── */
 async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vendedores_categorias = []) {
   // 1. Quitar asignaciones de vendedores removidos (respetando ventas)
@@ -65,21 +53,18 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
   if (vendedores_ids.length === 0) return;
 
   if (vendedores_categorias.length > 0) {
-    // Verificar si la columna serie existe
     const colCheck = await client.query(
       `SELECT 1 FROM information_schema.columns
        WHERE table_name = 'numeros_vendedor' AND column_name = 'serie'`
     );
     const tieneColumnasSerie = colCheck.rows.length > 0;
 
-    // ¿Existe ya la tabla boleteria_numeros_extra?
     const tablaExtraCheck = await client.query(
       `SELECT 1 FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name = 'boleteria_numeros_extra'`
     );
     const tieneTablaExtra = tablaExtraCheck.rows.length > 0;
 
-    // Agrupar por categoria_id
     const porCategoria = {};
     for (const { vendedor_id, categoria_id } of vendedores_categorias) {
       if (!porCategoria[categoria_id]) porCategoria[categoria_id] = [];
@@ -88,9 +73,6 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
 
     for (const [categoria_id, vids] of Object.entries(porCategoria)) {
       if (tieneColumnasSerie) {
-        // PASO A) Liberar (numero, serie) que pertenecían a OTRO vendedor
-        // en esta rifa pero que la nueva categoría reasigna a uno de
-        // estos vendedores. Solo si NO tiene venta.
         await client.query(
           `DELETE FROM numeros_vendedor nv
            WHERE nv.rifa_id = $1
@@ -108,8 +90,6 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
           [rifa_id, categoria_id, vids]
         );
 
-        // PASO B) Liberar de boleteria_numeros_extra los (num,serie)
-        // que ahora la categoría va a fijar. La asignación fija manda.
         if (tieneTablaExtra) {
           await client.query(
             `DELETE FROM boleteria_numeros_extra bne
@@ -124,9 +104,6 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
           );
         }
 
-        // PASO C) Insertar usando el constraint correcto.
-        // Si la terna (rifa_id, numero, serie) ya existe (porque era del
-        // mismo vendedor, o porque otro la tenía con venta), no se toca.
         await client.query(
           `INSERT INTO numeros_vendedor (vendedor_id, rifa_id, numero, serie)
            SELECT cga.vendedor_id, $1, cga.numero, cga.serie
@@ -137,7 +114,6 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
           [rifa_id, categoria_id, vids]
         );
       } else {
-        // Fallback: la columna serie no existe aún en la BD
         await client.query(
           `DELETE FROM numeros_vendedor nv
            WHERE nv.rifa_id = $1
@@ -196,12 +172,11 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
 // ── GET /api/rifas ─────────────────────────────────────────
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    // Rifas con sus stats
     const result = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
-        r.fecha_sorteo::text AS fecha_sorteo, 
-        r.fecha_sorteo, r.hora_sorteo, r.loteria_ref, r.activa,
+        r.fecha_sorteo::text AS fecha_sorteo,
+        r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
@@ -217,7 +192,6 @@ router.get('/', authMiddleware, async (req, res) => {
 
     const rifas = result.rows;
 
-    // Vendedores por rifa (usando numeros_vendedor agrupados)
     const vendedoresResult = await pool.query(`
       SELECT
         nv.rifa_id,
@@ -231,7 +205,6 @@ router.get('/', authMiddleware, async (req, res) => {
       ORDER BY u.nombre
     `);
 
-    // Agrupar vendedores por rifa_id
     const vendedoresPorRifa = {};
     vendedoresResult.rows.forEach(vr => {
       if (!vendedoresPorRifa[vr.rifa_id]) vendedoresPorRifa[vr.rifa_id] = [];
@@ -243,7 +216,6 @@ router.get('/', authMiddleware, async (req, res) => {
       });
     });
 
-    // Inyectar vendedores en cada rifa
     const rifasConVendedores = rifas.map(r => ({
       ...r,
       vendedores:     vendedoresPorRifa[r.id] || [],
@@ -263,7 +235,8 @@ router.get('/:id', authMiddleware, async (req, res) => {
     const result = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
-        r.fecha_sorteo, r.hora_sorteo, r.loteria_ref, r.activa,
+        r.fecha_sorteo::text AS fecha_sorteo,
+        r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
@@ -279,7 +252,6 @@ router.get('/:id', authMiddleware, async (req, res) => {
 
     if (!result.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
 
-    // Vendedores de esta rifa
     const vRes = await pool.query(`
       SELECT
         nv.vendedor_id        AS id,
@@ -314,8 +286,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     estado                = 'activa',
     ofertas               = [],
     vendedores_ids        = [],
-    vendedores_categorias = [],   // [{vendedor_id, categoria_id}] — desde SelectorCategoria
-    categoria_id          = null, // categoría global seleccionada
+    vendedores_categorias = [],
+    categoria_id          = null,
   } = req.body;
 
   if (!nombre || !premio || !precio)
@@ -330,18 +302,22 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Construir ids desde vendedores_categorias si no vienen como vendedores_ids
     const vids = vendedores_ids.length > 0
       ? vendedores_ids
       : vendedores_categorias.map(v => v.vendedor_id);
 
-    // Crear la rifa guardando categoria_seleccionada_id para que caja pueda leerla
+    // ✅ FIX: fecha_sorteo::text en RETURNING para evitar desfase UTC
     const result = await client.query(
       `INSERT INTO rifas
          (nombre, descripcion, premio, precio, fecha_sorteo, hora_sorteo, loteria_ref,
           tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       RETURNING *`,
+       RETURNING
+         id, nombre, descripcion, premio, precio,
+         fecha_sorteo::text AS fecha_sorteo,
+         hora_sorteo, loteria_ref, activa, imagen_url,
+         tipo, estado, ofertas, ticket_design,
+         categoria_seleccionada_id, created_by, created_at, updated_at`,
       [
         nombre, descripcion || null, premio, precio,
         fecha_sorteo || null, hora_sorteo || null, loteria_ref || null,
@@ -354,14 +330,12 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
 
     const rifa = result.rows[0];
 
-    // Reservar números usando cat_global_asignaciones (series A/B)
     if (vids.length > 0) {
       await sincronizarVendedoresRifa(client, rifa.id, vids, vendedores_categorias);
     }
 
     await client.query('COMMIT');
 
-    // Devolver rifa con vendedores
     const vRes = await pool.query(`
       SELECT nv.vendedor_id AS id, u.nombre, u.usuario, COUNT(nv.numero)::int AS numeros_count
       FROM numeros_vendedor nv
@@ -394,8 +368,8 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     fecha_sorteo, hora_sorteo, loteria_ref,
     activa, tipo, imagen_url, estado, ofertas,
     vendedores_ids,
-    vendedores_categorias,        // [{vendedor_id, categoria_id}] — puede ser undefined
-    categoria_id,                 // categoría global seleccionada — puede ser undefined
+    vendedores_categorias,
+    categoria_id,
   } = req.body;
 
   if (ofertas !== undefined) {
@@ -411,6 +385,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // ✅ FIX: fecha_sorteo::text en RETURNING para evitar desfase UTC
     const result = await client.query(
       `UPDATE rifas SET
         nombre                  = COALESCE($1,  nombre),
@@ -429,7 +404,12 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
                                        THEN $14::text::time
                                        ELSE hora_sorteo END
        WHERE id = $12
-       RETURNING *`,
+       RETURNING
+         id, nombre, descripcion, premio, precio,
+         fecha_sorteo::text AS fecha_sorteo,
+         hora_sorteo, loteria_ref, activa, imagen_url,
+         tipo, estado, ofertas, ticket_design,
+         categoria_seleccionada_id, created_at, updated_at`,
       [
         nombre       ?? null,
         descripcion  ?? null,
@@ -453,7 +433,6 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
 
-    // Sincronizar reservas si vienen vendedores (ya sea formato nuevo o legado)
     const vids = Array.isArray(vendedores_ids) && vendedores_ids.length > 0
       ? vendedores_ids
       : Array.isArray(vendedores_categorias) && vendedores_categorias.length > 0
@@ -471,7 +450,6 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Devolver rifa actualizada con vendedores
     const vRes = await pool.query(`
       SELECT nv.vendedor_id AS id, u.nombre, u.usuario, COUNT(nv.numero)::int AS numeros_count
       FROM numeros_vendedor nv
@@ -498,14 +476,12 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── DELETE /api/rifas/:id ──────────────────────────────────
-// Query param: ?force=true  → borra también ventas y números
 router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   const force = req.query.force === 'true';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Verificar que la rifa existe
     const rifaR = await client.query(
       `SELECT r.id, r.nombre, r.activa,
               COUNT(DISTINCT v.id)::int  AS total_ventas,
@@ -530,7 +506,6 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
 
     const rifa = rifaR.rows[0];
 
-    // Si tiene ventas y no es force → devolver info para que el frontend muestre la advertencia
     if (rifa.total_ventas > 0 && !force) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -544,7 +519,6 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
       });
     }
 
-    // Eliminar en orden: ventas → numeros_vendedor → rifa
     if (force) {
       await client.query('DELETE FROM ventas          WHERE rifa_id = $1', [req.params.id]);
     }
@@ -606,19 +580,14 @@ router.put('/:id/ticket-design', authMiddleware, soloDueno, async (req, res) => 
 
 
 // ════════════════════════════════════════════════════════════
-//  RUTAS BOLETERÍA — versión con tabla `boleteria_numeros_extra`
-//  Los números agregados desde boletería NO entran a las categorías
-//  globales del vendedor; viven solo en esta rifa.
+//  RUTAS BOLETERÍA
 // ════════════════════════════════════════════════════════════
 
 // ── GET /api/rifas/:id/boleteria-vendedores ────────────────
-// Devuelve vendedores asignados a esta rifa con todos sus números
-// (fijos + extras), y los números disponibles por serie (A y B).
 router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, res) => {
   try {
     const rifa_id = req.params.id;
 
-    // 1. Info de la rifa
     const rifaR = await pool.query(
       `SELECT id, nombre, COALESCE(tipo, 'sencilla') AS tipo, categoria_seleccionada_id
        FROM rifas WHERE id = $1`,
@@ -628,8 +597,6 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     const rifa         = rifaR.rows[0];
     const esSimultanea = rifa.tipo === 'simultanea';
 
-    // 2. Vendedores con TODOS sus números en esta rifa (fijos + extras).
-    //    Se etiqueta cada número con `origen` para el frontend.
     const vendR = await pool.query(`
       WITH numeros_unidos AS (
         SELECT vendedor_id, numero, COALESCE(serie, 'A') AS serie, 'fijo'::text AS origen
@@ -666,27 +633,15 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       ORDER BY u.nombre
     `, [rifa_id]);
 
-    // 3. Disponibles por serie en la CATEGORÍA.
     let disponiblesA = [];
     let disponiblesB = [];
 
-    // ── Cálculo de disponibles ───────────────────────────────
-    // Universo: TODOS los números 000–999 por serie.
-    // Bloqueos por (numero, serie):
-    //   1. cat_global_asignaciones  → ya asignado como fijo a algún vendedor
-    //   2. boleteria_numeros_extra  → ya asignado como extra en esta rifa
-    //   3. ventas                   → ya vendido (cada venta consume 1 ranura empezando por A)
-    //   4. reservas_cliente pendiente → cada reserva consume 1 ranura empezando por A
-    //
-    // Las ventas y reservas no guardan serie, así que se asume que ocupan
-    // ranuras en orden A → B (consistente con el resto del sistema público).
     const ocupadasPorNum = {};
     const marcar = (numero, serie) => {
       if (!ocupadasPorNum[numero]) ocupadasPorNum[numero] = new Set();
       ocupadasPorNum[numero].add(serie);
     };
 
-    // 1) Fijos (categoría global) — solo si la rifa tiene categoría
     if (rifa.categoria_seleccionada_id) {
       const asigR = await pool.query(
         `SELECT numero, serie FROM cat_global_asignaciones WHERE categoria_id = $1`,
@@ -695,15 +650,12 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       asigR.rows.forEach(r => marcar(r.numero, r.serie));
     }
 
-    // 2) Extras de esta rifa
     const extraR = await pool.query(
       `SELECT numero, serie FROM boleteria_numeros_extra WHERE rifa_id = $1`,
       [rifa_id]
     );
     extraR.rows.forEach(r => marcar(r.numero, r.serie));
 
-    // 3) Ventas confirmadas — ocupan ranuras A → B según cantidad
-    //    Las ventas no guardan serie. Convención del sistema: 1ª venta = A, 2ª = B.
     const ventasR = await pool.query(
       `SELECT numero, COUNT(*)::int AS veces FROM ventas
         WHERE rifa_id = $1 GROUP BY numero`,
@@ -716,21 +668,18 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       }
     });
 
-    // 4) Reservas pendientes — bloquean ranuras también
     const reservR = await pool.query(
       `SELECT numero, COUNT(*)::int AS veces FROM reservas_cliente
         WHERE rifa_id = $1 AND estado = 'pendiente' GROUP BY numero`,
       [rifa_id]
     );
     reservR.rows.forEach(r => {
-      // Misma lógica que ventas: ocupar A primero, luego B si hace falta
       for (let i = 0; i < r.veces; i++) {
         if (!ocupadasPorNum[r.numero]?.has('A')) marcar(r.numero, 'A');
         else if (!ocupadasPorNum[r.numero]?.has('B')) marcar(r.numero, 'B');
       }
     });
 
-    // Universo completo: 000–999
     for (let i = 0; i < 1000; i++) {
       const numero   = String(i).padStart(3, '0');
       const ocupadas = ocupadasPorNum[numero] || new Set();
@@ -754,9 +703,6 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
 });
 
 // ── POST /api/rifas/:id/boleteria-vendedores/:vendedorId ───
-// Asigna números EXTRA a un vendedor SOLO para esta rifa.
-// NO se escriben en cat_global_asignaciones ni cat_vendedor_numeros.
-// Body: { numeros: ['001','002'], serie?: 'A'|'B' }
 router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, async (req, res) => {
   const { numeros, serie } = req.body;
   const rifa_id     = req.params.id;
@@ -795,7 +741,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
     const colisiones = [];
 
     for (const numero of numeros) {
-      // ── Resolver la serie a usar ───────────────────────────
       let serieDestino = serie || 'A';
 
       if (esSimultanea && !serie) {
@@ -824,8 +769,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         }
       }
 
-      // ── Verificar conflictos ───────────────────────────────
-      // a) ¿Ya lo tiene fijo el mismo vendedor?
       const yaFijo = await client.query(
         `SELECT 1 FROM numeros_vendedor
           WHERE vendedor_id = $1 AND rifa_id = $2
@@ -837,7 +780,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         continue;
       }
 
-      // b) ¿Ya lo tiene como extra el mismo vendedor?
       const yaExtraMismo = await client.query(
         `SELECT 1 FROM boleteria_numeros_extra
           WHERE vendedor_id = $1 AND rifa_id = $2
@@ -849,7 +791,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         continue;
       }
 
-      // c) ¿Otro vendedor ya lo tiene (fijo o extra) en esta rifa?
       const ocupadoOtroR = await client.query(
         `SELECT u.nombre, src FROM (
            SELECT vendedor_id, 'fijo'  AS src FROM numeros_vendedor
@@ -872,7 +813,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
         continue;
       }
 
-      // ── Insertar SOLO en boleteria_numeros_extra ───────────
       await client.query(
         `INSERT INTO boleteria_numeros_extra
            (rifa_id, vendedor_id, numero, serie, created_by)
@@ -901,7 +841,6 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
 });
 
 // ── DELETE /api/rifas/:id/boleteria-vendedores/:vendedorId/numero ──
-// Body: { numero: '001', serie?: 'A'|'B', origen?: 'fijo'|'extra' }
 router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero, serie, origen } = req.body;
   const rifa_id     = req.params.id;
@@ -915,7 +854,6 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
 
     let borradoComo = null;
 
-    // 1) Intentar borrar como EXTRA si aplica
     if (origen === 'extra' || !origen) {
       const qExtra = serie
         ? `DELETE FROM boleteria_numeros_extra
@@ -929,7 +867,6 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
       if (delExtra.rowCount > 0) borradoComo = 'extra';
     }
 
-    // 2) Si no era extra, borrar fijo
     if (!borradoComo && (origen === 'fijo' || !origen)) {
       const rifaR = await client.query(
         `SELECT categoria_seleccionada_id FROM rifas WHERE id = $1`,

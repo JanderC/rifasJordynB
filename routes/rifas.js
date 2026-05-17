@@ -913,4 +913,250 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+//   VENTA RÁPIDA — endpoints para la pantalla de Reservas
+// ════════════════════════════════════════════════════════════════
+
+// ── GET /api/rifas/:id/numero/:n/disponibilidad ──
+// Verifica si un número está disponible para ser vendido en una rifa.
+// Toma en cuenta: ventas existentes y reservas pendientes/aprobadas.
+// Para rifas simultáneas (series A y B) reporta disponibilidad por serie.
+router.get('/:id/numero/:n/disponibilidad', authMiddleware, soloDueno, async (req, res) => {
+  const rifa_id = req.params.id;
+  let numero = String(req.params.n).trim();
+  // Normalizar a 3 dígitos (000-999)
+  if (/^\d+$/.test(numero)) numero = numero.padStart(3, '0');
+
+  try {
+    // 1. Obtener rifa
+    const rifaR = await pool.query(
+      `SELECT id, nombre, premio, precio, tipo,
+              COALESCE(estado, 'activa') AS estado, activa,
+              fecha_sorteo::text AS fecha_sorteo, hora_sorteo, loteria_ref,
+              categoria_seleccionada_id
+       FROM rifas WHERE id = $1`,
+      [rifa_id]
+    );
+    if (!rifaR.rows.length) {
+      return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+    const rifa = rifaR.rows[0];
+
+    // Solo permitir consulta sobre rifas activas
+    if (!rifa.activa || rifa.estado !== 'activa') {
+      return res.status(400).json({
+        error: 'Esta rifa no está activa',
+        disponible: false,
+        motivo: 'rifa_inactiva',
+      });
+    }
+
+    const esSimultanea = rifa.tipo === 'simultanea';
+
+    // 2. Buscar ocupaciones de ese número
+    const ocupadas = new Set();
+    const detalle = [];
+
+    // 2a. Categoría global (si aplica)
+    if (rifa.categoria_seleccionada_id) {
+      const r = await pool.query(
+        `SELECT serie FROM cat_global_asignaciones
+          WHERE categoria_id = $1 AND numero = $2`,
+        [rifa.categoria_seleccionada_id, numero]
+      );
+      r.rows.forEach(x => {
+        ocupadas.add(x.serie);
+        detalle.push({ serie: x.serie, motivo: 'asignado_a_categoria' });
+      });
+    }
+
+    // 2b. Boletería extra
+    const extraR = await pool.query(
+      `SELECT serie FROM boleteria_numeros_extra
+        WHERE rifa_id = $1 AND numero = $2`,
+      [rifa_id, numero]
+    );
+    extraR.rows.forEach(x => {
+      ocupadas.add(x.serie);
+      detalle.push({ serie: x.serie, motivo: 'boleteria_extra' });
+    });
+
+    // 2c. Ventas (no tiene columna serie; cuenta veces vendido)
+    const ventasR = await pool.query(
+      `SELECT COUNT(*)::int AS veces FROM ventas
+        WHERE rifa_id = $1 AND numero = $2`,
+      [rifa_id, numero]
+    );
+    const vecesVendido = ventasR.rows[0]?.veces || 0;
+    for (let i = 0; i < vecesVendido; i++) {
+      if (!ocupadas.has('A'))      { ocupadas.add('A'); detalle.push({ serie: 'A', motivo: 'vendido' }); }
+      else if (!ocupadas.has('B')) { ocupadas.add('B'); detalle.push({ serie: 'B', motivo: 'vendido' }); }
+    }
+
+    // 2d. Reservas pendientes/aprobadas (no rechazadas)
+    const resR = await pool.query(
+      `SELECT COUNT(*)::int AS veces FROM reservas_cliente
+        WHERE rifa_id = $1 AND numero = $2 AND estado IN ('pendiente','aprobado')`,
+      [rifa_id, numero]
+    );
+    const vecesReservado = resR.rows[0]?.veces || 0;
+    for (let i = 0; i < vecesReservado; i++) {
+      if (!ocupadas.has('A'))      { ocupadas.add('A'); detalle.push({ serie: 'A', motivo: 'reservado' }); }
+      else if (!ocupadas.has('B')) { ocupadas.add('B'); detalle.push({ serie: 'B', motivo: 'reservado' }); }
+    }
+
+    // 3. Determinar disponibilidad
+    const disponibleA = !ocupadas.has('A');
+    const disponibleB = esSimultanea && !ocupadas.has('B');
+    const disponible  = disponibleA || disponibleB;
+
+    res.json({
+      disponible,
+      numero,
+      rifa: {
+        id: rifa.id,
+        nombre: rifa.nombre,
+        premio: rifa.premio,
+        precio: Number(rifa.precio),
+        tipo: rifa.tipo,
+        fecha_sorteo: rifa.fecha_sorteo,
+        hora_sorteo:  rifa.hora_sorteo,
+        loteria_ref:  rifa.loteria_ref,
+      },
+      es_simultanea: esSimultanea,
+      disponible_a:  disponibleA,
+      disponible_b:  disponibleB,
+      ocupadas:      [...ocupadas],
+      detalle,
+    });
+  } catch (err) {
+    console.error('Error verificando disponibilidad:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/rifas/:id/venta-directa ──
+// Crea una reserva en estado APROBADO desde la pantalla admin.
+// Cuerpo: { numero, nombre_cliente, telefono?, nota_admin?, metodo_pago?, serie? }
+// Re-verifica disponibilidad en una transacción para evitar race conditions.
+router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) => {
+  const rifa_id = req.params.id;
+  const { numero: numeroRaw, nombre_cliente, telefono, nota_admin, metodo_pago, serie } = req.body;
+
+  if (!numeroRaw || !nombre_cliente) {
+    return res.status(400).json({ error: 'Falta numero o nombre_cliente' });
+  }
+
+  let numero = String(numeroRaw).trim();
+  if (/^\d+$/.test(numero)) numero = numero.padStart(3, '0');
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Verificar rifa
+    const rifaR = await client.query(
+      `SELECT id, nombre, premio, precio, tipo,
+              COALESCE(estado, 'activa') AS estado, activa,
+              fecha_sorteo::text AS fecha_sorteo
+       FROM rifas WHERE id = $1`,
+      [rifa_id]
+    );
+    if (!rifaR.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+    const rifa = rifaR.rows[0];
+    if (!rifa.activa || rifa.estado !== 'activa') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Esta rifa no está activa' });
+    }
+
+    // 2. Re-verificar disponibilidad (con FOR UPDATE para bloqueo)
+    // Contamos ocupaciones combinadas: ventas + reservas vivas + extras + categoria
+    const ocupadas = new Set();
+    const esSimultanea = rifa.tipo === 'simultanea';
+
+    if (rifa.categoria_seleccionada_id) {
+      const r = await client.query(
+        `SELECT serie FROM cat_global_asignaciones
+          WHERE categoria_id = $1 AND numero = $2`,
+        [rifa.categoria_seleccionada_id, numero]
+      );
+      r.rows.forEach(x => ocupadas.add(x.serie));
+    }
+    const extraR = await client.query(
+      `SELECT serie FROM boleteria_numeros_extra
+        WHERE rifa_id = $1 AND numero = $2`,
+      [rifa_id, numero]
+    );
+    extraR.rows.forEach(x => ocupadas.add(x.serie));
+
+    const ventasR = await client.query(
+      `SELECT COUNT(*)::int AS v FROM ventas
+        WHERE rifa_id = $1 AND numero = $2`,
+      [rifa_id, numero]
+    );
+    const vecesV = ventasR.rows[0]?.v || 0;
+    for (let i = 0; i < vecesV; i++) {
+      if (!ocupadas.has('A')) ocupadas.add('A');
+      else if (!ocupadas.has('B')) ocupadas.add('B');
+    }
+
+    const resR = await client.query(
+      `SELECT COUNT(*)::int AS v FROM reservas_cliente
+        WHERE rifa_id = $1 AND numero = $2 AND estado IN ('pendiente','aprobado')`,
+      [rifa_id, numero]
+    );
+    const vecesR = resR.rows[0]?.v || 0;
+    for (let i = 0; i < vecesR; i++) {
+      if (!ocupadas.has('A')) ocupadas.add('A');
+      else if (!ocupadas.has('B')) ocupadas.add('B');
+    }
+
+    // Decidir serie a usar
+    let serieElegida = serie;
+    if (!serieElegida) {
+      if (!ocupadas.has('A'))                    serieElegida = 'A';
+      else if (esSimultanea && !ocupadas.has('B')) serieElegida = 'B';
+      else {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Número no disponible' });
+      }
+    } else if (ocupadas.has(serieElegida)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Número no disponible en serie ${serieElegida}` });
+    }
+
+    // 3. Crear la reserva en estado APROBADO
+    const insertR = await client.query(
+      `INSERT INTO reservas_cliente
+         (rifa_id, numero, nombre_cliente, telefono, estado, precio, nota_admin, metodo_pago, created_at)
+       VALUES ($1, $2, $3, $4, 'aprobado', $5, $6, $7, NOW())
+       RETURNING id, rifa_id, numero, nombre_cliente, telefono, estado, precio, nota_admin, metodo_pago, created_at`,
+      [rifa_id, numero, nombre_cliente, telefono || null, Number(rifa.precio), nota_admin || null, metodo_pago || 'venta_directa']
+    );
+
+    await client.query('COMMIT');
+
+    const reserva = insertR.rows[0];
+    res.json({
+      ok: true,
+      reserva: {
+        ...reserva,
+        rifa_nombre: rifa.nombre,
+        premio: rifa.premio,
+        fecha_sorteo: rifa.fecha_sorteo,
+        serie_usada: serieElegida,
+      },
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error creando venta directa:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;

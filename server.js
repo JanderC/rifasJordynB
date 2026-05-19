@@ -39,6 +39,17 @@ app.use("/api/ticket-design",      require("./routes/ticketDesign"));
 app.use("/api/ticket-templates",   require("./routes/ticketTemplates"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);
 app.use("api/ticket-templates", require("./routes/ticketTemplates"));
+
+// ── WhatsApp Business ──────────────────────────────────────
+// IMPORTANTE: el webhook de Meta (GET verificación) debe estar
+// ANTES de express.json() o al menos aceptar raw body.
+// Como ya tenemos express.json() global arriba, funciona porque
+// Meta envía JSON en el POST y text/plain en el GET.
+app.use("/api/whatsapp",            require("./routes/wa-webhook"));
+app.use("/api/whatsapp/config",     require("./routes/wa-config"));
+app.use("/api/whatsapp/media",      require("./routes/wa-media"));
+app.use("/api/whatsapp/plantillas", require("./routes/wa-plantillas"));
+app.use("/api/whatsapp/flujo",      require("./routes/wa-flujo"));
 // ── Health check ───────────────────────────────────────────
 app.get("/api/health", (req, res) => {
   res.json({
@@ -85,6 +96,11 @@ app.listen(PORT, () => {
   console.log(`    GET    /api/reportes/dashboard`);
   console.log(`    GET    /api/publico/rifas              (público)`);
   console.log(`    POST   /api/publico/reservar           (público)`);
+  console.log(`    GET    /api/whatsapp/webhook          (Meta verificación)`);
+  console.log(`    POST   /api/whatsapp/webhook          (Meta mensajes)`);
+  console.log(`    GET/POST /api/whatsapp/config         (Credenciales)`);
+  console.log(`    GET/POST /api/whatsapp/plantillas     (Plantillas bot)`);
+  console.log(`    GET/POST /api/whatsapp/flujo          (Guión bot)`);
   console.log("🎰  ══════════════════════════════════════");
 });
 

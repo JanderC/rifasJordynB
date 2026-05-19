@@ -19,7 +19,10 @@ router.get('/webhook', async (req, res) => {
     const r = await pool.query(
       `SELECT verify_token FROM wa_config WHERE activo = true LIMIT 1`
     );
-    const savedToken = r.rows[0]?.verify_token;
+    // Si no hay config en BD se usa el token de entorno o el hardcodeado
+    const savedToken = r.rows[0]?.verify_token
+      || process.env.WA_VERIFY_TOKEN
+      || 'perro';
 
     if (mode === 'subscribe' && token === savedToken) {
       console.log('[WA Webhook] ✅ Verificado correctamente');

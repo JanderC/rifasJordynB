@@ -293,22 +293,36 @@ catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, 
   try {
     const catR = await pool.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+    // v8: usa cat_categoria_vendedores como fuente de verdad; incluye vendedores sin números
     const r = await pool.query(`
-      SELECT cvn.vendedor_id, u.nombre AS vendedor_nombre, u.cedula,
+      SELECT
+        ccv.vendedor_id,
+        u.nombre AS vendedor_nombre,
+        u.cedula,
         COUNT(DISTINCT cvn.numero)::int AS total_numeros,
         COUNT(cga.id)::int AS total_asignados,
         COUNT(CASE WHEN cga.serie='A' THEN 1 END)::int AS serie_a,
         COUNT(CASE WHEN cga.serie='B' THEN 1 END)::int AS serie_b,
-        JSON_AGG(JSON_BUILD_OBJECT(
-          'numero', cvn.numero, 'serie', cga.serie, 'asignacion_id', cga.id
-        ) ORDER BY cvn.numero, cga.serie NULLS LAST) AS numeros
-      FROM cat_vendedor_numeros cvn
-      JOIN users u ON u.id=cvn.vendedor_id
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT('numero', cvn.numero, 'serie', cga.serie, 'asignacion_id', cga.id)
+            ORDER BY cvn.numero, cga.serie NULLS LAST
+          ) FILTER (WHERE cvn.numero IS NOT NULL),
+          '[]'
+        ) AS numeros
+      FROM cat_categoria_vendedores ccv
+      JOIN users u ON u.id = ccv.vendedor_id
+      LEFT JOIN cat_vendedor_numeros cvn
+        ON  cvn.categoria_id = ccv.categoria_id
+        AND cvn.vendedor_id  = ccv.vendedor_id
       LEFT JOIN cat_global_asignaciones cga
-        ON cga.categoria_id=cvn.categoria_id AND cga.vendedor_id=cvn.vendedor_id AND cga.numero=cvn.numero
-      WHERE cvn.categoria_id=$1
-      GROUP BY cvn.vendedor_id,u.nombre,u.cedula
-      ORDER BY u.nombre`, [req.params.id]);
+        ON  cga.categoria_id = ccv.categoria_id
+        AND cga.vendedor_id  = ccv.vendedor_id
+        AND cga.numero       = cvn.numero
+      WHERE ccv.categoria_id = $1
+      GROUP BY ccv.vendedor_id, u.nombre, u.cedula
+      ORDER BY u.nombre
+    `, [req.params.id]);
     res.json({ tipo: catR.rows[0].tipo, vendedores: r.rows });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
 });
@@ -678,6 +692,13 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       credencialesGeneradas = { usuario: creds.usuario, password: creds.password };
     }
 
+    // v8: registrar membresía vendedor ↔ categoría (independiente de los números)
+    await client.query(
+      `INSERT INTO cat_categoria_vendedores (categoria_id, vendedor_id)
+       VALUES ($1, $2) ON CONFLICT (categoria_id, vendedor_id) DO NOTHING`,
+      [req.params.id, vendedorFinal.id]
+    );
+
     // Contar cuantas veces se pidio cada numero: [121,123,123] => {121:1, 123:2}
     const solicitudesMap = {};
     for (const num of numeros) solicitudesMap[num] = (solicitudesMap[num]||0) + 1;
@@ -697,7 +718,7 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       }
     }
 
-    // Pasar solicitudesMap: asigna exactamente las series pedidas (121->A, 123->A+B)
+    // Si numeros vacío, asignarSeriesParaVendedor retorna {insertados:[], colisiones:[]}
     const { insertados, colisiones } = await asignarSeriesParaVendedor(client, req.params.id, vendedorFinal.id, tipo, solicitudesMap);
 
     await client.query('COMMIT');
@@ -705,7 +726,7 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
     const mensajes=[];
     if (insertados.length) mensajes.push(`✅ ${insertados.length} número(s) asignados`);
     if (colisiones.length) mensajes.push(`⚠️ ${colisiones.length} sin espacio`);
-    if (!mensajes.length) mensajes.push('Vendedor vinculado sin números');
+    if (!mensajes.length) mensajes.push('Vendedor vinculado sin números — puedes agregarle números después');
 
     res.status(201).json({
       vendedor: { id: vendedorFinal.id, nombre: vendedorFinal.nombre, usuario: vendedorFinal.usuario, cedula: vendedorFinal.cedula },
@@ -726,13 +747,14 @@ catRouter.delete('/:id/vendedores/:vendedorId', authMiddleware, soloDueno, async
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // v8: verificar membresía en cat_categoria_vendedores (puede existir sin números)
     const existeR = await client.query(
-      `SELECT COUNT(*) FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2`,
+      `SELECT COUNT(*) FROM cat_categoria_vendedores WHERE categoria_id=$1 AND vendedor_id=$2`,
       [req.params.id, req.params.vendedorId]
     );
-    if (parseInt(existeR.rows[0].count)===0) {
+    if (parseInt(existeR.rows[0].count) === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'El vendedor no tiene números en esta categoría' });
+      return res.status(404).json({ error: 'El vendedor no pertenece a esta categoría' });
     }
     const asigR = await client.query(
       `DELETE FROM cat_global_asignaciones WHERE categoria_id=$1 AND vendedor_id=$2 RETURNING numero,serie`,
@@ -740,6 +762,11 @@ catRouter.delete('/:id/vendedores/:vendedorId', authMiddleware, soloDueno, async
     );
     const poolR = await client.query(
       `DELETE FROM cat_vendedor_numeros WHERE categoria_id=$1 AND vendedor_id=$2 RETURNING numero`,
+      [req.params.id, req.params.vendedorId]
+    );
+    // Eliminar membresía
+    await client.query(
+      `DELETE FROM cat_categoria_vendedores WHERE categoria_id=$1 AND vendedor_id=$2`,
       [req.params.id, req.params.vendedorId]
     );
     await client.query('COMMIT');
@@ -784,15 +811,17 @@ catRouter.get('/:id/para-rifa', authMiddleware, soloDueno, async (req, res) => {
       if (rifaR.rows[0]) precio_rifa = Number(rifaR.rows[0].precio) || 0;
     }
 
-    // 3. Vendedores con sus números asignados en esta categoría
+    // 3. v8: fuente de verdad = cat_categoria_vendedores (incluye vendedores sin números)
     const r = await pool.query(`
       SELECT
-        cvn.vendedor_id,
+        ccv.vendedor_id,
         u.nombre        AS vendedor_nombre,
         u.cedula,
-        -- Números del pool de este vendedor en la categoría
-        ARRAY_AGG(DISTINCT cvn.numero ORDER BY cvn.numero) AS numeros_pool,
-        -- Asignaciones confirmadas (serie A y/o B)
+        COALESCE(
+          ARRAY_AGG(DISTINCT cvn.numero ORDER BY cvn.numero)
+          FILTER (WHERE cvn.numero IS NOT NULL),
+          '{}'
+        ) AS numeros_pool,
         COALESCE(
           JSON_AGG(
             JSON_BUILD_OBJECT('numero', cga.numero, 'serie', cga.serie)
@@ -800,14 +829,17 @@ catRouter.get('/:id/para-rifa', authMiddleware, soloDueno, async (req, res) => {
           ) FILTER (WHERE cga.id IS NOT NULL),
           '[]'
         ) AS asignaciones
-      FROM cat_vendedor_numeros cvn
-      JOIN users u ON u.id = cvn.vendedor_id
+      FROM cat_categoria_vendedores ccv
+      JOIN users u ON u.id = ccv.vendedor_id
+      LEFT JOIN cat_vendedor_numeros cvn
+        ON  cvn.categoria_id = ccv.categoria_id
+        AND cvn.vendedor_id  = ccv.vendedor_id
       LEFT JOIN cat_global_asignaciones cga
-        ON  cga.categoria_id = cvn.categoria_id
-        AND cga.vendedor_id  = cvn.vendedor_id
+        ON  cga.categoria_id = ccv.categoria_id
+        AND cga.vendedor_id  = ccv.vendedor_id
         AND cga.numero       = cvn.numero
-      WHERE cvn.categoria_id = $1
-      GROUP BY cvn.vendedor_id, u.nombre, u.cedula
+      WHERE ccv.categoria_id = $1
+      GROUP BY ccv.vendedor_id, u.nombre, u.cedula
       ORDER BY u.nombre
     `, [categoria_id]);
 

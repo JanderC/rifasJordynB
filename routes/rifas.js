@@ -178,6 +178,7 @@ router.get('/', authMiddleware, async (req, res) => {
         r.fecha_sorteo::text AS fecha_sorteo,
         r.hora_sorteo, r.loteria_ref, r.activa,
         r.imagen_url,
+        r.desactivar_en,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
@@ -1158,5 +1159,80 @@ router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) =>
     client.release();
   }
 });
+
+/* ── PUT /api/rifas/:id/programar-desactivacion ──────────────
+   Body: { desactivar_en: "2025-06-15T22:00:00" }  ← ISO 8601
+   Si se envía null se cancela la programación.
+────────────────────────────────────────────────────────────── */
+router.put('/:id/programar-desactivacion', authMiddleware, soloDueno, async (req, res) => {
+  const { desactivar_en } = req.body;
+
+  // Validar: debe ser una fecha futura o null (para cancelar)
+  if (desactivar_en !== null && desactivar_en !== undefined) {
+    const fecha = new Date(desactivar_en);
+    if (isNaN(fecha.getTime()))
+      return res.status(400).json({ error: 'Fecha inválida' });
+    if (fecha <= new Date())
+      return res.status(400).json({ error: 'La fecha de desactivación debe ser en el futuro' });
+  }
+
+  try {
+    const r = await pool.query(
+      `UPDATE rifas
+          SET desactivar_en = $1
+        WHERE id = $2
+        RETURNING id, nombre, activa, desactivar_en`,
+      [desactivar_en || null, req.params.id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const accion = desactivar_en ? 'programada' : 'cancelada';
+    res.json({
+      ok: true,
+      mensaje: desactivar_en
+        ? `Desactivación programada para ${new Date(desactivar_en).toLocaleString('es-CO', { timeZone: 'America/Caracas' })}`
+        : 'Programación cancelada',
+      rifa: r.rows[0],
+    });
+  } catch (err) {
+    console.error('Error programando desactivación:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── CRON: verificar rifas a desactivar cada minuto ──────────
+   Se ejecuta en el mismo proceso del backend.
+   No requiere dependencia externa (usa setInterval nativo).
+────────────────────────────────────────────────────────────── */
+(function iniciarCronDesactivacion() {
+  const INTERVALO_MS = 60 * 1000; // cada 60 segundos
+
+  async function desactivarRifasProgramadas() {
+    try {
+      const r = await pool.query(
+        `UPDATE rifas
+            SET activa       = false,
+                estado       = 'inactiva',
+                desactivar_en = NULL
+          WHERE activa = true
+            AND desactivar_en IS NOT NULL
+            AND desactivar_en <= NOW()
+          RETURNING id, nombre`
+      );
+      if (r.rows.length > 0) {
+        r.rows.forEach(rifa =>
+          console.log(`[CRON] ✅ Rifa desactivada automáticamente: "${rifa.nombre}" (${rifa.id})`)
+        );
+      }
+    } catch (err) {
+      console.error('[CRON] Error desactivando rifas programadas:', err.message);
+    }
+  }
+
+  // Ejecutar inmediatamente al arrancar y luego cada minuto
+  desactivarRifasProgramadas();
+  setInterval(desactivarRifasProgramadas, INTERVALO_MS);
+  console.log('[CRON] Verificador de desactivaciones programadas iniciado (cada 60s)');
+})();
 
 module.exports = router;

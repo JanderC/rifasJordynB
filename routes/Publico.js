@@ -3,6 +3,8 @@
 //   ✅ ACTUALIZADO: campo `ofertas` expuesto, precio real en aprobación
 //   ✅ FIX PUNTO 1: fecha_sorteo devuelta como ISO 8601 con to_char()
 //   ✅ NUEVO: cedula (obligatoria) y correo (opcional) en reservas y ventas
+//   ✅ NUEVO: fecha_desactivacion_compra y fecha_eliminacion_pantalla
+//   ✅ NUEVO: campo compra_activa y porcentaje_comprado en listado de rifas
 // ============================================================
 const router = require('express').Router();
 const pool   = require('../config/db');
@@ -27,6 +29,8 @@ const FECHA_SQL = (alias = 'r') =>
 /* ── GET /api/publico/rifas ─────────────────────────────── */
 router.get('/rifas', async (req, res) => {
   try {
+    const ahora = new Date().toISOString();
+
     const r = await pool.query(`
       SELECT
         r.id, r.nombre, r.descripcion, r.premio, r.precio,
@@ -35,16 +39,49 @@ router.get('/rifas', async (req, res) => {
         COALESCE(r.tipo,   'sencilla') AS tipo,
         COALESCE(r.estado, 'activa')   AS estado,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
+        r.fecha_desactivacion_compra,
+        r.fecha_eliminacion_pantalla,
         COALESCE(COUNT(DISTINCT v.numero), 0)::int AS numeros_vendidos,
         COALESCE(SUM(v.precio_venta), 0)           AS recaudado,
-        ROUND(COALESCE(COUNT(DISTINCT v.numero), 0)::numeric / 10, 2) AS porcentaje
+        -- Porcentaje de números NO disponibles (vendidos + asignados a vendedor).
+        -- Se calcula sobre 1000 números totales.
+        -- Los números "no visibles" al cliente = ventas + asignaciones de vendedor
+        ROUND(
+          (
+            COALESCE(COUNT(DISTINCT v.numero), 0)::numeric +
+            COALESCE((
+              SELECT COUNT(DISTINCT numero)
+              FROM numeros_vendedor nv2
+              WHERE nv2.rifa_id = r.id
+            ), 0)::numeric +
+            COALESCE((
+              SELECT COUNT(DISTINCT numero)
+              FROM boleteria_numeros_extra bne2
+              WHERE bne2.rifa_id = r.id
+            ), 0)::numeric
+          ) / 10, 2
+        ) AS porcentaje_comprado
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id
-      WHERE r.activa = TRUE AND COALESCE(r.estado, 'activa') != 'archivada'
+      WHERE r.activa = TRUE
+        AND COALESCE(r.estado, 'activa') != 'archivada'
+        -- Ocultar completamente si ya pasó la fecha de eliminación
+        AND (
+          r.fecha_eliminacion_pantalla IS NULL
+          OR r.fecha_eliminacion_pantalla > $1
+        )
       GROUP BY r.id
       ORDER BY r.created_at DESC
-    `);
-    res.json(r.rows);
+    `, [ahora]);
+
+    // Enriquecer cada rifa con el flag compra_activa
+    const rifas = r.rows.map(rifa => ({
+      ...rifa,
+      compra_activa: !rifa.fecha_desactivacion_compra
+        || new Date(rifa.fecha_desactivacion_compra) > new Date(ahora),
+    }));
+
+    res.json(rifas);
   } catch (e) {
     console.error('Error obteniendo rifas públicas:', e);
     res.status(500).json({ error: e.message });
@@ -118,49 +155,32 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
       const ocupadas = seriesOcupadas[n] || new Set();
 
       if (esSimultanea) {
-        // En simultánea hay 2 ranuras (serie A y serie B).
-        // Cada ranura puede estar: libre, reservada (pendiente) o vendida.
-        // Calculamos cuántas ranuras están libres para mostrarlas disponibles.
-        const ranurasTomadas = c.vendidas + c.pendientes; // vendidas + pendientes cubren ranuras
+        const ranurasTomadas = c.vendidas + c.pendientes;
         const ranurasLibres  = Math.max(0, maxRanuras - ranurasTomadas);
-
-        // Ranuras bloqueadas por vendedor (serie A u B asignada)
-        const bloqueadasVendedor = ocupadas.size; // cuántas series tiene el vendedor
-
-        // De las ranuras libres, descontar las bloqueadas por vendedor
-        // (el vendedor ocupa serie A o B, esas no están disponibles para el cliente)
+        const bloqueadasVendedor = ocupadas.size;
         const disponiblesParaCliente = Math.max(0, ranurasLibres - bloqueadasVendedor);
-
-        // Ranuras que están pendientes (reservadas pero no vendidas) — se muestran como reservado
-        // Solo si el número tiene alguna reserva pendiente pero aún le quedan ranuras
         const pendientesAMostrar = Math.min(c.pendientes, maxRanuras - c.vendidas - bloqueadasVendedor);
 
-        // Ranuras agotadas (todas vendidas)
         if (c.vendidas >= maxRanuras) {
           numeros.push({ numero: n, estado: 'agotado' });
           continue;
         }
 
-        // Mostrar cada ranura disponible
         for (let r = 0; r < disponiblesParaCliente; r++) {
           numeros.push({ numero: n, estado: 'disponible' });
         }
 
-        // Mostrar ranuras pendientes (para información, no seleccionables)
         for (let r = 0; r < pendientesAMostrar; r++) {
           numeros.push({ numero: n, estado: 'reservado' });
         }
 
-        // Si ninguna ranura queda disponible ni visible, pero todas están cubiertas por pendientes
         if (disponiblesParaCliente === 0 && pendientesAMostrar === 0 && c.vendidas < maxRanuras) {
           if (c.pendientes + c.vendidas >= maxRanuras) {
-            // Todas las ranuras están reservadas pendientes → mostrar como agotado al cliente
             numeros.push({ numero: n, estado: 'agotado' });
           }
         }
 
       } else {
-        // Sencilla: 1 ranura por número
         if (c.vendidas >= 1) {
           numeros.push({ numero: n, estado: 'vendido_1' });
         } else if (c.pendientes >= 1) {
@@ -179,12 +199,12 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar
-   NUEVO: acepta cedula (obligatoria) y correo (opcional)
+   Bloquea reservas si fecha_desactivacion_compra ya pasó
    Body:
      {
        rifa_id, nombre_cliente,
-       cedula,            ← NUEVO obligatorio
-       correo,            ← NUEVO opcional
+       cedula,            ← obligatorio
+       correo,            ← opcional
        telefono, metodo_pago,
        comprobante_base64, comprobante_nombre,
        numeros: ['001','045']
@@ -229,16 +249,28 @@ router.post('/reservar', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Obtener tipo de rifa para saber si es simultánea
-    const rifaTipoR = await client.query(
-      `SELECT COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
+    // ── Verificar que la compra esté activa ───────────
+    const rifaCheck = await client.query(
+      `SELECT COALESCE(tipo, 'sencilla') AS tipo,
+              fecha_desactivacion_compra
+       FROM rifas WHERE id=$1`,
       [rifa_id]
     );
-    const esSimultanea = rifaTipoR.rows[0]?.tipo === 'simultanea';
+    if (!rifaCheck.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
 
-    // En simultánea se permiten hasta 2 reservas del mismo número (serie A y B).
-    // El cliente puede enviar el mismo número dos veces si seleccionó ambas entradas.
-    // Preservamos duplicados para simultánea; deduplicamos en sencilla.
+    const { fecha_desactivacion_compra, tipo: tipoRifa } = rifaCheck.rows[0];
+    if (fecha_desactivacion_compra && new Date(fecha_desactivacion_compra) <= new Date()) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: 'La compra de esta rifa está desactivada. El sorteo ya fue realizado.',
+        compra_desactivada: true,
+      });
+    }
+
+    const esSimultanea = tipoRifa === 'simultanea';
     const numerosAProcesar = esSimultanea ? numeros : [...new Set(numeros)];
 
     const reservasCreadas = [];
@@ -257,9 +289,6 @@ router.post('/reservar', async (req, res) => {
       );
       const vecesPendientes = parseInt(reservasPendientes.rows[0].count);
 
-      // Series del número ya asignadas a algún vendedor en esta rifa
-      // (fijos en numeros_vendedor + extras en boleteria_numeros_extra).
-      // Cada serie asignada a un vendedor BLOQUEA una ranura para el cliente.
       const seriesVendedor = await client.query(
         `SELECT COUNT(*)::int AS cnt FROM (
            SELECT COALESCE(serie,'A') AS serie FROM numeros_vendedor
@@ -272,7 +301,6 @@ router.post('/reservar', async (req, res) => {
       );
       const bloqueadasVendedor = seriesVendedor.rows[0].cnt;
 
-      // Cuántas ranuras ya están ocupadas (vendidas + pendientes + asignadas a vendedor)
       const ocupadas   = vecesVendidas + vecesPendientes + bloqueadasVendedor;
       const maxRanuras = esSimultanea ? 2 : 1;
 
@@ -283,7 +311,6 @@ router.post('/reservar', async (req, res) => {
         else if (vecesPendientes > 0) razon = 'reserva_pendiente';
         conflictos.push({ numero, razon }); continue;
       }
-
 
       const r = await client.query(`
         INSERT INTO reservas_cliente
@@ -430,7 +457,6 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
       const esSimultanea = rifa.rows[0]?.tipo === 'simultanea';
       const maxVentas    = esSimultanea ? 2 : 1;
 
-      // Verificar cuántas ventas ya existen para este número en esta rifa
       const ventasExistentes = await client.query(
         `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
         [reserva.rifa_id, reserva.numero]
@@ -438,7 +464,6 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
       const ventasActuales = parseInt(ventasExistentes.rows[0].count);
 
       if (ventasActuales >= maxVentas) {
-        // Ya está al tope — rechazar esta reserva automáticamente en lugar de explotar
         await client.query(
           `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
           [`Auto-rechazado: el número ${reserva.numero} ya alcanzó el máximo de ventas permitidas`, reserva.id]
@@ -494,7 +519,7 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
     const vendedorId = dueno.rows[0]?.id;
 
     let preciosMap = {};
-    let extrasMap  = {}; // { id: { cedula, correo } }
+    let extrasMap  = {};
 
     if (estado === 'aprobado') {
       const reservasQ = await client.query(
@@ -520,9 +545,7 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       }
     }
 
-    // Contador en memoria de ventas insertadas en esta transacción por (rifa_id, numero)
-    // para respetar el límite de la constraint max_dos_ventas sin consultar la BD en cada iteración
-    const ventasEnTransaccion = {}; // key: "rifa_id|numero" → count
+    const ventasEnTransaccion = {};
 
     let procesadas = 0;
     for (const id of ids) {
@@ -535,7 +558,6 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
       const reserva = res_r.rows[0];
 
       if (estado === 'aprobado') {
-        // Verificar límite de ventas para este número
         const claveNum = `${reserva.rifa_id}|${reserva.numero}`;
         const rifaInfo = (await client.query(
           `SELECT precio, COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
@@ -544,7 +566,6 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
         const esSimultanea = rifaInfo?.tipo === 'simultanea';
         const maxVentas    = esSimultanea ? 2 : 1;
 
-        // Ventas ya existentes en BD + las que ya insertamos en esta transacción
         const ventasEnBD = parseInt(
           (await client.query(`SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
             [reserva.rifa_id, reserva.numero])).rows[0].count
@@ -553,7 +574,6 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
         const totalOcupadas = ventasEnBD + ventasTx;
 
         if (totalOcupadas >= maxVentas) {
-          // No se puede insertar más — auto-rechazar esta reserva
           await client.query(
             `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
             [`Auto-rechazado: número ${reserva.numero} ya alcanzó el máximo de ventas`, id]

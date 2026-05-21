@@ -198,6 +198,108 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
 
 /* ──────────────────────────────────────────────────────────
+   GET /api/publico/rifas/:id/progreso
+   Devuelve el progreso de venta de una rifa de forma limpia
+   y consistente para mostrar la barra de % en el cliente.
+
+   Cálculo (NO depende del endpoint numeros-disponibles):
+     - total           = ranuras totales de la rifa
+                          · sencilla   = 1000
+                          · simultanea = 2000  (2 series × 1000)
+     - vendidos        = ventas registradas
+     - reservados      = reservas pendientes (aún sin aprobar)
+     - asignados_vend  = números en poder de vendedores
+                         (numeros_vendedor + boleteria_numeros_extra)
+     - tomados         = vendidos + reservados + asignados_vend
+     - disponibles     = total - tomados
+     - pct             = (tomados / total) * 100  (2 decimales)
+
+   En rifas SENCILLAS se cuenta cada número una vez.
+   En rifas SIMULTÁNEAS cada (numero, serie) cuenta por separado.
+────────────────────────────────────────────────────────── */
+router.get('/rifas/:id/progreso', async (req, res) => {
+  try {
+    const rifaR = await pool.query(
+      `SELECT id, COALESCE(tipo, 'sencilla') AS tipo
+         FROM rifas
+        WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const esSimultanea = rifaR.rows[0].tipo === 'simultanea';
+    const total        = esSimultanea ? 2000 : 1000;
+
+    // Conteos en paralelo
+    const [vendQ, resQ, asigQ] = await Promise.all([
+      // Ventas
+      esSimultanea
+        ? pool.query(
+            `SELECT COUNT(*)::int AS n FROM ventas WHERE rifa_id = $1`,
+            [req.params.id]
+          )
+        : pool.query(
+            `SELECT COUNT(DISTINCT numero)::int AS n FROM ventas WHERE rifa_id = $1`,
+            [req.params.id]
+          ),
+      // Reservas pendientes (todavía no aprobadas → ocupan ranura)
+      esSimultanea
+        ? pool.query(
+            `SELECT COUNT(*)::int AS n
+               FROM reservas_cliente
+              WHERE rifa_id = $1 AND estado = 'pendiente'`,
+            [req.params.id]
+          )
+        : pool.query(
+            `SELECT COUNT(DISTINCT numero)::int AS n
+               FROM reservas_cliente
+              WHERE rifa_id = $1 AND estado = 'pendiente'`,
+            [req.params.id]
+          ),
+      // Números en poder de vendedores
+      // (numeros_vendedor + boleteria_numeros_extra, unidos por numero+serie)
+      pool.query(
+        `SELECT COUNT(*)::int AS n FROM (
+           SELECT DISTINCT numero, COALESCE(serie,'A') AS serie
+             FROM numeros_vendedor
+            WHERE rifa_id = $1
+           UNION
+           SELECT DISTINCT numero, serie
+             FROM boleteria_numeros_extra
+            WHERE rifa_id = $1
+         ) t`,
+        [req.params.id]
+      ),
+    ]);
+
+    const vendidos        = vendQ.rows[0]?.n || 0;
+    const reservados      = resQ.rows[0]?.n  || 0;
+    const asignadosVend   = asigQ.rows[0]?.n || 0;
+
+    // Saneo por si la suma supera el total (datos inconsistentes)
+    const tomadosRaw      = vendidos + reservados + asignadosVend;
+    const tomados         = Math.min(total, Math.max(0, tomadosRaw));
+    const disponibles     = Math.max(0, total - tomados);
+    const pct             = total > 0 ? Math.round((tomados / total) * 10000) / 100 : 0;
+
+    res.json({
+      rifa_id: parseInt(req.params.id),
+      tipo: esSimultanea ? 'simultanea' : 'sencilla',
+      total,
+      vendidos,
+      reservados,
+      asignados_vendedor: asignadosVend,
+      tomados,
+      disponibles,
+      pct,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+/* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar
    Bloquea reservas si fecha_desactivacion_compra ya pasó
    Body:

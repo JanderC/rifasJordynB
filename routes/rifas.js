@@ -194,16 +194,25 @@ router.get('/', authMiddleware, async (req, res) => {
     const rifas = result.rows;
 
     const vendedoresResult = await pool.query(`
+      WITH unidos AS (
+        SELECT rifa_id, vendedor_id, numero, COALESCE(serie, 'A') AS serie, 'fijo'::text AS origen
+          FROM numeros_vendedor
+        UNION ALL
+        SELECT rifa_id, vendedor_id, numero, serie, 'extra'::text AS origen
+          FROM boleteria_numeros_extra
+      )
       SELECT
-        nv.rifa_id,
-        nv.vendedor_id        AS id,
-        u.nombre,
-        u.usuario,
-        COUNT(nv.numero)::int AS numeros_count
-      FROM numeros_vendedor nv
-      JOIN users u ON u.id = nv.vendedor_id
-      GROUP BY nv.rifa_id, nv.vendedor_id, u.nombre, u.usuario
-      ORDER BY u.nombre
+        u.rifa_id,
+        u.vendedor_id                                              AS id,
+        usr.nombre,
+        usr.usuario,
+        COUNT(*)::int                                              AS numeros_count,
+        COUNT(*) FILTER (WHERE u.origen = 'fijo')::int             AS fijos_count,
+        COUNT(*) FILTER (WHERE u.origen = 'extra')::int            AS extras_count
+      FROM unidos u
+      JOIN users usr ON usr.id = u.vendedor_id
+      GROUP BY u.rifa_id, u.vendedor_id, usr.nombre, usr.usuario
+      ORDER BY usr.nombre
     `);
 
     const vendedoresPorRifa = {};
@@ -214,6 +223,8 @@ router.get('/', authMiddleware, async (req, res) => {
         nombre:       vr.nombre,
         usuario:      vr.usuario,
         numeros_count: vr.numeros_count,
+        fijos_count:   vr.fijos_count,
+        extras_count:  vr.extras_count,
       });
     });
 

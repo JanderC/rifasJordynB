@@ -23,8 +23,33 @@ function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
   return mejorTotal;
 }
 
-const FECHA_SQL = (alias = 'r') =>
-  `to_char(${alias}.fecha_sorteo, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_sorteo`;
+/* ─────────────────────────────────────────────────────────────
+   CAMPOS DE FECHA PARA EL CLIENTE
+   - fecha_sorteo:     DATE puro (YYYY-MM-DD)  -- como rifas.js
+   - hora_sorteo:      TIME puro (HH:MM:SS)
+   - datetime_sorteo:  ISO UTC con Z, calculado a partir de la
+                       hora local Venezuela (America/Caracas).
+                       Esto se usa para el countdown en el front.
+
+   Importante: la fecha y hora se guardaron como "hora Venezuela".
+   PostgreSQL trata las columnas DATE/TIME como sin TZ, así que las
+   convertimos explícitamente: timestamp(fecha+hora) AT TIME ZONE
+   'America/Caracas' → da el UTC real correspondiente.
+───────────────────────────────────────────────────────────── */
+const FECHA_SQL = (alias = 'r') => `
+  ${alias}.fecha_sorteo::text AS fecha_sorteo,
+  ${alias}.hora_sorteo::text  AS hora_sorteo,
+  CASE
+    WHEN ${alias}.fecha_sorteo IS NOT NULL THEN
+      to_char(
+        ((${alias}.fecha_sorteo + COALESCE(${alias}.hora_sorteo, '00:00:00'::time))
+          AT TIME ZONE 'America/Caracas')
+          AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+      )
+    ELSE NULL
+  END AS datetime_sorteo
+`;
 
 /* ── GET /api/publico/rifas ─────────────────────────────── */
 router.get('/rifas', async (req, res) => {

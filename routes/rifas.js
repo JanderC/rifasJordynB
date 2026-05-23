@@ -356,6 +356,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     vendedores_ids        = [],
     vendedores_categorias = [],
     categoria_id          = null,
+    ticket_template_id    = null,
+    premio_secundario     = null,
   } = req.body;
 
   if (!nombre || !premio || !precio)
@@ -378,12 +380,14 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     const result = await client.query(
       `INSERT INTO rifas
          (nombre, descripcion, premio, precio, fecha_sorteo, hora_sorteo, loteria_ref,
-          tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by,
+          ticket_template_id, premio_secundario)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING
          id, nombre, descripcion, premio, precio,
          fecha_sorteo::text AS fecha_sorteo,
          hora_sorteo, loteria_ref, activa, imagen_url,
+         ticket_template_id, premio_secundario,
          tipo, estado, ofertas, ticket_design,
          categoria_seleccionada_id, created_by, created_at, updated_at`,
       [
@@ -393,6 +397,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
         JSON.stringify(ofertasOrdenadas),
         categoria_id || null,
         req.user.id,
+        ticket_template_id || null,
+        premio_secundario  || null,
       ]
     );
 
@@ -438,6 +444,8 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     vendedores_ids,
     vendedores_categorias,
     categoria_id,
+    ticket_template_id,
+    premio_secundario,
   } = req.body;
 
   if (ofertas !== undefined) {
@@ -470,12 +478,15 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         categoria_seleccionada_id = COALESCE($13::uuid, categoria_seleccionada_id),
         hora_sorteo             = CASE WHEN $14::text IS NOT NULL
                                        THEN $14::text::time
-                                       ELSE hora_sorteo END
+                                       ELSE hora_sorteo END,
+        ticket_template_id      = COALESCE($15::int,     ticket_template_id),
+        premio_secundario       = COALESCE($16::numeric, premio_secundario)
        WHERE id = $12
        RETURNING
          id, nombre, descripcion, premio, precio,
          fecha_sorteo::text AS fecha_sorteo,
          hora_sorteo, loteria_ref, activa, imagen_url,
+         ticket_template_id, premio_secundario,
          tipo, estado, ofertas, ticket_design,
          categoria_seleccionada_id, created_at, updated_at`,
       [
@@ -493,6 +504,8 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         req.params.id,
         categoria_id ?? null,
         hora_sorteo  !== undefined ? (hora_sorteo || null) : null,
+        ticket_template_id !== undefined ? (ticket_template_id ?? null) : null,
+        premio_secundario  !== undefined ? (premio_secundario  ?? null) : null,
       ]
     );
 

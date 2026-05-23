@@ -28,6 +28,40 @@ function validarOfertas(ofertas) {
    Fuente de verdad: cat_global_asignaciones (series A/B).
 ──────────────────────────────────────────────────────────── */
 async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vendedores_categorias = []) {
+  // 0. ── NUEVO: sincronizar rifa_categorias ─────────────────────────
+  //    Registra todos los vendedores seleccionados en rifa_categorias,
+  //    aunque no tengan números aún. Esto permite agregarles extras después.
+  //    Primero eliminamos las entradas de vendedores ya no seleccionados,
+  //    luego hacemos upsert de los actuales.
+  if (vendedores_categorias.length > 0) {
+    const selectedVids = vendedores_categorias.map(v => v.vendedor_id);
+
+    // Quitar de rifa_categorias los vendedores que ya no están seleccionados
+    await client.query(
+      `DELETE FROM rifa_categorias
+       WHERE rifa_id = $1
+         AND vendedor_id NOT IN (SELECT UNNEST($2::uuid[]))`,
+      [rifa_id, selectedVids]
+    );
+
+    // Upsert de cada vendedor seleccionado
+    for (const { vendedor_id, categoria_id } of vendedores_categorias) {
+      await client.query(
+        `INSERT INTO rifa_categorias (rifa_id, categoria_id, vendedor_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (rifa_id, categoria_id) DO UPDATE SET vendedor_id = EXCLUDED.vendedor_id`,
+        [rifa_id, categoria_id, vendedor_id]
+      );
+    }
+  } else {
+    // Si no se envían categorías, limpiar rifa_categorias de esta rifa
+    await client.query(
+      `DELETE FROM rifa_categorias WHERE rifa_id = $1`,
+      [rifa_id]
+    );
+  }
+  // ─────────────────────────────────────────────────────────────────
+
   // 1. Quitar asignaciones de vendedores removidos (respetando ventas)
   if (vendedores_ids.length > 0) {
     await client.query(
@@ -200,18 +234,25 @@ router.get('/', authMiddleware, async (req, res) => {
         UNION ALL
         SELECT rifa_id, vendedor_id, numero, serie, 'extra'::text AS origen
           FROM boleteria_numeros_extra
+      ),
+      miembros AS (
+        -- Vendedores vinculados a la rifa (con o sin números)
+        SELECT rifa_id, vendedor_id FROM rifa_categorias
+        UNION
+        SELECT DISTINCT rifa_id, vendedor_id FROM unidos
       )
       SELECT
-        u.rifa_id,
-        u.vendedor_id                                              AS id,
+        m.rifa_id,
+        m.vendedor_id                                              AS id,
         usr.nombre,
         usr.usuario,
-        COUNT(*)::int                                              AS numeros_count,
-        COUNT(*) FILTER (WHERE u.origen = 'fijo')::int             AS fijos_count,
-        COUNT(*) FILTER (WHERE u.origen = 'extra')::int            AS extras_count
-      FROM unidos u
-      JOIN users usr ON usr.id = u.vendedor_id
-      GROUP BY u.rifa_id, u.vendedor_id, usr.nombre, usr.usuario
+        COUNT(u.numero)::int                                       AS numeros_count,
+        COUNT(u.numero) FILTER (WHERE u.origen = 'fijo')::int     AS fijos_count,
+        COUNT(u.numero) FILTER (WHERE u.origen = 'extra')::int    AS extras_count
+      FROM miembros m
+      JOIN users usr ON usr.id = m.vendedor_id
+      LEFT JOIN unidos u ON u.rifa_id = m.rifa_id AND u.vendedor_id = m.vendedor_id
+      GROUP BY m.rifa_id, m.vendedor_id, usr.nombre, usr.usuario
       ORDER BY usr.nombre
     `);
 
@@ -618,6 +659,12 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
         SELECT vendedor_id, numero, serie, 'extra'::text AS origen
           FROM boleteria_numeros_extra
          WHERE rifa_id = $1
+      ),
+      miembros AS (
+        -- Vendedores vinculados a la rifa (con o sin números)
+        SELECT vendedor_id FROM rifa_categorias WHERE rifa_id = $1
+        UNION
+        SELECT DISTINCT vendedor_id FROM numeros_unidos
       )
       SELECT
         u.id              AS vendedor_id,
@@ -634,13 +681,9 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
           ) FILTER (WHERE nu.numero IS NOT NULL),
           '[]'::json
         ) AS numeros_fijos
-      FROM users u
+      FROM miembros m
+      JOIN users u ON u.id = m.vendedor_id
       LEFT JOIN numeros_unidos nu ON nu.vendedor_id = u.id
-      WHERE u.id IN (
-        SELECT DISTINCT vendedor_id FROM numeros_vendedor       WHERE rifa_id = $1
-        UNION
-        SELECT DISTINCT vendedor_id FROM boleteria_numeros_extra WHERE rifa_id = $1
-      )
       GROUP BY u.id, u.nombre, u.cedula
       ORDER BY u.nombre
     `, [rifa_id]);

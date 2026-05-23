@@ -1230,11 +1230,6 @@ router.put('/:id/programar-desactivacion', authMiddleware, soloDueno, async (req
             AND desactivar_en <= NOW()
           RETURNING id, nombre`
       );
-      if (r.rows.length > 0) {
-        r.rows.forEach(rifa =>
-          console.log(`[CRON] ✅ Rifa desactivada automáticamente: "${rifa.nombre}" (${rifa.id})`)
-        );
-      }
     } catch (err) {
       console.error('[CRON] Error desactivando rifas programadas:', err.message);
     }

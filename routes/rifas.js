@@ -28,17 +28,27 @@ function validarOfertas(ofertas) {
    Fuente de verdad: cat_global_asignaciones (series A/B).
 ──────────────────────────────────────────────────────────── */
 async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vendedores_categorias = []) {
-  // 0. ── NUEVO: sincronizar rifa_categorias ─────────────────────────
-  //    Registra todos los vendedores seleccionados en rifa_categorias,
-  //    aunque no tengan números aún. Esto permite agregarles extras después.
-  //    Primero eliminamos las entradas de vendedores ya no seleccionados,
-  //    luego hacemos upsert de los actuales.
+  // 0. ── Sincronizar rifa_vendedores_sel ────────────────────────────
+  //    Tabla liviana sin FKs externas que guarda qué vendedores fueron
+  //    seleccionados para esta rifa (incluso los que aún no tienen números).
+  //    Se crea automáticamente si no existe (migration-free).
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS rifa_vendedores_sel (
+      id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      rifa_id     uuid NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+      vendedor_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      categoria_global_id uuid,
+      created_at  timestamptz DEFAULT now(),
+      UNIQUE (rifa_id, vendedor_id)
+    )
+  `);
+
   if (vendedores_categorias.length > 0) {
     const selectedVids = vendedores_categorias.map(v => v.vendedor_id);
 
-    // Quitar de rifa_categorias los vendedores que ya no están seleccionados
+    // Quitar los vendedores ya no seleccionados
     await client.query(
-      `DELETE FROM rifa_categorias
+      `DELETE FROM rifa_vendedores_sel
        WHERE rifa_id = $1
          AND vendedor_id NOT IN (SELECT UNNEST($2::uuid[]))`,
       [rifa_id, selectedVids]
@@ -47,16 +57,17 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
     // Upsert de cada vendedor seleccionado
     for (const { vendedor_id, categoria_id } of vendedores_categorias) {
       await client.query(
-        `INSERT INTO rifa_categorias (rifa_id, categoria_id, vendedor_id)
+        `INSERT INTO rifa_vendedores_sel (rifa_id, vendedor_id, categoria_global_id)
          VALUES ($1, $2, $3)
-         ON CONFLICT (rifa_id, categoria_id) DO UPDATE SET vendedor_id = EXCLUDED.vendedor_id`,
-        [rifa_id, categoria_id, vendedor_id]
+         ON CONFLICT (rifa_id, vendedor_id) DO UPDATE
+           SET categoria_global_id = EXCLUDED.categoria_global_id`,
+        [rifa_id, vendedor_id, categoria_id]
       );
     }
   } else {
-    // Si no se envían categorías, limpiar rifa_categorias de esta rifa
+    // Sin categorías: limpiar selección
     await client.query(
-      `DELETE FROM rifa_categorias WHERE rifa_id = $1`,
+      `DELETE FROM rifa_vendedores_sel WHERE rifa_id = $1`,
       [rifa_id]
     );
   }
@@ -236,8 +247,8 @@ router.get('/', authMiddleware, async (req, res) => {
           FROM boleteria_numeros_extra
       ),
       miembros AS (
-        -- Vendedores vinculados a la rifa (con o sin números)
-        SELECT rifa_id, vendedor_id FROM rifa_categorias
+        -- Vendedores seleccionados para la rifa (con o sin números)
+        SELECT rifa_id, vendedor_id FROM rifa_vendedores_sel
         UNION
         SELECT DISTINCT rifa_id, vendedor_id FROM unidos
       )
@@ -661,8 +672,8 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
          WHERE rifa_id = $1
       ),
       miembros AS (
-        -- Vendedores vinculados a la rifa (con o sin números)
-        SELECT vendedor_id FROM rifa_categorias WHERE rifa_id = $1
+        -- Vendedores seleccionados para la rifa (con o sin números)
+        SELECT vendedor_id FROM rifa_vendedores_sel WHERE rifa_id = $1
         UNION
         SELECT DISTINCT vendedor_id FROM numeros_unidos
       )

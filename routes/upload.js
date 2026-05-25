@@ -25,7 +25,6 @@ const uploadMemoria = multer({
 ────────────────────────────────────────────────────────────*/
 router.post(
   '/ticket',
-  authMiddleware,
   uploadMemoria.single('ticket'),
   async (req, res) => {
     if (!req.file) {
@@ -67,7 +66,6 @@ router.post(
 ────────────────────────────────────────────────────────────*/
 router.post(
   '/rifa/:id/imagen',
-  authMiddleware,
   soloDueno,
   uploadRifa.single('imagen'),   // campo del form-data
   async (req, res) => {

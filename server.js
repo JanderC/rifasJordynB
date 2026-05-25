@@ -39,7 +39,7 @@ app.use("/api/ticket-design",      require("./routes/ticketDesign"));
 app.use("/api/ticket-templates",   require("./routes/ticketTemplates"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);
 app.use("api/ticket-templates", require("./routes/ticketTemplates"));
-app.use("api/upload", require("./routes/upload"));
+app.use("/api/upload", require("./routes/upload"));
 
 // ── WhatsApp Business ──────────────────────────────────────
 // IMPORTANTE: el webhook de Meta (GET verificación) debe estar

@@ -2,14 +2,27 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { vendedoresRouter, categoriasGlobalesRouter } = require('./routes/vendedores');
-
+const { startWhatsApp } = require("./whatsapp/whatsappService");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ── Middlewares globales ───────────────────────────────────
 app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "https://rifas-jordyn-f.vercel.app",
+   cors({
+    origin: (origin, callback) => {
+      const allowed = [
+        process.env.FRONTEND_URL || "https://rifas-jordyn-f.vercel.app",
+        "http://localhost:5000",
+        "http://localhost:3000",
+        "http://127.0.0.1:5000",
+      ];
+      // Permite también origen null (archivo local) en desarrollo
+      if (!origin || allowed.includes(origin) || process.env.NODE_ENV === "development") {
+        callback(null, true);
+      } else {
+        callback(new Error("CORS no permitido: " + origin));
+      }
+    },
     credentials: true,
   }),
 );
@@ -40,6 +53,7 @@ app.use("/api/ticket-templates",   require("./routes/ticketTemplates"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);
 app.use("api/ticket-templates", require("./routes/ticketTemplates"));
 app.use("/api/upload", require("./routes/upload"));
+app.use("/api/baileys", require("./routes/wa-baileys"));
 
 // ── WhatsApp Business ──────────────────────────────────────
 // IMPORTANTE: el webhook de Meta (GET verificación) debe estar
@@ -103,6 +117,9 @@ app.listen(PORT, () => {
   console.log(`    GET/POST /api/whatsapp/plantillas     (Plantillas bot)`);
   console.log(`    GET/POST /api/whatsapp/flujo          (Guión bot)`);
   console.log("🎰  ══════════════════════════════════════");
+  startWhatsApp().catch((err) =>
+    console.error("❌ [WhatsApp] Error al iniciar Baileys:", err)
+  );
 });
 
 module.exports = app;

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WhatsApp — Rifas Jordyn</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', sans-serif;
+    background: #0d1117;
+    color: #e6edf3;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 16px;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: #58d68d;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .sub { color: #8b949e; font-size: 0.85rem; margin-bottom: 32px; }
+
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 24px;
+    width: 100%;
+    max-width: 480px;
+    margin-bottom: 20px;
+  }
+
+  .card h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: #c9d1d9;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 10px;
+  }
+
+  /* Status badge */
+  #statusBadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    background: #21262d;
+    color: #8b949e;
+    transition: all 0.3s;
+  }
+  #statusBadge.open   { background: #0d3b1e; color: #58d68d; }
+  #statusBadge.connecting { background: #2d2106; color: #f0b429; }
+  #statusBadge .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  /* QR box */
+  #qrBox {
+    text-align: center;
+    padding: 16px 0;
+  }
+  #qrImg {
+    width: 220px;
+    height: 220px;
+    border-radius: 10px;
+    border: 3px solid #30363d;
+    display: none;
+  }
+  #qrMsg { color: #8b949e; font-size: 0.85rem; margin-top: 10px; }
+
+  /* Form */
+  label { display: block; font-size: 0.82rem; color: #8b949e; margin-bottom: 6px; }
+
+  input[type="text"],
+  input[type="tel"],
+  textarea {
+    width: 100%;
+    padding: 10px 12px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    color: #e6edf3;
+    font-size: 0.9rem;
+    outline: none;
+    margin-bottom: 14px;
+    transition: border-color 0.2s;
+  }
+  input:focus, textarea:focus { border-color: #58d68d; }
+  textarea { resize: vertical; min-height: 80px; }
+
+  .file-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: #0d1117;
+    border: 1px dashed #30363d;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.88rem;
+    color: #8b949e;
+    margin-bottom: 14px;
+    transition: border-color 0.2s;
+  }
+  .file-label:hover { border-color: #58d68d; color: #58d68d; }
+  #fileInput { display: none; }
+  #fileName { font-size: 0.8rem; color: #58d68d; margin-top: -10px; margin-bottom: 14px; }
+
+  .preview-img {
+    width: 100%;
+    max-height: 150px;
+    object-fit: cover;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    display: none;
+    border: 1px solid #30363d;
+  }
+
+  button {
+    width: 100%;
+    padding: 11px;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+  }
+  button:active { transform: scale(0.98); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-green  { background: #238636; color: #fff; }
+  .btn-blue   { background: #1f6feb; color: #fff; }
+  .btn-red    { background: #b91c1c; color: #fff; margin-top: 8px; }
+  .btn-ghost  { background: #21262d; color: #c9d1d9; margin-top: 8px; }
+
+  /* Toast */
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: #161b22;
+    border: 1px solid #30363d;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 0.88rem;
+    transition: transform 0.3s;
+    max-width: 90vw;
+    text-align: center;
+    z-index: 999;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+  #toast.ok   { border-color: #238636; color: #58d68d; }
+  #toast.err  { border-color: #b91c1c; color: #f87171; }
+
+  .divider { height: 1px; background: #21262d; margin: 6px 0 16px; }
+</style>
+</head>
+<body>
+
+<h1>📱 WhatsApp — Rifas Jordyn</h1>
+<p class="sub">Panel de control · Baileys</p>
+
+<!-- Estado de conexión -->
+<div class="card">
+  <h2>Estado de la conexión</h2>
+  <div id="statusBadge"><span class="dot"></span> Cargando…</div>
+  <br/>
+  <button class="btn-ghost" onclick="checkStatus()">🔄 Actualizar estado</button>
+  <button class="btn-red"   onclick="doLogout()">🚪 Cerrar sesión</button>
+</div>
+
+<!-- QR -->
+<div class="card" id="qrCard">
+  <h2>Escanear QR</h2>
+  <div id="qrBox">
+    <img id="qrImg" src="" alt="QR WhatsApp" />
+    <p id="qrMsg">Cargando QR…</p>
+  </div>
+  <button class="btn-ghost" onclick="loadQR()">🔃 Refrescar QR</button>
+</div>
+
+<!-- Enviar texto -->
+<div class="card">
+  <h2>✉️ Enviar mensaje de texto</h2>
+  <label>Número (ej: 04241234567)</label>
+  <input type="tel" id="txtNumero" placeholder="04241234567" />
+  <label>Mensaje</label>
+  <textarea id="txtMensaje" placeholder="Hola! Tu número de rifa está confirmado 🎰"></textarea>
+  <button class="btn-green" onclick="sendText()">Enviar texto</button>
+</div>
+
+<!-- Enviar imagen -->
+<div class="card">
+  <h2>🖼️ Enviar imagen con texto</h2>
+  <label>Número (ej: 04241234567)</label>
+  <input type="tel" id="imgNumero" placeholder="04241234567" />
+
+  <label>Caption (texto que acompaña la imagen)</label>
+  <textarea id="imgCaption" placeholder="¡Aquí está tu ticket! 🎟️" style="min-height:60px;"></textarea>
+
+  <label>Imagen</label>
+  <label class="file-label" for="fileInput">📎 Seleccionar imagen…</label>
+  <input type="file" id="fileInput" accept="image/*" onchange="previewFile(event)" />
+  <p id="fileName"></p>
+  <img id="previewImg" class="preview-img" />
+
+  <div class="divider"></div>
+  <label style="margin-bottom:4px;">O pega una URL de imagen</label>
+  <input type="text" id="imgUrl" placeholder="https://ejemplo.com/imagen.jpg" />
+
+  <button class="btn-blue" onclick="sendImage()">Enviar imagen</button>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+  // ── Config ──────────────────────────────────────────────
+  // Detecta si se abre como archivo local o desde el servidor
+  const BASE = (window.location.protocol === "file:" || window.location.hostname === "localhost")
+    ? "http://localhost:5000/api/baileys"
+    : "/api/baileys";
+
+  // Si usas WA_SECRET_KEY en el backend, ponla aquí
+  const WA_KEY = "";   // ej: "mi_clave_secreta"
+
+  function headers(isFormData = false) {
+    const h = {};
+    if (WA_KEY) h["x-wa-key"] = WA_KEY;
+    if (!isFormData) h["Content-Type"] = "application/json";
+    return h;
+  }
+
+  // ── Toast ────────────────────────────────────────────────
+  function toast(msg, type = "ok") {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.className = `show ${type}`;
+    setTimeout(() => t.className = "", 3500);
+  }
+
+  // ── Estado ───────────────────────────────────────────────
+  async function checkStatus() {
+    try {
+      const r = await fetch(`${BASE}/status`, { headers: headers() });
+      const d = await r.json();
+      const badge = document.getElementById("statusBadge");
+      const labels = { open: "Conectado ✅", connecting: "Esperando QR…", disconnected: "Desconectado" };
+      badge.innerHTML = `<span class="dot"></span> ${labels[d.status] || d.status}`;
+      badge.className = d.status;
+
+      // Si está conectado, ocultamos la tarjeta QR
+      document.getElementById("qrCard").style.display =
+        d.status === "open" ? "none" : "block";
+
+      if (d.status !== "open") loadQR();
+    } catch (e) {
+      toast("No se pudo obtener el estado del servidor.", "err");
+    }
+  }
+
+  // ── QR ───────────────────────────────────────────────────
+  async function loadQR() {
+    const img = document.getElementById("qrImg");
+    const msg = document.getElementById("qrMsg");
+    try {
+      const r = await fetch(`${BASE}/qr`, { headers: headers() });
+      const d = await r.json();
+      if (d.qr) {
+        img.src = d.qr;
+        img.style.display = "block";
+        msg.textContent = "Escanea con WhatsApp → Dispositivos vinculados → Vincular dispositivo";
+      } else {
+        img.style.display = "none";
+        msg.textContent = d.message || "No hay QR disponible.";
+      }
+    } catch (e) {
+      msg.textContent = "Error al cargar QR.";
+    }
+  }
+
+  // ── Enviar texto ─────────────────────────────────────────
+  async function sendText() {
+    const numero  = document.getElementById("txtNumero").value.trim();
+    const mensaje = document.getElementById("txtMensaje").value.trim();
+    if (!numero || !mensaje) return toast("Completa número y mensaje.", "err");
+
+    try {
+      const r = await fetch(`${BASE}/send/text`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ numero, mensaje }),
+      });
+      const d = await r.json();
+      d.ok ? toast(`✅ Mensaje enviado a ${d.to}`) : toast(d.error, "err");
+    } catch (e) {
+      toast("Error al enviar mensaje.", "err");
+    }
+  }
+
+  // ── Preview imagen ───────────────────────────────────────
+  function previewFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    document.getElementById("fileName").textContent = file.name;
+    const prev = document.getElementById("previewImg");
+    prev.src = URL.createObjectURL(file);
+    prev.style.display = "block";
+    // Limpia la URL si se elige archivo
+    document.getElementById("imgUrl").value = "";
+  }
+
+  // ── Enviar imagen ─────────────────────────────────────────
+  async function sendImage() {
+    const numero  = document.getElementById("imgNumero").value.trim();
+    const caption = document.getElementById("imgCaption").value.trim();
+    const file    = document.getElementById("fileInput").files[0];
+    const url     = document.getElementById("imgUrl").value.trim();
+
+    if (!numero) return toast("Ingresa el número.", "err");
+    if (!file && !url) return toast("Selecciona una imagen o pega una URL.", "err");
+
+    try {
+      let r;
+      if (file) {
+        // Multipart con archivo
+        const form = new FormData();
+        form.append("numero", numero);
+        form.append("caption", caption);
+        form.append("imagen", file);
+        r = await fetch(`${BASE}/send/image`, {
+          method: "POST",
+          headers: headers(true),
+          body: form,
+        });
+      } else {
+        // JSON con URL
+        r = await fetch(`${BASE}/send/image`, {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify({ numero, caption, imagenUrl: url }),
+        });
+      }
+      const d = await r.json();
+      d.ok ? toast(`✅ Imagen enviada a ${d.to}`) : toast(d.error, "err");
+    } catch (e) {
+      toast("Error al enviar imagen.", "err");
+    }
+  }
+
+  // ── Logout ───────────────────────────────────────────────
+  async function doLogout() {
+    if (!confirm("¿Cerrar sesión de WhatsApp?")) return;
+    try {
+      const r = await fetch(`${BASE}/logout`, { method: "POST", headers: headers() });
+      const d = await r.json();
+      toast(d.message || "Sesión cerrada.");
+      setTimeout(checkStatus, 1500);
+    } catch (e) {
+      toast("Error al cerrar sesión.", "err");
+    }
+  }
+
+  // ── Polling de estado cada 8 segundos ────────────────────
+  checkStatus();
+  setInterval(checkStatus, 8000);
+</script>
+</body>
+</html>

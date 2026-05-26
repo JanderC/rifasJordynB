@@ -9,6 +9,8 @@
     "seed": "node database/seed.js"
   },
   "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
@@ -18,7 +20,9 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
     "multer-storage-cloudinary": "^4.0.0",
-    "pg": "^8.11.3"
+    "pg": "^8.11.3",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

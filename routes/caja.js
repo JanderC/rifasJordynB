@@ -605,4 +605,228 @@ router.post('/semanas/:id/importar', async (req, res) => {
   } finally { client.release(); }
 });
 
+/* ══════════════════════════════════════════════════════════
+   COBRO POR VENDEDOR — pantalla de cobro rifa individual
+   ──────────────────────────────────────────────────────────
+   GET  /api/caja/rifas/:rifaId/cobro-vendedores?porcentaje=50
+        Devuelve todos los vendedores de la rifa con sus
+        números (fijos + extras), precio por número al
+        porcentaje indicado, y estado pagado por número.
+   POST /api/caja/rifas/:rifaId/cobro-vendedores/:vendedorId/pagar-numero
+        Body: { numero, serie, pagado: true|false }
+        Marca/desmarca un número como pagado para ese vendedor.
+   PUT  /api/caja/rifas/:rifaId/cobro-vendedores/porcentaje
+        Body: { porcentaje: 50 }
+        Guarda el porcentaje activo para esa rifa en caja_rifa_config.
+══════════════════════════════════════════════════════════ */
+
+/* ── Asegurar tabla caja_rifa_config y caja_pagos_numero ── */
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caja_rifa_config (
+        rifa_id   UUID PRIMARY KEY REFERENCES rifas(id) ON DELETE CASCADE,
+        porcentaje NUMERIC(5,2) NOT NULL DEFAULT 50,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caja_pagos_numero (
+        id          SERIAL PRIMARY KEY,
+        rifa_id     UUID NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+        vendedor_id UUID NOT NULL,
+        numero      VARCHAR(10) NOT NULL,
+        serie       VARCHAR(5)  NOT NULL DEFAULT 'A',
+        pagado      BOOLEAN     NOT NULL DEFAULT FALSE,
+        pagado_at   TIMESTAMPTZ,
+        UNIQUE(rifa_id, vendedor_id, numero, serie)
+      )
+    `);
+  } catch(e) {
+    console.error('[caja] Error creando tablas cobro:', e.message);
+  }
+})();
+
+/* GET /rifas/:rifaId/cobro-vendedores */
+router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
+  const { rifaId } = req.params;
+  const porcentajeParsed = Math.min(Math.max(Number(req.query.porcentaje) || 50, 1), 100);
+
+  try {
+    // 1. Rifa
+    const rifaR = await pool.query(`SELECT * FROM rifas WHERE id=$1`, [rifaId]);
+    if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+    const rifa = rifaR.rows[0];
+
+    // 2. Config porcentaje guardado (si existe, lo usamos; query param gana)
+    const cfgR = await pool.query(
+      `SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]
+    );
+    const porcentaje = req.query.porcentaje
+      ? porcentajeParsed
+      : Number(cfgR.rows[0]?.porcentaje || 50);
+
+    const precioBoleto = Number(rifa.precio) || 0;
+    const precioConPct = +(precioBoleto * porcentaje / 100).toFixed(2);
+
+    // 3. Vendedores con números fijos desde numeros_vendedor
+    const vendR = await pool.query(`
+      SELECT
+        nv.vendedor_id,
+        u.nombre AS vendedor_nombre,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'numero', LPAD(nv.numero::text, 3, '0'),
+            'serie',  COALESCE(nv.serie, 'A'),
+            'origen', 'fijo'
+          )
+          ORDER BY nv.numero, nv.serie
+        ) AS numeros
+      FROM numeros_vendedor nv
+      JOIN users u ON u.id = nv.vendedor_id
+      WHERE nv.rifa_id = $1
+      GROUP BY nv.vendedor_id, u.nombre
+      ORDER BY u.nombre
+    `, [rifaId]);
+
+    // 4. Números extras desde caja_lotes (origen='extra')
+    //    Los lotes con numeros_fijos=false tienen números extras asignados
+    const extrasR = await pool.query(`
+      SELECT
+        l.vendedor_id,
+        l.vendedor_nombre,
+        l.numeros_asignados
+      FROM caja_lotes l
+      JOIN caja_semanas s ON s.id = l.semana_id
+      WHERE s.rifa_id = $1
+        AND l.numeros_fijos = false
+        AND l.numeros_asignados IS NOT NULL
+        AND l.numeros_asignados <> ''
+    `, [rifaId]);
+
+    // 5. Estados de pago por número
+    const pagosR = await pool.query(
+      `SELECT vendedor_id::text, numero, serie, pagado FROM caja_pagos_numero WHERE rifa_id=$1`,
+      [rifaId]
+    );
+    const pagosMap = {};
+    for (const p of pagosR.rows) {
+      const key = `${p.vendedor_id}|${p.numero}|${p.serie}`;
+      pagosMap[key] = p.pagado;
+    }
+
+    // 6. Combinar vendedores fijos + extras
+    const vendedoresMap = {};
+
+    for (const v of vendR.rows) {
+      vendedoresMap[v.vendedor_id] = {
+        vendedor_id:     v.vendedor_id,
+        vendedor_nombre: v.vendedor_nombre,
+        numeros:         v.numeros || [],
+      };
+    }
+
+    for (const e of extrasR.rows) {
+      if (!e.vendedor_id) continue;
+      const vid = e.vendedor_id;
+      if (!vendedoresMap[vid]) {
+        vendedoresMap[vid] = {
+          vendedor_id:     vid,
+          vendedor_nombre: e.vendedor_nombre,
+          numeros:         [],
+        };
+      }
+      const extras = parseNumsServer(e.numeros_asignados).map(n => ({
+        numero: String(n).padStart(3, '0'),
+        serie:  'A',
+        origen: 'extra',
+      }));
+      vendedoresMap[vid].numeros.push(...extras);
+    }
+
+    // 7. Deduplicar por numero+serie y agregar estado pagado
+    const vendedores = Object.values(vendedoresMap).map(v => {
+      const seen = new Set();
+      const numsSinDup = [];
+      for (const n of v.numeros) {
+        const key = `${n.numero}|${n.serie}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const pagoKey = `${v.vendedor_id}|${n.numero}|${n.serie}`;
+          numsSinDup.push({ ...n, pagado: pagosMap[pagoKey] === true });
+        }
+      }
+      numsSinDup.sort((a, b) => a.numero.localeCompare(b.numero) || a.serie.localeCompare(b.serie));
+
+      const totalNums    = numsSinDup.length;
+      const totalPagados = numsSinDup.filter(n => n.pagado).length;
+      const deuda        = +(precioConPct * (totalNums - totalPagados)).toFixed(2);
+      const cobrado      = +(precioConPct * totalPagados).toFixed(2);
+
+      return {
+        ...v,
+        numeros:        numsSinDup,
+        total_numeros:  totalNums,
+        total_pagados:  totalPagados,
+        precio_por_num: precioConPct,
+        total_cobrar:   +(precioConPct * totalNums).toFixed(2),
+        cobrado,
+        deuda,
+      };
+    });
+
+    res.json({
+      rifa,
+      porcentaje,
+      precio_boleto_original: precioBoleto,
+      precio_boleto_efectivo: precioConPct,
+      vendedores,
+    });
+  } catch (e) {
+    console.error('/cobro-vendedores:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /rifas/:rifaId/cobro-vendedores/:vendedorId/pagar-numero */
+router.post('/rifas/:rifaId/cobro-vendedores/:vendedorId/pagar-numero', async (req, res) => {
+  const { rifaId, vendedorId } = req.params;
+  const { numero, serie = 'A', pagado = true } = req.body;
+  if (!numero) return res.status(400).json({ error: 'numero requerido' });
+
+  try {
+    const numPad = String(numero).padStart(3, '0');
+    const pagado_at = pagado ? new Date() : null;
+    await pool.query(`
+      INSERT INTO caja_pagos_numero (rifa_id, vendedor_id, numero, serie, pagado, pagado_at)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (rifa_id, vendedor_id, numero, serie)
+      DO UPDATE SET pagado=$5, pagado_at=$6
+    `, [rifaId, vendedorId, numPad, serie.toUpperCase(), pagado, pagado_at]);
+
+    res.json({ ok: true, numero: numPad, serie, pagado });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* PUT /rifas/:rifaId/cobro-vendedores/porcentaje */
+router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
+  const { rifaId } = req.params;
+  const { porcentaje } = req.body;
+  if (!porcentaje || porcentaje <= 0 || porcentaje > 100)
+    return res.status(400).json({ error: 'porcentaje debe estar entre 1 y 100' });
+
+  try {
+    await pool.query(`
+      INSERT INTO caja_rifa_config (rifa_id, porcentaje, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (rifa_id) DO UPDATE SET porcentaje=$2, updated_at=NOW()
+    `, [rifaId, porcentaje]);
+    res.json({ ok: true, porcentaje });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

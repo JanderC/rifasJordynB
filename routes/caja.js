@@ -753,10 +753,7 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
         if (!seen.has(key)) {
           seen.add(key);
           const pagoKey = `${v.vendedor_id}|${n.numero}|${n.serie}`;
-          // Verde por defecto: los números asignados son números ya vendidos.
-          // Solo quedan rojos si fueron marcados explícitamente como pagado=false.
-          const estadoPago = pagoKey in pagosMap ? pagosMap[pagoKey] : true;
-          numsSinDup.push({ ...n, pagado: estadoPago });
+          numsSinDup.push({ ...n, pagado: pagosMap[pagoKey] === true });
         }
       }
       numsSinDup.sort((a, b) => a.numero.localeCompare(b.numero) || a.serie.localeCompare(b.serie));
@@ -778,12 +775,29 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
       };
     });
 
+    // 8. Cargar estado de cuadre por vendedor
+    const cuadreR = await pool.query(
+      `SELECT vendedor_id::text, cuadrado, notas FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
+      [rifaId]
+    );
+    const cuadreMap = {};
+    for (const row of cuadreR.rows) {
+      cuadreMap[row.vendedor_id] = { cuadrado: row.cuadrado, notas: row.notas };
+    }
+
+    // Agregar cuadre a cada vendedor
+    const vendedoresConCuadre = vendedores.map(v => ({
+      ...v,
+      cuadrado: cuadreMap[v.vendedor_id]?.cuadrado || false,
+      cuadre_notas: cuadreMap[v.vendedor_id]?.notas || null,
+    }));
+
     res.json({
       rifa,
       porcentaje,
       precio_boleto_original: precioBoleto,
       precio_boleto_efectivo: precioConPct,
-      vendedores,
+      vendedores: vendedoresConCuadre,
     });
   } catch (e) {
     console.error('/cobro-vendedores:', e);
@@ -827,6 +841,53 @@ router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
       ON CONFLICT (rifa_id) DO UPDATE SET porcentaje=$2, updated_at=NOW()
     `, [rifaId, porcentaje]);
     res.json({ ok: true, porcentaje });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════
+   CUADRE DE VENDEDOR — estado visual persistente
+   Tabla: caja_cuadre_vendedor
+     rifa_id, vendedor_id → cuadrado (bool), notas, updated_at
+   GET  /rifas/:rifaId/cobro-vendedores  → ya incluye cuadrado en cada vendedor
+   PUT  /rifas/:rifaId/cuadre/:vendedorId  { cuadrado: true|false, notas? }
+══════════════════════════════════════════════════════════ */
+
+/* ── Crear tabla si no existe ── */
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caja_cuadre_vendedor (
+        rifa_id     UUID        NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+        vendedor_id UUID        NOT NULL,
+        cuadrado    BOOLEAN     NOT NULL DEFAULT FALSE,
+        notas       TEXT,
+        updated_at  TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (rifa_id, vendedor_id)
+      )
+    `);
+  } catch (e) {
+    console.error('[caja] Error creando tabla caja_cuadre_vendedor:', e.message);
+  }
+})();
+
+/* PUT /rifas/:rifaId/cuadre/:vendedorId
+   Body: { cuadrado: true|false, notas?: string }
+   Guarda o actualiza el estado de cuadre del vendedor en esa rifa. */
+router.put('/rifas/:rifaId/cuadre/:vendedorId', async (req, res) => {
+  const { rifaId, vendedorId } = req.params;
+  const { cuadrado = false, notas = null } = req.body;
+
+  try {
+    await pool.query(`
+      INSERT INTO caja_cuadre_vendedor (rifa_id, vendedor_id, cuadrado, notas, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (rifa_id, vendedor_id)
+      DO UPDATE SET cuadrado=$3, notas=$4, updated_at=NOW()
+    `, [rifaId, vendedorId, !!cuadrado, notas]);
+
+    res.json({ ok: true, rifa_id: rifaId, vendedor_id: vendedorId, cuadrado: !!cuadrado });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

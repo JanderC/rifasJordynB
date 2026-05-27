@@ -753,7 +753,10 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
         if (!seen.has(key)) {
           seen.add(key);
           const pagoKey = `${v.vendedor_id}|${n.numero}|${n.serie}`;
-          numsSinDup.push({ ...n, pagado: pagosMap[pagoKey] === true });
+          // Verde por defecto: los números asignados son números ya vendidos.
+          // Solo quedan rojos si fueron marcados explícitamente como pagado=false.
+          const estadoPago = pagoKey in pagosMap ? pagosMap[pagoKey] : true;
+          numsSinDup.push({ ...n, pagado: estadoPago });
         }
       }
       numsSinDup.sort((a, b) => a.numero.localeCompare(b.numero) || a.serie.localeCompare(b.serie));

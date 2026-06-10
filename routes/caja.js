@@ -606,6 +606,48 @@ router.post('/semanas/:id/importar', async (req, res) => {
 });
 
 /* ══════════════════════════════════════════════════════════
+   LOTES POR RIFA — devuelve todos los lotes de la semana
+   activa de una rifa con por_pagar / abono / pendiente
+   para que el frontend pueda construir el mapa de deudas
+   sin depender del estado de detalleSemana.
+   GET /api/caja/rifas/:rifaId/lotes-vendedores
+   Devuelve: { semana_id, lotes: [{ lote_id, vendedor_id,
+     vendedor_nombre, por_pagar, abono, pendiente, estado }] }
+══════════════════════════════════════════════════════════ */
+router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
+  const { rifaId } = req.params;
+  try {
+    // Obtener semana más reciente de la rifa
+    const semR = await pool.query(
+      `SELECT id FROM caja_semanas WHERE rifa_id=$1 ORDER BY created_at DESC LIMIT 1`,
+      [rifaId]
+    );
+    if (!semR.rows[0]) return res.json({ semana_id: null, lotes: [] });
+
+    const semanaId = semR.rows[0].id;
+    const lotesR = await pool.query(`
+      SELECT
+        l.id             AS lote_id,
+        l.vendedor_id,
+        l.vendedor_nombre,
+        l.por_pagar,
+        l.abono,
+        l.pendiente,
+        l.estado
+      FROM caja_lotes l
+      WHERE l.semana_id = $1
+        AND l.vendedor_id IS NOT NULL
+      ORDER BY l.vendedor_nombre
+    `, [semanaId]);
+
+    res.json({ semana_id: semanaId, lotes: lotesR.rows });
+  } catch (e) {
+    console.error('/rifas/:rifaId/lotes-vendedores:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════
    COBRO POR VENDEDOR — pantalla de cobro rifa individual
    ──────────────────────────────────────────────────────────
    GET  /api/caja/rifas/:rifaId/cobro-vendedores?porcentaje=50
@@ -777,19 +819,26 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
 
     // 8. Cargar estado de cuadre por vendedor
     const cuadreR = await pool.query(
-      `SELECT vendedor_id::text, cuadrado, notas FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
+      `SELECT vendedor_id::text, cuadrado, pendiente_flag, monto_cuadrado, notas FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
       [rifaId]
     );
     const cuadreMap = {};
     for (const row of cuadreR.rows) {
-      cuadreMap[row.vendedor_id] = { cuadrado: row.cuadrado, notas: row.notas };
+      cuadreMap[row.vendedor_id] = {
+        cuadrado:       row.cuadrado,
+        pendiente_flag: row.pendiente_flag,
+        monto_cuadrado: row.monto_cuadrado,
+        notas:          row.notas,
+      };
     }
 
     // Agregar cuadre a cada vendedor
     const vendedoresConCuadre = vendedores.map(v => ({
       ...v,
-      cuadrado: cuadreMap[v.vendedor_id]?.cuadrado || false,
-      cuadre_notas: cuadreMap[v.vendedor_id]?.notas || null,
+      cuadrado:       cuadreMap[v.vendedor_id]?.cuadrado       || false,
+      pendiente_flag: cuadreMap[v.vendedor_id]?.pendiente_flag || false,
+      monto_cuadrado: cuadreMap[v.vendedor_id]?.monto_cuadrado || null,
+      cuadre_notas:   cuadreMap[v.vendedor_id]?.notas          || null,
     }));
 
     res.json({
@@ -854,40 +903,65 @@ router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
    PUT  /rifas/:rifaId/cuadre/:vendedorId  { cuadrado: true|false, notas? }
 ══════════════════════════════════════════════════════════ */
 
-/* ── Crear tabla si no existe ── */
+/* ── Crear / migrar tabla caja_cuadre_vendedor ── */
 (async () => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS caja_cuadre_vendedor (
-        rifa_id     UUID        NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
-        vendedor_id UUID        NOT NULL,
-        cuadrado    BOOLEAN     NOT NULL DEFAULT FALSE,
-        notas       TEXT,
-        updated_at  TIMESTAMPTZ DEFAULT NOW(),
+        rifa_id         UUID        NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+        vendedor_id     UUID        NOT NULL,
+        cuadrado        BOOLEAN     NOT NULL DEFAULT FALSE,
+        pendiente_flag  BOOLEAN     NOT NULL DEFAULT FALSE,
+        monto_cuadrado  NUMERIC(12,2),
+        notas           TEXT,
+        updated_at      TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (rifa_id, vendedor_id)
       )
     `);
+    // Migración segura: agregar columnas si no existen
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS pendiente_flag BOOLEAN NOT NULL DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS monto_cuadrado NUMERIC(12,2)`);
   } catch (e) {
     console.error('[caja] Error creando tabla caja_cuadre_vendedor:', e.message);
   }
 })();
 
 /* PUT /rifas/:rifaId/cuadre/:vendedorId
-   Body: { cuadrado: true|false, notas?: string }
-   Guarda o actualiza el estado de cuadre del vendedor en esa rifa. */
+   Body: { cuadrado, pendiente_flag, monto_cuadrado?, notas? }
+   cuadrado=true      → vendedor cuadrado y cerrado con ese monto
+   pendiente_flag=true → vendedor marcado como pendiente (prioritario)
+   Ambos pueden coexistir, pero semánticamente son excluyentes en la UI */
 router.put('/rifas/:rifaId/cuadre/:vendedorId', async (req, res) => {
   const { rifaId, vendedorId } = req.params;
-  const { cuadrado = false, notas = null } = req.body;
+  const {
+    cuadrado       = false,
+    pendiente_flag = false,
+    monto_cuadrado = null,
+    notas          = null,
+  } = req.body;
 
   try {
     await pool.query(`
-      INSERT INTO caja_cuadre_vendedor (rifa_id, vendedor_id, cuadrado, notas, updated_at)
-      VALUES ($1, $2, $3, $4, NOW())
+      INSERT INTO caja_cuadre_vendedor
+        (rifa_id, vendedor_id, cuadrado, pendiente_flag, monto_cuadrado, notas, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW())
       ON CONFLICT (rifa_id, vendedor_id)
-      DO UPDATE SET cuadrado=$3, notas=$4, updated_at=NOW()
-    `, [rifaId, vendedorId, !!cuadrado, notas]);
+      DO UPDATE SET
+        cuadrado       = $3,
+        pendiente_flag = $4,
+        monto_cuadrado = $5,
+        notas          = $6,
+        updated_at     = NOW()
+    `, [rifaId, vendedorId, !!cuadrado, !!pendiente_flag, monto_cuadrado || null, notas]);
 
-    res.json({ ok: true, rifa_id: rifaId, vendedor_id: vendedorId, cuadrado: !!cuadrado });
+    res.json({
+      ok: true,
+      rifa_id:        rifaId,
+      vendedor_id:    vendedorId,
+      cuadrado:       !!cuadrado,
+      pendiente_flag: !!pendiente_flag,
+      monto_cuadrado: monto_cuadrado || null,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

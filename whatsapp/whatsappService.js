@@ -1,5 +1,6 @@
 /**
- * whatsappService.js — con protecciones anti-ban
+ * whatsappService.js — con protecciones anti-ban, respuestas automáticas (Gemini)
+ * y gestión automática de sesiones (sin borrar manualmente sessions/)
  */
 
 const {
@@ -11,8 +12,11 @@ const {
 
 const { Boom } = require("@hapi/boom");
 const path = require("path");
+const fs = require("fs");
 const pino = require("pino");
 const EventEmitter = require("events");
+const { getAutoReply } = require("./autoReply");
+const { acumularMensaje } = require("./geminiService");
 
 const SESSION_PATH = path.join(__dirname, "sessions");
 const waEvents = new EventEmitter();
@@ -23,21 +27,37 @@ let connectionStatus = "disconnected";
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+// ── Limpieza automática de sesión ──────────────────────────
+/**
+ * Borra la carpeta sessions/ de forma segura.
+ * Se llama automáticamente cuando:
+ *  - Se detecta que el dispositivo fue desconectado (loggedOut)
+ *  - Se llama logout() desde la API
+ *  - Se llama el endpoint /api/whatsapp/reset
+ */
+function clearSession() {
+  try {
+    if (fs.existsSync(SESSION_PATH)) {
+      fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+      console.log("🗑️  [WhatsApp] Sesión borrada correctamente.");
+    }
+  } catch (err) {
+    console.error("❌ [WhatsApp] Error borrando sesión:", err.message);
+  }
+}
+
 // ── Rate limiting ──────────────────────────────────────────
-// Controla cuántos mensajes se envían y con qué frecuencia
 const rateLimit = {
-  windowMs: 60 * 1000,       // ventana de 1 minuto
-  maxPerWindow: 10,           // máx 10 mensajes por minuto
-  minDelayMs: 2000,           // mínimo 2s entre mensajes
-  maxDelayMs: 5000,           // máximo 5s entre mensajes (aleatorio)
+  windowMs: 60 * 1000,
+  maxPerWindow: 10,
+  minDelayMs: 2000,
+  maxDelayMs: 5000,
   sentInWindow: 0,
   windowStart: Date.now(),
   lastSentAt: 0,
 };
 
 // ── Cola de mensajes ───────────────────────────────────────
-// En vez de enviar todo junto, los mensajes se encolan y
-// se envían de uno en uno con delay aleatorio
 const messageQueue = [];
 let isProcessingQueue = false;
 
@@ -52,13 +72,10 @@ function randomDelay() {
 
 function checkRateLimit() {
   const now = Date.now();
-
-  // Reinicia la ventana si ya pasó 1 minuto
   if (now - rateLimit.windowStart > rateLimit.windowMs) {
     rateLimit.sentInWindow = 0;
     rateLimit.windowStart = now;
   }
-
   if (rateLimit.sentInWindow >= rateLimit.maxPerWindow) {
     const waitMs = rateLimit.windowMs - (now - rateLimit.windowStart);
     throw new Error(
@@ -73,8 +90,6 @@ async function processQueue() {
 
   while (messageQueue.length > 0) {
     const { task, resolve, reject } = messageQueue.shift();
-
-    // Espera el delay antes de enviar
     const delay = randomDelay();
     console.log(`⏳ [WhatsApp] Enviando en ${delay}ms...`);
     await sleep(delay);
@@ -100,6 +115,14 @@ function enqueue(task) {
   });
 }
 
+// ── Anti-flood ─────────────────────────────────────────────
+const recentlyReplied = new Set();
+
+function markReplied(msgId) {
+  recentlyReplied.add(msgId);
+  setTimeout(() => recentlyReplied.delete(msgId), 5 * 60 * 1000);
+}
+
 // ── Inicio de WhatsApp ─────────────────────────────────────
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
@@ -110,14 +133,13 @@ async function startWhatsApp() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: true,
     auth: state,
-    // Simula un navegador real para reducir detección
     browser: ["Windows", "Chrome", "120.0.0"],
     generateHighQualityLinkPreview: false,
-    // Retries internos de Baileys
     retryRequestDelayMs: 2000,
     maxMsgRetryCount: 2,
   });
 
+  // ── Conexión y QR ──────────────────────────────────────
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -143,19 +165,80 @@ async function startWhatsApp() {
       console.log(`⚠️  [WhatsApp] Desconectado. Código: ${reason}`);
 
       if (reason === DisconnectReason.loggedOut) {
-        console.log("🚪 [WhatsApp] Sesión cerrada. Borra sessions/ y reinicia.");
+        // ✅ MEJORA: borra sesión automáticamente y reconecta desde cero
+        console.log("🚪 [WhatsApp] Sesión cerrada remotamente. Limpiando y reconectando...");
+        clearSession();
+        reconnectAttempts = 0;
+        await sleep(3000);
+        startWhatsApp();
         return;
       }
 
-      // Reconexión con backoff exponencial para no spamear
       if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
-        const waitSec = Math.pow(2, reconnectAttempts) * 3; // 6s, 12s, 24s, 48s...
+        const waitSec = Math.pow(2, reconnectAttempts) * 3;
         console.log(`🔄 [WhatsApp] Intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} en ${waitSec}s...`);
         await sleep(waitSec * 1000);
         startWhatsApp();
       } else {
-        console.log("❌ [WhatsApp] Máximo de reconexiones alcanzado. Reinicia el servidor manualmente.");
+        console.log("❌ [WhatsApp] Máximo de reconexiones alcanzado. Limpiando sesión...");
+        // ✅ MEJORA: si agota los intentos, limpia sesión para que el próximo arranque sea limpio
+        clearSession();
+        reconnectAttempts = 0;
+        waEvents.emit("session_expired");
+      }
+    }
+  });
+
+  // ── Auto-respuestas con Gemini ─────────────────────────
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+
+    for (const msg of messages) {
+      try {
+        if (msg.key.fromMe) continue;
+        if (msg.key.remoteJid.endsWith("@g.us")) continue;
+        if (recentlyReplied.has(msg.key.id)) continue;
+
+        const texto =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          "";
+
+        if (!texto) continue;
+
+        const jid = msg.key.remoteJid;
+
+        console.log(`📩 [AutoReply] De ${jid}: "${texto.substring(0, 50)}"`);
+
+        // Marcar ya como procesado para evitar duplicados de este msg.key.id
+        markReplied(msg.key.id);
+
+        // Acumular mensajes: si el cliente manda varios seguidos,
+        // se agrupan y se responde UNO SOLO después de 4 segundos de silencio
+        acumularMensaje(jid, texto, async (jidFinal, textoAcumulado) => {
+          try {
+            const respuesta = await getAutoReply(jidFinal, textoAcumulado);
+
+            await sock.sendPresenceUpdate("composing", jidFinal);
+            await sleep(1500);
+            await sock.sendPresenceUpdate("paused", jidFinal);
+
+            await enqueue(async () => {
+              await sock.sendMessage(jidFinal, { text: respuesta });
+              console.log(`🤖 [AutoReply] Respondido a ${jidFinal}`);
+              return { ok: true, to: jidFinal };
+            });
+
+            waEvents.emit("autoReply", { jid: jidFinal, incoming: textoAcumulado, response: respuesta });
+          } catch (err) {
+            console.error("❌ [AutoReply] Error enviando respuesta acumulada:", err.message);
+          }
+        });
+
+      } catch (err) {
+        console.error("❌ [AutoReply] Error procesando mensaje:", err.message);
       }
     }
   });
@@ -214,7 +297,6 @@ async function sendImage(numero, imagen, caption = "") {
 
 function getStatus() {
   const now = Date.now();
-  // Reinicia conteo si ya expiró la ventana
   if (now - rateLimit.windowStart > rateLimit.windowMs) {
     rateLimit.sentInWindow = 0;
     rateLimit.windowStart = now;
@@ -237,14 +319,43 @@ async function getQRBase64() {
   return await QRCode.toDataURL(currentQR);
 }
 
+/**
+ * Cierra la sesión activa y borra la carpeta sessions/ automáticamente.
+ * La próxima llamada a startWhatsApp() pedirá un nuevo QR.
+ */
 async function logout() {
   if (sock) {
-    await sock.logout();
+    try {
+      await sock.logout();
+    } catch (_) {
+      // ignorar error de logout si ya estaba desconectado
+    }
     sock = null;
     connectionStatus = "disconnected";
     currentQR = null;
     reconnectAttempts = 0;
   }
+  // ✅ MEJORA: siempre limpia la sesión al hacer logout
+  clearSession();
+}
+
+/**
+ * Fuerza un reset completo: cierra conexión, borra sesión y reinicia.
+ * Útil para el endpoint /api/whatsapp/reset del panel de administración.
+ */
+async function resetAndReconnect() {
+  console.log("🔁 [WhatsApp] Reset forzado solicitado...");
+  if (sock) {
+    try { await sock.end(); } catch (_) {}
+    sock = null;
+  }
+  connectionStatus = "disconnected";
+  currentQR = null;
+  reconnectAttempts = 0;
+  clearSession();
+  await sleep(1000);
+  await startWhatsApp();
+  console.log("🔁 [WhatsApp] Reconectando con sesión limpia...");
 }
 
 module.exports = {
@@ -254,5 +365,7 @@ module.exports = {
   getStatus,
   getQRBase64,
   logout,
+  resetAndReconnect,   // ✅ nuevo
+  clearSession,        // ✅ nuevo (expuesto para uso externo)
   waEvents,
 };

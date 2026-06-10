@@ -6,11 +6,13 @@
  *   app.use("/api/baileys", require("./routes/wa-baileys"));
  *
  * Endpoints:
- *   GET  /api/baileys/status        → estado de conexión
- *   GET  /api/baileys/qr            → imagen QR en base64
- *   POST /api/baileys/send/text     → enviar texto plano
- *   POST /api/baileys/send/image    → enviar imagen con caption
- *   POST /api/baileys/logout        → cerrar sesión
+ *   GET  /api/baileys/status          → estado de conexión
+ *   GET  /api/baileys/qr              → imagen QR en base64
+ *   POST /api/baileys/send/text       → enviar texto plano
+ *   POST /api/baileys/send/image      → enviar imagen con caption
+ *   POST /api/baileys/logout          → cerrar sesión
+ *   GET  /api/baileys/guion           → ver guión activo (debug)
+ *   POST /api/baileys/guion/test      → probar respuesta de un mensaje
  */
 
 const express = require("express");
@@ -23,9 +25,11 @@ const {
   getStatus,
   getQRBase64,
   logout,
-} = require("../whatsapp/whatsappService"); // ajusta la ruta según donde pongas el servicio
+} = require("../whatsapp/whatsappService");
 
-// Multer en memoria (para recibir imágenes sin guardarlas en disco)
+const { getAutoReply, getGuion } = require("../whatsapp/autoReply");
+
+// ── Multer en memoria (imágenes sin guardar en disco) ───────
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // máx 10 MB
@@ -37,12 +41,10 @@ const upload = multer({
   },
 });
 
-// ── Middleware de auth simple (opcional, pero recomendado) ──
-// Valida un header X-WA-Key contra la variable de entorno WA_SECRET_KEY.
-// Si no quieres auth, comenta este middleware y quítalo de las rutas.
+// ── Middleware de auth simple ───────────────────────────────
 function waAuth(req, res, next) {
   const secret = process.env.WA_SECRET_KEY;
-  if (!secret) return next(); // sin variable = sin protección (solo desarrollo)
+  if (!secret) return next();
   const key = req.headers["x-wa-key"];
   if (key !== secret) {
     return res.status(401).json({ error: "No autorizado." });
@@ -56,7 +58,6 @@ router.get("/status", waAuth, (req, res) => {
 });
 
 // ── GET /api/baileys/qr ─────────────────────────────────────
-// Retorna la imagen QR como data URL para mostrar en un <img>
 router.get("/qr", waAuth, async (req, res) => {
   try {
     const qrBase64 = await getQRBase64();
@@ -91,20 +92,12 @@ router.post("/send/text", waAuth, async (req, res) => {
 });
 
 // ── POST /api/baileys/send/image ────────────────────────────
-// Acepta DOS formas:
-//
-// Forma 1 — multipart/form-data (archivo real):
-//   Campo "imagen" (file) + "numero" (text) + "caption" (text, opcional)
-//
-// Forma 2 — application/json (URL o base64):
-//   { "numero": "...", "imagenUrl": "https://...", "caption": "..." }
-//   { "numero": "...", "imagenBase64": "data:image/png;base64,...", "caption": "..." }
-
+// Forma 1 — multipart/form-data: campo "imagen" + "numero" + "caption"
+// Forma 2 — application/json:   { "numero", "imagenUrl" | "imagenBase64", "caption" }
 router.post(
   "/send/image",
   waAuth,
   (req, res, next) => {
-    // Solo usamos multer si la petición es multipart
     const ct = req.headers["content-type"] || "";
     if (ct.includes("multipart/form-data")) {
       return upload.single("imagen")(req, res, next);
@@ -123,13 +116,10 @@ router.post(
       let imageSource;
 
       if (req.file) {
-        // Forma 1: archivo subido vía multipart
         imageSource = req.file.buffer;
       } else if (req.body?.imagenUrl) {
-        // Forma 2a: URL pública
         imageSource = req.body.imagenUrl;
       } else if (req.body?.imagenBase64) {
-        // Forma 2b: base64
         imageSource = req.body.imagenBase64;
       } else {
         return res.status(400).json({
@@ -153,6 +143,34 @@ router.post("/logout", waAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── GET /api/baileys/guion ──────────────────────────────────
+// Muestra el guión activo en memoria (útil para verificar sin reiniciar)
+router.get("/guion", waAuth, (req, res) => {
+  const guion = getGuion();
+  res.json({
+    ok: true,
+    total: guion.length,
+    guion: guion.map((g) => ({
+      id: g.id,
+      nombre: g.nombre,
+      triggers: g.triggers,
+      responsePreview: g.response.substring(0, 80) + "...",
+    })),
+  });
+});
+
+// ── POST /api/baileys/guion/test ────────────────────────────
+// Prueba qué respuesta generaría un mensaje sin enviarlo
+// Body JSON: { "mensaje": "hola quiero comprar" }
+router.post("/guion/test", waAuth, (req, res) => {
+  const { mensaje } = req.body;
+  if (!mensaje) {
+    return res.status(400).json({ error: "Se requiere 'mensaje'." });
+  }
+  const respuesta = getAutoReply(mensaje);
+  res.json({ ok: true, input: mensaje, response: respuesta });
 });
 
 module.exports = router;

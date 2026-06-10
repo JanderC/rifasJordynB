@@ -616,71 +616,111 @@ router.post('/semanas/:id/importar', async (req, res) => {
 ══════════════════════════════════════════════════════════ */
 router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
   const { rifaId } = req.params;
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     // 1. Rifa y precio base
-    const rifaR = await pool.query(`SELECT precio FROM rifas WHERE id=$1`, [rifaId]);
-    if (!rifaR.rows[0]) return res.json({ semana_id: null, lotes: [] });
+    const rifaR = await client.query(`SELECT id, precio FROM rifas WHERE id=$1`, [rifaId]);
+    if (!rifaR.rows[0]) { await client.query('ROLLBACK'); return res.json({ semana_id: null, lotes: [] }); }
     const precioBoleto = Number(rifaR.rows[0].precio) || 0;
 
     // 2. Porcentaje activo
-    const cfgR = await pool.query(
-      `SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]
-    );
-    const porcentaje  = Number(cfgR.rows[0]?.porcentaje || 50);
+    const cfgR = await client.query(`SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]);
+    const porcentaje   = Number(cfgR.rows[0]?.porcentaje || 50);
     const precioConPct = +(precioBoleto * porcentaje / 100).toFixed(2);
 
-    // 3. Semana más reciente
-    const semR = await pool.query(
-      `SELECT id FROM caja_semanas WHERE rifa_id=$1 ORDER BY created_at DESC LIMIT 1`,
-      [rifaId]
+    // 3. Semana más reciente (o crearla)
+    let semanaId;
+    const semR = await client.query(
+      `SELECT id FROM caja_semanas WHERE rifa_id=$1 ORDER BY created_at DESC LIMIT 1`, [rifaId]
     );
-    if (!semR.rows[0]) return res.json({ semana_id: null, lotes: [], porcentaje, precio_con_pct: precioConPct });
+    if (semR.rows[0]) {
+      semanaId = semR.rows[0].id;
+    } else {
+      // No hay semana aún — devolver vacío (rifa-activa la crea)
+      await client.query('ROLLBACK');
+      return res.json({ semana_id: null, lotes: [], porcentaje, precio_con_pct: precioConPct });
+    }
 
-    const semanaId = semR.rows[0].id;
-
-    // 4. Lotes con conteo real de números para recalcular por_pagar al porcentaje
-    //    Usamos numeros_vendedor como fuente de verdad para la cantidad
-    const lotesR = await pool.query(`
+    // 4. Obtener todos los vendedores reales de esta rifa desde numeros_vendedor
+    const vendsR = await client.query(`
       SELECT
-        l.id               AS lote_id,
-        l.vendedor_id,
-        l.vendedor_nombre,
-        l.abono,
-        l.estado,
-        -- Contar los números reales del vendedor en esta rifa
-        COALESCE(
-          (SELECT COUNT(*) FROM numeros_vendedor nv WHERE nv.rifa_id=$2 AND nv.vendedor_id = l.vendedor_id),
-          l.cant_entregados,
-          0
-        )::int             AS total_numeros
-      FROM caja_lotes l
-      WHERE l.semana_id = $1
-        AND l.vendedor_id IS NOT NULL
-      ORDER BY l.vendedor_nombre
-    `, [semanaId, rifaId]);
+        nv.vendedor_id,
+        u.nombre        AS vendedor_nombre,
+        COUNT(*)::int   AS total_numeros
+      FROM numeros_vendedor nv
+      JOIN users u ON u.id = nv.vendedor_id
+      WHERE nv.rifa_id = $1
+      GROUP BY nv.vendedor_id, u.nombre
+    `, [rifaId]);
 
-    // 5. Recalcular por_pagar y pendiente con el porcentaje actual
-    const lotes = lotesR.rows.map(l => {
-      const totalNums  = Number(l.total_numeros || 0);
+    // 5. Para cada vendedor: buscar su lote (por vendedor_id o por nombre como fallback)
+    //    Si no tiene lote, crearlo automáticamente
+    const resultado = [];
+    for (const v of vendsR.rows) {
+      const totalNums  = Number(v.total_numeros || 0);
       const porPagar   = +(precioConPct * totalNums).toFixed(2);
-      const abono      = Number(l.abono || 0);
-      const pendiente  = Math.max(porPagar - abono, 0);
-      return {
-        lote_id:        l.lote_id,
-        vendedor_id:    l.vendedor_id,
-        vendedor_nombre: l.vendedor_nombre,
-        por_pagar:      porPagar,
+
+      // Buscar lote por vendedor_id primero, luego por nombre
+      let loteR = await client.query(
+        `SELECT id, abono, estado FROM caja_lotes WHERE semana_id=$1 AND vendedor_id=$2 LIMIT 1`,
+        [semanaId, v.vendedor_id]
+      );
+
+      if (!loteR.rows[0]) {
+        // Fallback: buscar por nombre (lotes viejos sin vendedor_id)
+        loteR = await client.query(
+          `SELECT id, abono, estado FROM caja_lotes WHERE semana_id=$1 AND vendedor_nombre=$2 LIMIT 1`,
+          [semanaId, v.vendedor_nombre]
+        );
+        // Aprovechar para sellar el vendedor_id si lo encontramos por nombre
+        if (loteR.rows[0]) {
+          await client.query(
+            `UPDATE caja_lotes SET vendedor_id=$1 WHERE id=$2`,
+            [v.vendedor_id, loteR.rows[0].id]
+          );
+        }
+      }
+
+      let lote;
+      if (loteR.rows[0]) {
+        lote = loteR.rows[0];
+      } else {
+        // Crear el lote si no existe
+        const nuevoR = await client.query(`
+          INSERT INTO caja_lotes
+            (semana_id, vendedor_nombre, vendedor_id, numeros_fijos,
+             cant_entregados, abono, por_pagar, pendiente, estado)
+          VALUES ($1,$2,$3,true,$4,0,$5,$5,'pendiente')
+          RETURNING id, abono, estado
+        `, [semanaId, v.vendedor_nombre, v.vendedor_id, totalNums, porPagar]);
+        lote = nuevoR.rows[0];
+      }
+
+      const abono     = Number(lote.abono || 0);
+      const pendiente = Math.max(porPagar - abono, 0);
+
+      resultado.push({
+        lote_id:         lote.id,
+        vendedor_id:     v.vendedor_id,
+        vendedor_nombre: v.vendedor_nombre,
+        por_pagar:       porPagar,
         abono,
         pendiente,
-        estado:         pendiente <= 0 && porPagar > 0 ? 'pagado' : abono > 0 ? 'parcial' : 'pendiente',
-        total_numeros:  totalNums,
-      };
-    });
+        estado:          pendiente <= 0 && porPagar > 0 ? 'pagado' : abono > 0 ? 'parcial' : 'pendiente',
+        total_numeros:   totalNums,
+      });
+    }
 
-    res.json({ semana_id: semanaId, lotes, porcentaje, precio_con_pct: precioConPct });
+    await client.query('COMMIT');
+    res.json({ semana_id: semanaId, lotes: resultado, porcentaje, precio_con_pct: precioConPct });
   } catch (e) {
+    await client.query('ROLLBACK');
     console.error('/rifas/:rifaId/lotes-vendedores:', e);
     res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 

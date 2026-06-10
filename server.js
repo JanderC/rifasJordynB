@@ -6,7 +6,7 @@ const { startWhatsApp } = require("./whatsapp/whatsappService");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ── Middlewares globales ───────────────────────────────────
+// ── Middlewares globales ───────────────────────────────────/
 app.use(
    cors({
     origin: (origin, callback) => {

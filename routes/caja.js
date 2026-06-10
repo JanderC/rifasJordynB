@@ -900,26 +900,30 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
 
     // 8. Cargar estado de cuadre por vendedor
     const cuadreR = await pool.query(
-      `SELECT vendedor_id::text, cuadrado, pendiente_flag, monto_cuadrado, notas FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
+      `SELECT vendedor_id::text, cuadrado, pendiente_flag, monto_cuadrado, nums_cuadrados, monto_entregado, notas FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
       [rifaId]
     );
     const cuadreMap = {};
     for (const row of cuadreR.rows) {
       cuadreMap[row.vendedor_id] = {
-        cuadrado:       row.cuadrado,
-        pendiente_flag: row.pendiente_flag,
-        monto_cuadrado: row.monto_cuadrado,
-        notas:          row.notas,
+        cuadrado:        row.cuadrado,
+        pendiente_flag:  row.pendiente_flag,
+        monto_cuadrado:  row.monto_cuadrado,
+        nums_cuadrados:  row.nums_cuadrados,
+        monto_entregado: row.monto_entregado,
+        notas:           row.notas,
       };
     }
 
     // Agregar cuadre a cada vendedor
     const vendedoresConCuadre = vendedores.map(v => ({
       ...v,
-      cuadrado:       cuadreMap[v.vendedor_id]?.cuadrado       || false,
-      pendiente_flag: cuadreMap[v.vendedor_id]?.pendiente_flag || false,
-      monto_cuadrado: cuadreMap[v.vendedor_id]?.monto_cuadrado || null,
-      cuadre_notas:   cuadreMap[v.vendedor_id]?.notas          || null,
+      cuadrado:        cuadreMap[v.vendedor_id]?.cuadrado        || false,
+      pendiente_flag:  cuadreMap[v.vendedor_id]?.pendiente_flag  || false,
+      monto_cuadrado:  cuadreMap[v.vendedor_id]?.monto_cuadrado  || null,
+      nums_cuadrados:  cuadreMap[v.vendedor_id]?.nums_cuadrados  || null,
+      monto_entregado: cuadreMap[v.vendedor_id]?.monto_entregado || null,
+      cuadre_notas:    cuadreMap[v.vendedor_id]?.notas           || null,
     }));
 
     res.json({
@@ -989,19 +993,23 @@ router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS caja_cuadre_vendedor (
-        rifa_id         UUID        NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
-        vendedor_id     UUID        NOT NULL,
-        cuadrado        BOOLEAN     NOT NULL DEFAULT FALSE,
-        pendiente_flag  BOOLEAN     NOT NULL DEFAULT FALSE,
-        monto_cuadrado  NUMERIC(12,2),
-        notas           TEXT,
-        updated_at      TIMESTAMPTZ DEFAULT NOW(),
+        rifa_id          UUID        NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+        vendedor_id      UUID        NOT NULL,
+        cuadrado         BOOLEAN     NOT NULL DEFAULT FALSE,
+        pendiente_flag   BOOLEAN     NOT NULL DEFAULT FALSE,
+        monto_cuadrado   NUMERIC(12,2),
+        nums_cuadrados   INTEGER,
+        monto_entregado  NUMERIC(12,2),
+        notas            TEXT,
+        updated_at       TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (rifa_id, vendedor_id)
       )
     `);
-    // Migración segura: agregar columnas si no existen
-    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS pendiente_flag BOOLEAN NOT NULL DEFAULT FALSE`);
-    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS monto_cuadrado NUMERIC(12,2)`);
+    // Migraciones seguras
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS pendiente_flag  BOOLEAN NOT NULL DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS monto_cuadrado  NUMERIC(12,2)`);
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS nums_cuadrados  INTEGER`);
+    await pool.query(`ALTER TABLE caja_cuadre_vendedor ADD COLUMN IF NOT EXISTS monto_entregado NUMERIC(12,2)`);
   } catch (e) {
     console.error('[caja] Error creando tabla caja_cuadre_vendedor:', e.message);
   }
@@ -1015,34 +1023,36 @@ router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
 router.put('/rifas/:rifaId/cuadre/:vendedorId', async (req, res) => {
   const { rifaId, vendedorId } = req.params;
   const {
-    cuadrado       = false,
-    pendiente_flag = false,
-    monto_cuadrado = null,
-    notas          = null,
+    cuadrado        = false,
+    pendiente_flag  = false,
+    monto_cuadrado  = null,
+    nums_cuadrados  = null,
+    monto_entregado = null,
+    notas           = null,
   } = req.body;
 
   try {
     await pool.query(`
       INSERT INTO caja_cuadre_vendedor
-        (rifa_id, vendedor_id, cuadrado, pendiente_flag, monto_cuadrado, notas, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        (rifa_id, vendedor_id, cuadrado, pendiente_flag, monto_cuadrado,
+         nums_cuadrados, monto_entregado, notas, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
       ON CONFLICT (rifa_id, vendedor_id)
       DO UPDATE SET
-        cuadrado       = $3,
-        pendiente_flag = $4,
-        monto_cuadrado = $5,
-        notas          = $6,
-        updated_at     = NOW()
-    `, [rifaId, vendedorId, !!cuadrado, !!pendiente_flag, monto_cuadrado || null, notas]);
+        cuadrado        = $3,
+        pendiente_flag  = $4,
+        monto_cuadrado  = $5,
+        nums_cuadrados  = $6,
+        monto_entregado = $7,
+        notas           = $8,
+        updated_at      = NOW()
+    `, [rifaId, vendedorId, !!cuadrado, !!pendiente_flag,
+        monto_cuadrado  || null,
+        nums_cuadrados  || null,
+        monto_entregado || null,
+        notas]);
 
-    res.json({
-      ok: true,
-      rifa_id:        rifaId,
-      vendedor_id:    vendedorId,
-      cuadrado:       !!cuadrado,
-      pendiente_flag: !!pendiente_flag,
-      monto_cuadrado: monto_cuadrado || null,
-    });
+    res.json({ ok: true, rifa_id: rifaId, vendedor_id: vendedorId, cuadrado: !!cuadrado });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

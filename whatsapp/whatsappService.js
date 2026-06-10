@@ -16,7 +16,7 @@ const fs = require("fs");
 const pino = require("pino");
 const EventEmitter = require("events");
 const { getAutoReply } = require("./autoReply");
-const { acumularMensaje } = require("./geminiService");
+const { acumularMensaje } = require("./Geminiservice");
 
 const SESSION_PATH = path.join(__dirname, "sessions");
 const waEvents = new EventEmitter();

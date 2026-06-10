@@ -11,7 +11,7 @@
  * ⚠️  IMPORTANTE: getAutoReply ahora es ASYNC, actualiza tus await en whatsappService.js
  */
 
-const { getGeminiReply } = require("./geminiService");
+const { getGeminiReply } = require("./Geminiservice");
 
 // ─────────────────────────────────────────────────────────────
 // GUIÓN DE FALLBACK (se usa si Gemini no está disponible)

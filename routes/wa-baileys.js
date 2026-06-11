@@ -137,32 +137,63 @@ router.post('/guion/test', waAuth, async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────
-// ✅ NUEVO — POST /api/baileys/reservas/:id/confirmar
+// POST /api/baileys/reservas/:id/confirmar
 //
-// Aprueba una reserva en BD y envía el ticket al cliente por Baileys.
-// El frontend (GestionReservas) genera las imágenes y las manda en base64.
+// AUTH dual: acepta JWT (Bearer) o WA_SECRET_KEY (x-wa-key)
+// El frontend React manda el token JWT; el HTML de pruebas usa x-wa-key.
 //
 // Body JSON:
 // {
 //   nota?:          string
-//   ticketsBase64?: string[]   ← imágenes PNG en base64 (data:image/png;base64,...)
-//   pdfBase64?:     string     ← PDF en base64 para múltiples tickets
-//   mensajeTexto:   string     ← texto del mensaje de confirmación
+//   ticketsBase64?: string[]   ← base64 (fallback)
+//   ticketUrls?:    string[]   ← URLs de Cloudinary (preferido)
+//   pdfBase64?:     string
+//   mensajeTexto:   string
 // }
+// El endpoint también extrae URLs de Cloudinary del propio mensajeTexto.
 // ────────────────────────────────────────────────────────────
-router.post('/reservas/:id/confirmar', authMiddleware, async (req, res) => {
-  const { id }              = req.params;
-  const { nota, ticketsBase64 = [], pdfBase64, mensajeTexto } = req.body;
+function authDual(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const jwt = require('jsonwebtoken');
+      req.user = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET || 'secret');
+      return next();
+    } catch (_) {}
+  }
+  const secret = process.env.WA_SECRET_KEY;
+  if (secret && req.headers['x-wa-key'] === secret) return next();
+  if (!secret && !authHeader) return next(); // sin seguridad configurada → permitir
+  return res.status(401).json({ error: 'Token no proporcionado o inválido.' });
+}
+
+function extraerUrlsDelMensaje(texto) {
+  const cloudinary = texto.match(/https:\/\/res\.cloudinary\.com\/[^\s\n]+/g) || [];
+  const otras      = texto.match(/https:\/\/[^\s\n]+\.(?:png|jpg|jpeg|webp)/gi) || [];
+  return [...new Set([...cloudinary, ...otras])];
+}
+
+router.post('/reservas/:id/confirmar', authDual, async (req, res) => {
+  const { id } = req.params;
+  const { nota, ticketsBase64 = [], ticketUrls = [], pdfBase64, mensajeTexto } = req.body;
 
   if (!mensajeTexto) {
     return res.status(400).json({ error: "Se requiere 'mensajeTexto'." });
   }
 
+  // Resolver imágenes: URLs > base64 > extraídas del mensaje
+  const imagenesParaWA = ticketUrls.length > 0
+    ? ticketUrls
+    : ticketsBase64.length > 0
+      ? ticketsBase64
+      : extraerUrlsDelMensaje(mensajeTexto);
+
+  console.log(`📋 [Confirmar] ${id} — ${imagenesParaWA.length} imagen(es)`);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Obtener reserva (y hermanas del mismo cliente en la misma rifa)
     const rRes = await client.query(
       `SELECT rc.*, r.nombre AS rifa_nombre, r.premio, r.fecha_sorteo::text AS fecha_sorteo
          FROM reservas_cliente rc
@@ -170,92 +201,50 @@ router.post('/reservas/:id/confirmar', authMiddleware, async (req, res) => {
         WHERE rc.id = $1`,
       [id]
     );
-    if (!rRes.rows.length) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Reserva no encontrada.' });
-    }
+    if (!rRes.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Reserva no encontrada.' }); }
     const reserva = rRes.rows[0];
 
-    if (reserva.estado === 'aprobado') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Esta reserva ya fue aprobada.' });
-    }
+    if (reserva.estado === 'aprobado') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Reserva ya aprobada.' }); }
 
-    // 2. Buscar reservas hermanas (mismo cliente + misma rifa + pendiente)
     const herRes = await client.query(
       `SELECT id FROM reservas_cliente
-        WHERE rifa_id = $1
-          AND LOWER(TRIM(nombre_cliente)) = LOWER(TRIM($2))
-          AND estado = 'pendiente'
-          AND id != $3`,
+        WHERE rifa_id = $1 AND LOWER(TRIM(nombre_cliente)) = LOWER(TRIM($2))
+          AND estado = 'pendiente' AND id != $3`,
       [reserva.rifa_id, reserva.nombre_cliente, id]
     );
     const idsAprobar = [id, ...herRes.rows.map(r => r.id)];
 
-    // 3. Aprobar todas
     await client.query(
-      `UPDATE reservas_cliente
-          SET estado = 'aprobado', nota_admin = $1, updated_at = NOW()
-        WHERE id = ANY($2::uuid[])`,
+      `UPDATE reservas_cliente SET estado = 'aprobado', nota_admin = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
       [nota || null, idsAprobar]
     );
-
     await client.query('COMMIT');
+    console.log(`✅ [Confirmar] ${idsAprobar.length} reserva(s) aprobada(s) en BD`);
 
-    // 4. Enviar por WhatsApp si hay teléfono
-    let waSent = false;
-    let waError = null;
+    let waSent = false, waError = null;
 
     if (reserva.telefono) {
       try {
         const pdfBuffer = pdfBase64
           ? Buffer.from(pdfBase64.includes(',') ? pdfBase64.split(',')[1] : pdfBase64, 'base64')
           : null;
-
-        await sendTicketConfirmacion(
-          reserva.telefono,
-          mensajeTexto,
-          ticketsBase64,
-          pdfBuffer
-        );
+        await sendTicketConfirmacion(reserva.telefono, mensajeTexto, imagenesParaWA, pdfBuffer);
         waSent = true;
+        console.log(`📲 [Confirmar] WA enviado a ${reserva.telefono}`);
       } catch (waErr) {
-        console.error('⚠️  [Confirmar] Error enviando WA:', waErr.message);
+        console.error('⚠️  [Confirmar] Error WA:', waErr.message);
         waError = waErr.message;
-        // No hacemos rollback — la reserva ya fue aprobada; solo informamos el error de WA
       }
     }
 
-    res.json({
-      ok: true,
-      aprobados: idsAprobar.length,
-      ids: idsAprobar,
-      waSent,
-      waError: waError || undefined,
-      sinTelefono: !reserva.telefono,
-    });
+    res.json({ ok: true, aprobados: idsAprobar.length, ids: idsAprobar, waSent, waError: waError || undefined, sinTelefono: !reserva.telefono, imagenesEnviadas: imagenesParaWA.length });
 
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('❌ [Confirmar] Error:', err.message);
+    console.error('❌ [Confirmar] Error BD:', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
-
-// ────────────────────────────────────────────────────────────
-// ✅ NUEVO — POST /api/baileys/send/ticket
-//
-// Envía ticket(s) a un número sin modificar BD.
-// Útil para reenvíos o pruebas.
-//
-// Body JSON:
-// {
-//   numero:         string
-//   mensajeTexto:   string
-//   ticketsBase64?: string[]
-//   pdfBase64?:     string
 // }
 // ────────────────────────────────────────────────────────────
 router.post('/send/ticket', authMiddleware, async (req, res) => {

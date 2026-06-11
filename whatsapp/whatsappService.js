@@ -315,61 +315,79 @@ async function sendImage(numero, imagen, caption = '') {
 }
 
 /**
- * ✅ NUEVO — Envía el ticket de confirmación a un cliente.
- * Envía primero el texto y luego cada imagen de ticket.
- * Si hay más de 1 ticket también envía el PDF.
+ * ✅ Envía el ticket de confirmación a un cliente.
  *
- * @param {string}   numero      — Teléfono del cliente
- * @param {string}   texto       — Mensaje de confirmación
- * @param {string[]} imagenesB64 — Array de base64 de imágenes de ticket
+ * Flujo:
+ *  1. Texto de confirmación
+ *  2. Imágenes de ticket — acepta URLs de Cloudinary (preferido) O base64
+ *  3. PDF adjunto (opcional)
+ *
+ * @param {string}   numero       — Teléfono del cliente (ej: "04241234567")
+ * @param {string}   texto        — Mensaje de confirmación
+ * @param {string[]} imagenes     — Array de URLs (https://...) O base64 (data:image/...)
  * @param {Buffer|null} pdfBuffer — PDF con todos los tickets (opcional)
  */
-async function sendTicketConfirmacion(numero, texto, imagenesB64 = [], pdfBuffer = null) {
+async function sendTicketConfirmacion(numero, texto, imagenes = [], pdfBuffer = null) {
   assertConnected();
   const jid = toJID(numero);
 
-  // 1. Enviar mensaje de texto
+  // 1. ── Texto de confirmación ─────────────────────────────
   await enqueue(async () => {
     await sock.sendMessage(jid, { text: texto });
-    console.log(`📤 [Ticket] Texto de confirmación → ${jid}`);
+    console.log(`📤 [Ticket] Texto → ${jid}`);
     return { ok: true };
   });
 
   await sleep(1000);
 
-  // 2. Enviar cada imagen de ticket
-  for (let i = 0; i < imagenesB64.length; i++) {
-    const imgB64 = imagenesB64[i];
-    const buffer = Buffer.from(imgB64.includes(',') ? imgB64.split(',')[1] : imgB64, 'base64');
+  // 2. ── Imágenes del ticket ────────────────────────────────
+  for (let i = 0; i < imagenes.length; i++) {
+    const src     = imagenes[i];
+    const caption = imagenes.length > 1
+      ? `🎟️ Ticket ${i + 1} de ${imagenes.length}`
+      : '🎟️ Tu ticket — ¡guárdalo!';
+
+    // Detectar si es URL de Cloudinary/https o base64
+    const esUrl = typeof src === 'string' && src.startsWith('http');
 
     await enqueue(async () => {
-      await sock.sendMessage(jid, {
-        image: buffer,
-        caption: imagenesB64.length > 1 ? `🎟️ Ticket ${i + 1} de ${imagenesB64.length}` : '🎟️ Tu ticket',
-        mimetype: 'image/png',
-      });
+      if (esUrl) {
+        // Enviar por URL directa — Baileys descarga la imagen por nosotros
+        await sock.sendMessage(jid, {
+          image: { url: src },
+          caption,
+          mimetype: 'image/png',
+        });
+        console.log(`🖼️  [Ticket] Imagen URL → ${jid} (${src.substring(0, 60)}…)`);
+      } else {
+        // Fallback: base64
+        const b64    = src.includes(',') ? src.split(',')[1] : src;
+        const buffer = Buffer.from(b64, 'base64');
+        await sock.sendMessage(jid, { image: buffer, caption, mimetype: 'image/png' });
+        console.log(`🖼️  [Ticket] Imagen base64 → ${jid}`);
+      }
       return { ok: true };
     });
 
-    if (i < imagenesB64.length - 1) await sleep(800);
+    if (i < imagenes.length - 1) await sleep(900);
   }
 
-  // 3. Si hay PDF, enviarlo también
+  // 3. ── PDF adjunto ────────────────────────────────────────
   if (pdfBuffer && pdfBuffer.length > 0) {
-    await sleep(800);
+    await sleep(900);
     await enqueue(async () => {
       await sock.sendMessage(jid, {
         document: pdfBuffer,
         mimetype: 'application/pdf',
         fileName: 'tickets-rifas-jordyn.pdf',
-        caption: `📄 Aquí tienes todos tus tickets en un PDF 🎉`,
+        caption: '📄 Todos tus tickets en PDF 🎉',
       });
       console.log(`📄 [Ticket] PDF → ${jid}`);
       return { ok: true };
     });
   }
 
-  console.log(`✅ [Ticket] Confirmación completa → ${jid} (${imagenesB64.length} imagen(es))`);
+  console.log(`✅ [Ticket] Confirmación completa → ${jid} (${imagenes.length} imagen(es))`);
   return { ok: true, to: jid };
 }
 

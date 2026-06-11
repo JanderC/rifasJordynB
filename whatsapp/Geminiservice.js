@@ -445,12 +445,55 @@ async function getGeminiReply(jid, incoming) {
   return reply;
 }
 
+// ─────────────────────────────────────────────────────────────
+// SYSTEM PROMPT editable en caliente (para el panel admin)
+// ─────────────────────────────────────────────────────────────
+let _activePrompt = SYSTEM_PROMPT;
+
+/**
+ * Permite cambiar el system prompt en caliente desde el panel admin.
+ * El cambio aplica a todas las conversaciones nuevas inmediatamente.
+ * Para persistirlo entre reinicios, guárdalo en BD o en un archivo.
+ */
+function setSystemPrompt(nuevoPrompt) {
+  if (nuevoPrompt && typeof nuevoPrompt === 'string' && nuevoPrompt.trim()) {
+    _activePrompt = nuevoPrompt.trim();
+    console.log(`✏️  [AI] System prompt actualizado (${_activePrompt.length} chars)`);
+  }
+}
+
+function getSystemPrompt() {
+  return _activePrompt;
+}
+
+// Patch: usar _activePrompt en getGeminiReply (reemplaza referencia a SYSTEM_PROMPT)
+const _originalGetGeminiReply = getGeminiReply;
+async function getGeminiReplyPatched(jid, incoming) {
+  if (!incoming || typeof incoming !== 'string') {
+    throw new Error('El mensaje entrante debe ser un string no vacío.');
+  }
+  const rifasCtx = await buildRifasContext(incoming);
+  const history  = getHistory(jid);
+  const messages = [
+    { role: 'system',    content: _activePrompt },
+    ...history,
+    { role: 'user',      content: `${incoming}\n\n${rifasCtx}` },
+  ];
+  const reply = await callGroqAPI(messages);
+  addToHistory(jid, 'user',      incoming);
+  addToHistory(jid, 'assistant', reply);
+  return reply;
+}
+
 module.exports = {
-  getGeminiReply,
-  acumularMensaje,      // ← exportado para usar en whatsappService.js
+  getGeminiReply:   getGeminiReplyPatched,
+  acumularMensaje,
   clearHistory,
   clearAllHistories,
   getHistoryStats,
   getRifasActivas,
   verificarNumero,
+  setSystemPrompt,          // ✅ nuevo — para actualizar el prompt desde el panel
+  getSystemPrompt,          // ✅ nuevo — para leer el prompt actual
+  SYSTEM_PROMPT,            // ✅ exportado para usarlo como fallback
 };

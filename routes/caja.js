@@ -658,21 +658,31 @@ router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
       GROUP BY nv.vendedor_id, u.nombre
     `, [rifaId]);
 
-    // 5. Para cada vendedor: buscar o crear su lote
+    // 5. Cargar estado de cuadre para saber si un vendedor ya cerró
+    const cuadreR = await client.query(
+      `SELECT vendedor_id::text, cuadrado, monto_cuadrado FROM caja_cuadre_vendedor WHERE rifa_id=$1`,
+      [rifaId]
+    );
+    const cuadreMap = {};
+    for (const row of cuadreR.rows) {
+      cuadreMap[row.vendedor_id] = { cuadrado: row.cuadrado, monto_cuadrado: row.monto_cuadrado };
+    }
+
+    // 6. Para cada vendedor: buscar o crear su lote
     const resultado = [];
     for (const v of vendsR.rows) {
       const totalNums = Number(v.total_numeros || 0);
       const porPagar  = precioConPct > 0 ? +(precioConPct * totalNums).toFixed(2) : 0;
 
-      // Buscar lote por vendedor_id
+      // Buscar lote por vendedor_id — traer todos los campos necesarios
       let loteR = await client.query(
-        `SELECT id, abono FROM caja_lotes WHERE semana_id=$1 AND vendedor_id=$2 LIMIT 1`,
+        `SELECT id, abono, por_pagar, pendiente, estado FROM caja_lotes WHERE semana_id=$1 AND vendedor_id=$2 LIMIT 1`,
         [semanaId, v.vendedor_id]
       );
       // Fallback por nombre (lotes viejos sin vendedor_id)
       if (!loteR.rows[0]) {
         loteR = await client.query(
-          `SELECT id, abono FROM caja_lotes WHERE semana_id=$1 AND vendedor_nombre=$2 LIMIT 1`,
+          `SELECT id, abono, por_pagar, pendiente, estado FROM caja_lotes WHERE semana_id=$1 AND vendedor_nombre=$2 LIMIT 1`,
           [semanaId, v.vendedor_nombre]
         );
         if (loteR.rows[0]) {
@@ -683,12 +693,18 @@ router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
       let lote;
       if (loteR.rows[0]) {
         lote = loteR.rows[0];
-        // Actualizar por_pagar con el precio actual (porcentaje puede haber cambiado)
-        if (porPagar > 0) {
+
+        // Solo recalcular por_pagar si el vendedor NO está cuadrado.
+        // Si ya cuadró, respetar el monto_cuadrado guardado para no pisar el cierre.
+        const yaCuadrado = cuadreMap[v.vendedor_id]?.cuadrado === true;
+        if (!yaCuadrado && porPagar > 0) {
           await client.query(
             `UPDATE caja_lotes SET por_pagar=$1, pendiente=GREATEST($1 - COALESCE(abono,0), 0) WHERE id=$2`,
             [porPagar, lote.id]
           );
+          // Reflejar los valores actualizados en el objeto local
+          lote.por_pagar = porPagar;
+          lote.pendiente = Math.max(porPagar - Number(lote.abono || 0), 0);
         }
       } else {
         const nuevoR = await client.query(`
@@ -696,24 +712,25 @@ router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
             (semana_id, vendedor_nombre, vendedor_id, numeros_fijos,
              cant_entregados, abono, por_pagar, pendiente, estado)
           VALUES ($1,$2,$3,true,$4,0,$5,$5,'pendiente')
-          RETURNING id, abono
+          RETURNING id, abono, por_pagar, pendiente, estado
         `, [semanaId, v.vendedor_nombre, v.vendedor_id, totalNums, porPagar]);
         lote = nuevoR.rows[0];
       }
 
-      const abono     = Number(lote.abono || 0);
-      const pendiente = porPagar > 0 ? Math.max(porPagar - abono, 0) : 0;
+      const abono     = Number(lote.abono     || 0);
+      const porPagarFinal = Number(lote.por_pagar || porPagar);
+      const pendiente = Number(lote.pendiente  ?? Math.max(porPagarFinal - abono, 0));
 
       resultado.push({
         lote_id:         lote.id,
         vendedor_id:     v.vendedor_id,
         vendedor_nombre: v.vendedor_nombre,
-        por_pagar:       porPagar,
+        por_pagar:       porPagarFinal,
         precio_ticket:   precioConPct,
         total_numeros:   totalNums,
         abono,
         pendiente,
-        estado: pendiente <= 0 && porPagar > 0 ? 'pagado' : abono > 0 ? 'parcial' : 'pendiente',
+        estado: lote.estado || (pendiente <= 0 && porPagarFinal > 0 ? 'pagado' : abono > 0 ? 'parcial' : 'pendiente'),
       });
     }
 

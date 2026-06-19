@@ -85,7 +85,7 @@ router.get('/rifas', async (req, res) => {
               FROM boleteria_numeros_extra bne2
               WHERE bne2.rifa_id = r.id
             ), 0)::numeric
-          ) / (power(10, COALESCE(r.cifras, 3)) / 100.0), 2
+          ) / (power(10, COALESCE(r.cifras, 3))::numeric / 100), 2
         ) AS porcentaje_comprado
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id

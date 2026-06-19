@@ -943,6 +943,43 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
       cuadre_notas:    cuadreMap[v.vendedor_id]?.notas           || null,
     }));
 
+    // 9. Incluir vendedores que tienen cuadre guardado pero ya no figuran
+    //    en los números (p. ej. cuadre manual o números reasignados).
+    const presentes = new Set(vendedoresConCuadre.map(v => v.vendedor_id));
+    const faltantes = cuadreR.rows
+      .map(r => r.vendedor_id)
+      .filter(vid => !presentes.has(vid));
+
+    if (faltantes.length) {
+      const namesR = await pool.query(
+        `SELECT id::text AS id, nombre FROM users WHERE id = ANY($1::uuid[])`,
+        [faltantes]
+      );
+      const nameMap = {};
+      for (const u of namesR.rows) nameMap[u.id] = u.nombre;
+
+      for (const vid of faltantes) {
+        const cm = cuadreMap[vid] || {};
+        vendedoresConCuadre.push({
+          vendedor_id:     vid,
+          vendedor_nombre: nameMap[vid] || 'Vendedor',
+          numeros:         [],
+          total_numeros:   0,
+          total_pagados:   0,
+          precio_por_num:  precioConPct,
+          total_cobrar:    0,
+          cobrado:         0,
+          deuda:           0,
+          cuadrado:        cm.cuadrado        || false,
+          pendiente_flag:  cm.pendiente_flag  || false,
+          monto_cuadrado:  cm.monto_cuadrado  || null,
+          nums_cuadrados:  cm.nums_cuadrados  || null,
+          monto_entregado: cm.monto_entregado || null,
+          cuadre_notas:    cm.notas           || null,
+        });
+      }
+    }
+
     res.json({
       rifa,
       porcentaje,

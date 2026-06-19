@@ -63,6 +63,7 @@ router.get('/rifas', async (req, res) => {
         r.loteria_ref, r.activa, r.imagen_url,
         COALESCE(r.tipo,   'sencilla') AS tipo,
         COALESCE(r.estado, 'activa')   AS estado,
+        COALESCE(r.cifras, 3)          AS cifras,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
         r.fecha_desactivacion_compra,
         r.fecha_eliminacion_pantalla,
@@ -84,7 +85,7 @@ router.get('/rifas', async (req, res) => {
               FROM boleteria_numeros_extra bne2
               WHERE bne2.rifa_id = r.id
             ), 0)::numeric
-          ) / 10, 2
+          ) / (power(10, COALESCE(r.cifras, 3)) / 100.0), 2
         ) AS porcentaje_comprado
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id
@@ -113,17 +114,63 @@ router.get('/rifas', async (req, res) => {
   }
 });
 
+/* ── GET /api/publico/rifas/:id/numero/:n  → estado de UN número ──
+   Pensado para rifas de 4 cifras (buscador). También sirve para 3. */
+router.get('/rifas/:id/numero/:n', async (req, res) => {
+  try {
+    const rifaR = await pool.query(
+      `SELECT COALESCE(tipo,'sencilla') AS tipo, COALESCE(cifras,3) AS cifras
+         FROM rifas WHERE id=$1`, [req.params.id]);
+    if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const { tipo, cifras } = rifaR.rows[0];
+    const maxRanuras = tipo === 'simultanea' ? 2 : 1;
+
+    const raw = String(req.params.n).replace(/\D/g, '');
+    if (!raw || raw.length > Number(cifras))
+      return res.status(400).json({ error: 'Número inválido' });
+    const numero = raw.padStart(Number(cifras), '0');
+
+    const [vend, resv, asig] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int n FROM ventas WHERE rifa_id=$1 AND numero=$2`, [req.params.id, numero]),
+      pool.query(`SELECT COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`, [req.params.id, numero]),
+      pool.query(`SELECT 1 FROM numeros_vendedor WHERE rifa_id=$1 AND numero=$2
+                  UNION SELECT 1 FROM boleteria_numeros_extra WHERE rifa_id=$1 AND numero=$2 LIMIT 1`,
+                 [req.params.id, numero]),
+    ]);
+
+    const vendidas   = vend.rows[0].n;
+    const pendientes = resv.rows[0].n;
+    const bloqueado  = asig.rows.length > 0;
+
+    let estado = 'disponible';
+    if (vendidas >= maxRanuras) estado = 'agotado';
+    else if (bloqueado)         estado = 'agotado';
+    else if (pendientes >= maxRanuras - vendidas) estado = 'reservado';
+    else if (vendidas >= 1)     estado = (maxRanuras > 1 ? 'disponible' : 'vendido_1');
+
+    res.json({ numero, estado, vendidas, pendientes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ── GET /api/publico/rifas/:id/numeros-disponibles ─────── */
 router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
   try {
     // 1. Tipo de rifa
     const rifaR = await pool.query(
-      `SELECT COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id = $1`,
+      `SELECT COALESCE(tipo, 'sencilla') AS tipo, COALESCE(cifras, 3) AS cifras FROM rifas WHERE id = $1`,
       [req.params.id]
     );
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     const esSimultanea = rifaR.rows[0].tipo === 'simultanea';
     const maxRanuras   = esSimultanea ? 2 : 1;
+    const cifras       = Number(rifaR.rows[0].cifras) || 3;
+
+    // Rifas de 4 cifras (0000-9999): NO se entrega cuadrícula de 10.000.
+    // El cliente usa el buscador puntual (GET /rifas/:id/numero/:n).
+    if (cifras >= 4) {
+      return res.json({ modo: 'buscador', cifras, numeros: [] });
+    }
 
     // 2. Ventas por número
     const vendidos = await pool.query(
@@ -361,7 +408,7 @@ router.post('/reservar', async (req, res) => {
   if (numeros.length > 50)
     return res.status(400).json({ error: 'Máximo 50 números por reserva' });
 
-  const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
+  const invalidos = numeros.filter(n => !/^\d{3,4}$/.test(String(n)));
   if (invalidos.length > 0)
     return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
 
@@ -379,6 +426,7 @@ router.post('/reservar', async (req, res) => {
     // ── Verificar que la compra esté activa ───────────
     const rifaCheck = await client.query(
       `SELECT COALESCE(tipo, 'sencilla') AS tipo,
+              COALESCE(cifras, 3) AS cifras,
               fecha_desactivacion_compra
        FROM rifas WHERE id=$1`,
       [rifa_id]
@@ -389,6 +437,17 @@ router.post('/reservar', async (req, res) => {
     }
 
     const { fecha_desactivacion_compra, tipo: tipoRifa } = rifaCheck.rows[0];
+    const cifrasRifa = Number(rifaCheck.rows[0].cifras) || 3;
+
+    // Normalizamos cada número a la cantidad de cifras de la rifa (000 / 0000)
+    for (let i = 0; i < numeros.length; i++) {
+      const raw = String(numeros[i]).replace(/\D/g, '');
+      if (!raw || raw.length > cifrasRifa) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Número fuera de rango para rifa de ${cifrasRifa} cifras: ${numeros[i]}` });
+      }
+      numeros[i] = raw.padStart(cifrasRifa, '0');
+    }
     if (fecha_desactivacion_compra && new Date(fecha_desactivacion_compra) <= new Date()) {
       await client.query('ROLLBACK');
       return res.status(403).json({

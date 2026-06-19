@@ -1039,17 +1039,21 @@ router.put('/rifas/:rifaId/cobro-vendedores/porcentaje', async (req, res) => {
    Ambos pueden coexistir, pero semánticamente son excluyentes en la UI */
 router.put('/rifas/:rifaId/cuadre/:vendedorId', async (req, res) => {
   const { rifaId, vendedorId } = req.params;
-  const {
-    cuadrado        = false,
-    pendiente_flag  = false,
-    monto_cuadrado  = null,
-    nums_cuadrados  = null,
-    monto_entregado = null,
-    notas           = null,
-  } = req.body;
+  const b = req.body || {};
+
+  // Saneo defensivo: nunca dejamos pasar NaN al NUMERIC/INTEGER
+  const numOrNull = v => (v === null || v === undefined || v === '' || isNaN(Number(v)))    ? null : Number(v);
+  const intOrNull = v => (v === null || v === undefined || v === '' || isNaN(parseInt(v)))  ? null : parseInt(v, 10);
+
+  const cuadrado        = !!b.cuadrado;
+  const pendiente_flag  = !!b.pendiente_flag;
+  const monto_cuadrado  = numOrNull(b.monto_cuadrado);
+  const nums_cuadrados  = intOrNull(b.nums_cuadrados);
+  const monto_entregado = numOrNull(b.monto_entregado);
+  const notas           = b.notas ?? null;
 
   try {
-    await pool.query(`
+    const r = await pool.query(`
       INSERT INTO caja_cuadre_vendedor
         (rifa_id, vendedor_id, cuadrado, pendiente_flag, monto_cuadrado,
          nums_cuadrados, monto_entregado, notas, updated_at)
@@ -1063,14 +1067,13 @@ router.put('/rifas/:rifaId/cuadre/:vendedorId', async (req, res) => {
         monto_entregado = $7,
         notas           = $8,
         updated_at      = NOW()
-    `, [rifaId, vendedorId, !!cuadrado, !!pendiente_flag,
-        monto_cuadrado  || null,
-        nums_cuadrados  || null,
-        monto_entregado || null,
-        notas]);
+      RETURNING cuadrado, pendiente_flag, monto_cuadrado, nums_cuadrados, monto_entregado, notas
+    `, [rifaId, vendedorId, cuadrado, pendiente_flag, monto_cuadrado,
+        nums_cuadrados, monto_entregado, notas]);
 
-    res.json({ ok: true, rifa_id: rifaId, vendedor_id: vendedorId, cuadrado: !!cuadrado });
+    res.json({ ok: true, rifa_id: rifaId, vendedor_id: vendedorId, cuadre: r.rows[0] });
   } catch (e) {
+    console.error('[caja] cuadre PUT error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });

@@ -228,6 +228,7 @@ router.get('/', authMiddleware, async (req, res) => {
         r.premio_secundario,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
+        COALESCE(r.cifras,  3)          AS cifras,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
         COALESCE(COUNT(DISTINCT v.id), 0)::int AS total_ventas,
         COALESCE(SUM(v.precio_venta),  0)       AS ingresos_totales,
@@ -308,6 +309,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
         r.premio_secundario,
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
+        COALESCE(r.cifras,  3)          AS cifras,
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
         COALESCE(COUNT(DISTINCT v.id), 0)::int AS total_ventas,
         COALESCE(SUM(v.precio_venta),  0)       AS ingresos_totales,
@@ -358,10 +360,14 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     categoria_id          = null,
     ticket_template_id    = null,
     premio_secundario     = null,
+    cifras                = 3,
   } = req.body;
 
   if (!nombre || !premio || !precio)
     return res.status(400).json({ error: 'Nombre, premio y precio son requeridos' });
+
+  if (![3, 4].includes(Number(cifras)))
+    return res.status(400).json({ error: 'cifras debe ser 3 o 4' });
 
   const errOfertas = validarOfertas(ofertas);
   if (errOfertas) return res.status(400).json({ error: errOfertas });
@@ -381,13 +387,13 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
       `INSERT INTO rifas
          (nombre, descripcion, premio, precio, fecha_sorteo, hora_sorteo, loteria_ref,
           tipo, imagen_url, estado, ofertas, categoria_seleccionada_id, created_by,
-          ticket_template_id, premio_secundario)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          ticket_template_id, premio_secundario, cifras)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING
          id, nombre, descripcion, premio, precio,
          fecha_sorteo::text AS fecha_sorteo,
          hora_sorteo, loteria_ref, activa, imagen_url,
-         ticket_template_id, premio_secundario,
+         ticket_template_id, premio_secundario, cifras,
          tipo, estado, ofertas, ticket_design,
          categoria_seleccionada_id, created_by, created_at, updated_at`,
       [
@@ -399,6 +405,7 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
         req.user.id,
         ticket_template_id || null,
         premio_secundario  || null,
+        Number(cifras),
       ]
     );
 

@@ -6,7 +6,7 @@ const pool = new Pool({
   port: process.env.DB_PORT || 5432,
   database: process.env.DB_NAME || 'respaldo5',
   user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'p4ng34t3ch',
+  password: process.env.DB_PASSWORD || 'p4ng34t3ch2',
 });
 
 // Test de conexión

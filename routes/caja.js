@@ -77,6 +77,40 @@ async function getSemana(client, rifaId, userId, rifaNombre) {
   return n.rows[0].id;
 }
 
+// Devuelve el historial de abonos de uno o varios lotes.
+// La fecha se formatea en SQL (to_char) para que no la altere ninguna
+// conversión de zona horaria entre Postgres → Node → navegador.
+async function getAbonosDeLotes(client, loteIds) {
+  if (!loteIds || !loteIds.length) return {};
+  const r = await client.query(`
+    SELECT a.id,
+           a.lote_id::text AS lote_id,
+           a.monto,
+           a.nota,
+           a.created_at            AS fecha,
+           to_char(a.created_at, 'DD/MM/YYYY HH24:MI') AS fecha_txt,
+           u.nombre                AS registrado_por_nombre
+    FROM caja_abonos a
+    LEFT JOIN users u ON u.id = a.registrado_por
+    WHERE a.lote_id = ANY($1::uuid[])
+    ORDER BY a.created_at ASC, a.id ASC
+  `, [loteIds]);
+  const map = {};
+  for (const row of r.rows) {
+    if (!map[row.lote_id]) map[row.lote_id] = [];
+    map[row.lote_id].push({
+      id: row.id,
+      lote_id: row.lote_id,
+      monto: Number(row.monto || 0),
+      nota: row.nota || '',
+      fecha: row.fecha,
+      fecha_txt: row.fecha_txt,
+      registrado_por_nombre: row.registrado_por_nombre || null,
+    });
+  }
+  return map;
+}
+
 function parseNums(str) {
   if (!str) return [];
   const nums = new Set();
@@ -201,6 +235,12 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
     const cuadreMap = {};
     for (const row of cuadresR.rows) cuadreMap[row.vendedor_id] = row;
 
+    // Historial de abonos de todos los lotes de la semana (una sola query)
+    const lotesSemanaR = await client.query(
+      `SELECT id::text FROM caja_lotes WHERE semana_id=$1`, [semanaId]
+    );
+    const abonosMap = await getAbonosDeLotes(client, lotesSemanaR.rows.map(r => r.id));
+
     const vendedores = [];
     for (const v of vendsR.rows) {
       const c = cuadreMap[v.vendedor_id] || {};
@@ -227,6 +267,9 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
         monto_cuadrado:       c.monto_cuadrado  ?? null,
         nums_cuadrados:       c.nums_cuadrados  ?? null,
         monto_entregado:      c.monto_entregado ?? null,
+        abonos:               abonosMap[String(lote.id)] || [],
+        total_abonado:        (abonosMap[String(lote.id)] || [])
+                                .reduce((s, a) => s + Number(a.monto || 0), 0),
       });
     }
 
@@ -606,10 +649,17 @@ router.post('/abonos', async (req, res) => {
       WHERE id=$1
     `, [lote_id]);
     await recalcularLote(client, lote_id);
+
+    // Historial actualizado (dentro de la misma transacción)
+    const abonosMap = await getAbonosDeLotes(client, [lote_id]);
     await client.query('COMMIT');
 
     const loteR = await pool.query(`SELECT * FROM caja_lotes WHERE id=$1`, [lote_id]);
-    res.status(201).json({ abono: abonoR.rows[0], lote: loteR.rows[0] });
+    res.status(201).json({
+      abono: abonoR.rows[0],
+      lote:  loteR.rows[0],
+      abonos: abonosMap[String(lote_id)] || [],
+    });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[caja v5] /abonos:', e);
@@ -633,13 +683,134 @@ router.delete('/abonos/:id', async (req, res) => {
       WHERE id=$1
     `, [lote_id]);
     await recalcularLote(client, lote_id);
+    const abonosMap = await getAbonosDeLotes(client, [lote_id]);
     await client.query('COMMIT');
     const loteR = await pool.query(`SELECT * FROM caja_lotes WHERE id=$1`, [lote_id]);
-    res.json({ ok: true, lote: loteR.rows[0] });
+    res.json({ ok: true, lote: loteR.rows[0], abonos: abonosMap[String(lote_id)] || [] });
   } catch (e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
   } finally { client.release(); }
+});
+
+/* ══════════════════════════════════════════════════════════
+   HISTORIAL DE PAGOS
+   GET /api/caja/lotes/:loteId/abonos
+        → abonos de un lote puntual
+   GET /api/caja/rifas/:rifaId/vendedores/:vendedorId/abonos
+        → abonos de ese vendedor en esa rifa (todas sus semanas)
+   GET /api/caja/vendedores/:vendedorId/historial-pagos
+        → historial completo del vendedor en todas las rifas
+══════════════════════════════════════════════════════════ */
+router.get('/lotes/:loteId/abonos', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const loteR = await client.query(
+      `SELECT id, por_pagar, abono, pendiente, estado FROM caja_lotes WHERE id=$1`,
+      [req.params.loteId]
+    );
+    if (!loteR.rows[0]) return res.status(404).json({ error: 'Lote no encontrado' });
+    const map = await getAbonosDeLotes(client, [req.params.loteId]);
+    const abonos = map[String(req.params.loteId)] || [];
+    res.json({
+      lote: loteR.rows[0],
+      abonos,
+      total_abonado: abonos.reduce((s, a) => s + Number(a.monto || 0), 0),
+    });
+  } catch (e) {
+    console.error('[caja v5] /lotes/:id/abonos:', e);
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
+router.get('/rifas/:rifaId/vendedores/:vendedorId/abonos', async (req, res) => {
+  const { rifaId, vendedorId } = req.params;
+  try {
+    const r = await pool.query(`
+      SELECT a.id,
+             a.lote_id::text AS lote_id,
+             a.monto,
+             a.nota,
+             a.created_at AS fecha,
+             to_char(a.created_at, 'DD/MM/YYYY HH24:MI') AS fecha_txt,
+             u.nombre  AS registrado_por_nombre,
+             s.nombre  AS semana_nombre
+      FROM caja_abonos a
+      JOIN caja_lotes   l ON l.id = a.lote_id
+      JOIN caja_semanas s ON s.id = l.semana_id
+      LEFT JOIN users u ON u.id = a.registrado_por
+      WHERE s.rifa_id = $1 AND l.vendedor_id = $2
+      ORDER BY a.created_at ASC, a.id ASC
+    `, [rifaId, vendedorId]);
+    const abonos = r.rows.map(x => ({ ...x, monto: Number(x.monto || 0) }));
+    res.json({
+      abonos,
+      total_abonado: abonos.reduce((s, a) => s + a.monto, 0),
+    });
+  } catch (e) {
+    console.error('[caja v5] /vendedores/:id/abonos:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/vendedores/:vendedorId/historial-pagos', async (req, res) => {
+  const { vendedorId } = req.params;
+  try {
+    const r = await pool.query(`
+      SELECT a.id,
+             a.monto,
+             a.nota,
+             a.created_at AS fecha,
+             to_char(a.created_at, 'DD/MM/YYYY HH24:MI') AS fecha_txt,
+             r.id::text   AS rifa_id,
+             r.nombre     AS rifa_nombre,
+             r.fecha_sorteo,
+             s.nombre     AS semana_nombre,
+             l.id::text   AS lote_id,
+             l.por_pagar,
+             u.nombre     AS registrado_por_nombre
+      FROM caja_abonos a
+      JOIN caja_lotes   l ON l.id = a.lote_id
+      JOIN caja_semanas s ON s.id = l.semana_id
+      JOIN rifas        r ON r.id = s.rifa_id
+      LEFT JOIN users u ON u.id = a.registrado_por
+      WHERE l.vendedor_id = $1
+      ORDER BY a.created_at DESC, a.id DESC
+      LIMIT 500
+    `, [vendedorId]);
+
+    const porRifa = {};
+    for (const x of r.rows) {
+      if (!porRifa[x.rifa_id]) {
+        porRifa[x.rifa_id] = {
+          rifa_id: x.rifa_id,
+          rifa_nombre: x.rifa_nombre,
+          fecha_sorteo: x.fecha_sorteo,
+          total: 0,
+          abonos: [],
+        };
+      }
+      porRifa[x.rifa_id].total += Number(x.monto || 0);
+      porRifa[x.rifa_id].abonos.push({
+        id: x.id,
+        monto: Number(x.monto || 0),
+        nota: x.nota || '',
+        fecha: x.fecha,
+        fecha_txt: x.fecha_txt,
+        semana_nombre: x.semana_nombre,
+        lote_id: x.lote_id,
+        registrado_por_nombre: x.registrado_por_nombre || null,
+      });
+    }
+
+    res.json({
+      total_general: r.rows.reduce((s, x) => s + Number(x.monto || 0), 0),
+      rifas: Object.values(porRifa),
+    });
+  } catch (e) {
+    console.error('[caja v5] /historial-pagos:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ══════════════════════════════════════════════════════════

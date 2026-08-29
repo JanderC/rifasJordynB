@@ -117,9 +117,6 @@ app.listen(PORT, () => {
   console.log(`    GET/POST /api/whatsapp/plantillas     (Plantillas bot)`);
   console.log(`    GET/POST /api/whatsapp/flujo          (Guión bot)`);
   console.log("🎰  ══════════════════════════════════════");
-  startWhatsApp().catch((err) =>
-    console.error("❌ [WhatsApp] Error al iniciar Baileys:", err)
-  );
 });
 
 module.exports = app;

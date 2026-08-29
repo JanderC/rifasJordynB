@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 require('dotenv').config();
+//conexión a la db 
 
 const pool = new Pool({
   host: process.env.DB_HOST || '200.40.68.122',

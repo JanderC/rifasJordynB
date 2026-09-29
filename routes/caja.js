@@ -531,7 +531,8 @@ router.post('/rifas/:rifaId/cobro-vendedores/:vendedorId/pagar-numero', async (r
   const { numero, serie = 'A', pagado = true } = req.body;
   if (!numero) return res.status(400).json({ error: 'numero requerido' });
   try {
-    const numPad = String(numero).padStart(3, '0');
+    const rifaR  = await pool.query(`SELECT COALESCE(cifras, 3) AS cifras FROM rifas WHERE id = $1`, [rifaId]);
+    const numPad = String(numero).padStart(Number(rifaR.rows[0]?.cifras) || 3, '0');
     const pagado_at = pagado ? new Date() : null;
     await pool.query(`
       INSERT INTO caja_pagos_numero (rifa_id, vendedor_id, numero, serie, pagado, pagado_at)

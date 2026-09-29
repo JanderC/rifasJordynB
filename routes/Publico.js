@@ -221,8 +221,8 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
     // 5. Generar listado
     const numeros = [];
-    for (let i = 0; i < 1000; i++) {
-      const n       = String(i).padStart(3, '0');
+    for (let i = 0; i < 10 ** cifras; i++) {
+      const n       = String(i).padStart(cifras, '0');
       const c       = conteos[n] || { vendidas: 0, pendientes: 0 };
       const ocupadas = seriesOcupadas[n] || new Set();
 
@@ -292,7 +292,7 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 router.get('/rifas/:id/progreso', async (req, res) => {
   try {
     const rifaR = await pool.query(
-      `SELECT id, COALESCE(tipo, 'sencilla') AS tipo
+      `SELECT id, COALESCE(tipo, 'sencilla') AS tipo, COALESCE(cifras, 3) AS cifras
          FROM rifas
         WHERE id = $1`,
       [req.params.id]
@@ -300,7 +300,9 @@ router.get('/rifas/:id/progreso', async (req, res) => {
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
 
     const esSimultanea = rifaR.rows[0].tipo === 'simultanea';
-    const total        = esSimultanea ? 2000 : 1000;
+    // Terminal (2 cifras) = 100 números por serie; el resto se mantiene en 1000
+    const porSerie     = Number(rifaR.rows[0].cifras) === 2 ? 100 : 1000;
+    const total        = esSimultanea ? porSerie * 2 : porSerie;
 
     // Conteos en paralelo
     const [vendQ, resQ, asigQ] = await Promise.all([
@@ -408,7 +410,7 @@ router.post('/reservar', async (req, res) => {
   if (numeros.length > 50)
     return res.status(400).json({ error: 'Máximo 50 números por reserva' });
 
-  const invalidos = numeros.filter(n => !/^\d{3,4}$/.test(String(n)));
+  const invalidos = numeros.filter(n => !/^\d{2,4}$/.test(String(n)));
   if (invalidos.length > 0)
     return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
 

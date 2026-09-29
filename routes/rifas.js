@@ -97,6 +97,13 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
 
   if (vendedores_ids.length === 0) return;
 
+  // Rifas de terminal (00-99): los números fijos de categoría son de 3 cifras
+  // y no caben en la rifa. Los números se asignan a mano desde la boletería.
+  const cifrasR = await client.query(
+    `SELECT COALESCE(cifras, 3) AS cifras FROM rifas WHERE id = $1`, [rifa_id]
+  );
+  if (Number(cifrasR.rows[0]?.cifras) === 2) return;
+
   if (vendedores_categorias.length > 0) {
     const colCheck = await client.query(
       `SELECT 1 FROM information_schema.columns
@@ -366,8 +373,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   if (!nombre || !premio || !precio)
     return res.status(400).json({ error: 'Nombre, premio y precio son requeridos' });
 
-  if (![3, 4].includes(Number(cifras)))
-    return res.status(400).json({ error: 'cifras debe ser 3 o 4' });
+  if (![2, 3, 4].includes(Number(cifras)))
+    return res.status(400).json({ error: 'cifras debe ser 2, 3 o 4' });
 
   const errOfertas = validarOfertas(ofertas);
   if (errOfertas) return res.status(400).json({ error: errOfertas });
@@ -677,12 +684,14 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     const rifa_id = req.params.id;
 
     const rifaR = await pool.query(
-      `SELECT id, nombre, COALESCE(tipo, 'sencilla') AS tipo, categoria_seleccionada_id
+      `SELECT id, nombre, COALESCE(tipo, 'sencilla') AS tipo, categoria_seleccionada_id,
+              COALESCE(cifras, 3) AS cifras
        FROM rifas WHERE id = $1`,
       [rifa_id]
     );
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     const rifa         = rifaR.rows[0];
+    const cifras       = Number(rifa.cifras) || 3;
     const esSimultanea = rifa.tipo === 'simultanea';
 
     const vendR = await pool.query(`
@@ -770,8 +779,8 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       }
     });
 
-    for (let i = 0; i < 1000; i++) {
-      const numero   = String(i).padStart(3, '0');
+    for (let i = 0; i < 10 ** cifras; i++) {
+      const numero   = String(i).padStart(cifras, '0');
       const ocupadas = ocupadasPorNum[numero] || new Set();
       if (!ocupadas.has('A'))                disponiblesA.push(numero);
       if (esSimultanea && !ocupadas.has('B')) disponiblesB.push(numero);
@@ -780,6 +789,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
     res.json({
       rifa_id,
       tipo:             rifa.tipo,
+      cifras,
       es_simultanea:    esSimultanea,
       tiene_categoria:  !!rifa.categoria_seleccionada_id,
       vendedores:       vendR.rows,
@@ -801,22 +811,26 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
   if (!Array.isArray(numeros) || numeros.length === 0)
     return res.status(400).json({ error: 'numeros[] es requerido' });
 
-  const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
-  if (invalidos.length > 0)
-    return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const rifaR = await client.query(
-      `SELECT id, COALESCE(tipo,'sencilla') AS tipo, categoria_seleccionada_id
+      `SELECT id, COALESCE(tipo,'sencilla') AS tipo, categoria_seleccionada_id,
+              COALESCE(cifras, 3) AS cifras
        FROM rifas WHERE id = $1`,
       [rifa_id]
     );
     if (!rifaR.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+
+    const formato   = new RegExp(`^\\d{${Number(rifaR.rows[0].cifras) || 3}}$`);
+    const invalidos = numeros.filter(n => !formato.test(n));
+    if (invalidos.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Números con formato inválido: ${invalidos.join(', ')}` });
     }
     const { tipo, categoria_seleccionada_id } = rifaR.rows[0];
     const esSimultanea = tipo === 'simultanea';
@@ -1014,8 +1028,6 @@ router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, so
 router.get('/:id/numero/:n/disponibilidad', authMiddleware, soloDueno, async (req, res) => {
   const rifa_id = req.params.id;
   let numero = String(req.params.n).trim();
-  // Normalizar a 3 dígitos (000-999)
-  if (/^\d+$/.test(numero)) numero = numero.padStart(3, '0');
 
   try {
     // 1. Obtener rifa
@@ -1023,7 +1035,7 @@ router.get('/:id/numero/:n/disponibilidad', authMiddleware, soloDueno, async (re
       `SELECT id, nombre, premio, precio, tipo,
               COALESCE(estado, 'activa') AS estado, activa,
               fecha_sorteo::text AS fecha_sorteo, hora_sorteo, loteria_ref,
-              categoria_seleccionada_id
+              categoria_seleccionada_id, COALESCE(cifras, 3) AS cifras
        FROM rifas WHERE id = $1`,
       [rifa_id]
     );
@@ -1031,6 +1043,9 @@ router.get('/:id/numero/:n/disponibilidad', authMiddleware, soloDueno, async (re
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
     const rifa = rifaR.rows[0];
+
+    // Normalizar a las cifras de la rifa (00 / 000 / 0000)
+    if (/^\d+$/.test(numero)) numero = numero.padStart(Number(rifa.cifras) || 3, '0');
 
     // Solo permitir consulta sobre rifas activas
     if (!rifa.activa || rifa.estado !== 'activa') {
@@ -1138,7 +1153,6 @@ router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) =>
   }
 
   let numero = String(numeroRaw).trim();
-  if (/^\d+$/.test(numero)) numero = numero.padStart(3, '0');
 
   const client = await pool.connect();
   try {
@@ -1148,7 +1162,7 @@ router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) =>
     const rifaR = await client.query(
       `SELECT id, nombre, premio, precio, tipo,
               COALESCE(estado, 'activa') AS estado, activa,
-              fecha_sorteo::text AS fecha_sorteo
+              fecha_sorteo::text AS fecha_sorteo, COALESCE(cifras, 3) AS cifras
        FROM rifas WHERE id = $1`,
       [rifa_id]
     );
@@ -1157,6 +1171,7 @@ router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) =>
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
     const rifa = rifaR.rows[0];
+    if (/^\d+$/.test(numero)) numero = numero.padStart(Number(rifa.cifras) || 3, '0');
     if (!rifa.activa || rifa.estado !== 'activa') {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Esta rifa no está activa' });

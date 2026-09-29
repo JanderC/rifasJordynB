@@ -2,6 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const { reemplazarBase64EnJson, CARPETAS } = require('../services/imagenes');
 
 // ── Clave usada en config_sistema ─────────────────────────
 const CONFIG_KEY = 'ticket_design_global';
@@ -40,6 +41,8 @@ router.put('/', authMiddleware, soloDueno, async (req, res) => {
   }
 
   try {
+    // Imágenes del diseño → Cloudinary (en la BD solo quedan URLs)
+    const designSinBase64 = await reemplazarBase64EnJson(design, { folder: CARPETAS.ticketDesigns });
     const r = await pool.query(
       `INSERT INTO config_sistema (clave, valor, descripcion, updated_by, updated_at)
        VALUES ($1, $2::jsonb, 'Diseño global del ticket de boleto', $3, NOW())
@@ -48,7 +51,7 @@ router.put('/', authMiddleware, soloDueno, async (req, res) => {
              updated_by = EXCLUDED.updated_by,
              updated_at = NOW()
        RETURNING updated_at`,
-      [CONFIG_KEY, JSON.stringify(design), req.user.id]
+      [CONFIG_KEY, JSON.stringify(designSinBase64), req.user.id]
     );
     res.json({ ok: true, updated_at: r.rows[0].updated_at });
   } catch (err) {

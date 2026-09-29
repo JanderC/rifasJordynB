@@ -2,6 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const { reemplazarBase64EnJson, CARPETAS } = require('../services/imagenes');
 
 // ── Helpers ───────────────────────────────────────────────
 const validateDesign = (design) => {
@@ -57,6 +58,15 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
   const err = validateDesign(design);
   if (err) return res.status(400).json({ error: err });
 
+  // Imágenes del diseño → Cloudinary (en la BD solo quedan URLs)
+  let designSinBase64;
+  try {
+    designSinBase64 = await reemplazarBase64EnJson(design, { folder: CARPETAS.ticketDesigns });
+  } catch (e) {
+    console.error('Error subiendo imágenes de plantilla a Cloudinary:', e);
+    return res.status(502).json({ error: 'No se pudieron subir las imágenes del diseño' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -73,7 +83,7 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
       [
         nombre.trim(),
         descripcion || null,
-        JSON.stringify(design),
+        JSON.stringify(designSinBase64),
         !!is_default,
         req.user.id,
       ]
@@ -100,6 +110,15 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   const err = validateDesign(design);
   if (err) return res.status(400).json({ error: err });
 
+  // Imágenes del diseño → Cloudinary (en la BD solo quedan URLs)
+  let designSinBase64;
+  try {
+    designSinBase64 = await reemplazarBase64EnJson(design, { folder: CARPETAS.ticketDesigns });
+  } catch (e) {
+    console.error('Error subiendo imágenes de plantilla a Cloudinary:', e);
+    return res.status(502).json({ error: 'No se pudieron subir las imágenes del diseño' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -123,7 +142,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
       [
         nombre.trim(),
         descripcion || null,
-        JSON.stringify(design),
+        JSON.stringify(designSinBase64),
         !!is_default,
         req.params.id,
       ]

@@ -9,6 +9,8 @@
 const router = require('express').Router();
 const pool   = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const { subirSiEsBase64, CARPETAS } = require('../services/imagenes');
+const { eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 
 function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
   if (!Array.isArray(ofertas) || ofertas.length === 0 || cantidad === 0)
@@ -420,6 +422,18 @@ router.post('/reservar', async (req, res) => {
   if (!comprobante_base64)
     return res.status(400).json({ error: 'El comprobante de pago es obligatorio para reservar' });
 
+  // El comprobante se sube UNA vez a Cloudinary y todas las filas guardan la URL
+  // (antes se guardaba el base64 completo repetido en cada número reservado).
+  let comprobanteUrl;
+  try {
+    comprobanteUrl = await subirSiEsBase64(comprobante_base64, { folder: CARPETAS.comprobantes });
+  } catch (e) {
+    console.error('[reservar] Error subiendo comprobante a Cloudinary:', e);
+    return res.status(502).json({ error: 'No se pudo subir el comprobante, intenta de nuevo' });
+  }
+  const comprobanteSubido = comprobanteUrl !== comprobante_base64;
+  let reservaConfirmada = false;
+
   const client = await pool.connect();
 
   try {
@@ -513,7 +527,7 @@ router.post('/reservar', async (req, res) => {
         correo?.trim() || null,
         telefono       || null,
         metodo_pago    || null,
-        comprobante_base64,
+        comprobanteUrl,
         comprobante_nombre || null,
       ]);
       reservasCreadas.push(r.rows[0]);
@@ -525,6 +539,7 @@ router.post('/reservar', async (req, res) => {
     }
 
     await client.query('COMMIT');
+    reservaConfirmada = true;
 
     const respuesta = {
       ok: true, reservas: reservasCreadas,
@@ -540,7 +555,13 @@ router.post('/reservar', async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
-  } finally { client.release(); }
+  } finally {
+    client.release();
+    // Si no se creó ninguna reserva, no dejamos el comprobante huérfano en Cloudinary
+    if (comprobanteSubido && !reservaConfirmada) {
+      eliminarImagen(extraerPublicId(comprobanteUrl));
+    }
+  }
 });
 
 /* ── GET /api/publico/reserva/:id ───────────────────────── */

@@ -8,6 +8,7 @@ const express = require('express');
 const router  = express.Router();
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const { subirSiEsBase64, reemplazarBase64EnJson, CARPETAS, TRANSFORM_RIFA } = require('../services/imagenes');
 
 /* ── Helper: valida array de ofertas ─────────────────────── */
 function validarOfertas(ofertas) {
@@ -381,6 +382,15 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
 
   const ofertasOrdenadas = [...ofertas].sort((a, b) => a.cantidad - b.cantidad);
 
+  // La imagen nunca se guarda en base64: se sube a Cloudinary y se guarda la URL
+  let imagenFinal;
+  try {
+    imagenFinal = await subirSiEsBase64(imagen_url, { folder: CARPETAS.rifas, transformation: TRANSFORM_RIFA });
+  } catch (err) {
+    console.error('Error subiendo imagen de rifa a Cloudinary:', err);
+    return res.status(502).json({ error: 'No se pudo subir la imagen de la rifa' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -406,7 +416,7 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
       [
         nombre, descripcion || null, premio, precio,
         fecha_sorteo || null, hora_sorteo || null, loteria_ref || null,
-        tipo, imagen_url, estado,
+        tipo, imagenFinal, estado,
         JSON.stringify(ofertasOrdenadas),
         categoria_id || null,
         req.user.id,
@@ -471,6 +481,15 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     ? JSON.stringify([...ofertas].sort((a, b) => a.cantidad - b.cantidad))
     : undefined;
 
+  // La imagen nunca se guarda en base64: se sube a Cloudinary y se guarda la URL
+  let imagenFinal;
+  try {
+    imagenFinal = await subirSiEsBase64(imagen_url, { folder: CARPETAS.rifas, transformation: TRANSFORM_RIFA });
+  } catch (err) {
+    console.error('Error subiendo imagen de rifa a Cloudinary:', err);
+    return res.status(502).json({ error: 'No se pudo subir la imagen de la rifa' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -512,7 +531,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         loteria_ref  ?? null,
         activa       ?? null,
         tipo         ?? null,
-        imagen_url   !== undefined ? imagen_url : null,
+        imagenFinal  !== undefined ? imagenFinal : null,
         estado       ?? null,
         ofertasOrdenadas ?? null,
         req.params.id,
@@ -655,10 +674,12 @@ router.put('/:id/ticket-design', authMiddleware, soloDueno, async (req, res) => 
   if (!ticket_design || typeof ticket_design !== 'object')
     return res.status(400).json({ error: 'ticket_design debe ser un objeto JSON' });
   try {
+    // Imágenes del diseño → Cloudinary (en la BD solo quedan URLs)
+    const designSinBase64 = await reemplazarBase64EnJson(ticket_design, { folder: CARPETAS.ticketDesigns });
     const result = await pool.query(
       `UPDATE rifas SET ticket_design = $1, updated_at = NOW()
        WHERE id = $2 RETURNING id, nombre, ticket_design`,
-      [JSON.stringify(ticket_design), req.params.id]
+      [JSON.stringify(designSinBase64), req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     res.json({

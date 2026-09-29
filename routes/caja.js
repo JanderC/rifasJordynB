@@ -30,39 +30,56 @@ async function recalcularLote(client, loteId) {
   return { porPagar, abono, pendiente, estado };
 }
 
-async function garantizarLote(client, rifaId, semanaId, vendedorId, vendedorNombre, porPagar) {
-  let r = await client.query(
-    `SELECT id, abono, por_pagar, pendiente, estado
-     FROM caja_lotes WHERE semana_id=$1 AND vendedor_id=$2 LIMIT 1`,
-    [semanaId, vendedorId]
-  );
-  if (r.rows[0]) {
-    const lote = r.rows[0];
-    const cR = await client.query(
-      `SELECT cuadrado FROM caja_cuadre_vendedor WHERE rifa_id=$1 AND vendedor_id=$2`,
-      [rifaId, vendedorId]
-    );
-    const cuadrado = cR.rows[0]?.cuadrado === true;
-    if (!cuadrado && porPagar > 0 && Number(lote.por_pagar) !== porPagar) {
-      await client.query(
-        `UPDATE caja_lotes
-         SET por_pagar=$1, pendiente=GREATEST($1 - COALESCE(abono,0), 0)
-         WHERE id=$2`,
-        [porPagar, lote.id]
-      );
-      lote.por_pagar = porPagar;
-      lote.pendiente = Math.max(porPagar - Number(lote.abono || 0), 0);
-    }
-    return lote;
+// Garantiza (en bloque) un lote por vendedor en la semana y sincroniza
+// su por_pagar si el vendedor no está cuadrado. Antes esto se hacía con
+// 2-3 queries POR VENDEDOR; con la BD remota (~350 ms por round-trip)
+// una rifa de 60+ vendedores tardaba casi un minuto. Ahora son como
+// máximo 3 queries sin importar cuántos vendedores haya.
+//   items: [{ vendedor_id, vendedor_nombre, porPagar, cuadrado }]
+//   devuelve: { [vendedor_id]: { id, abono, por_pagar, pendiente, estado } }
+async function sincronizarLotes(client, semanaId, items) {
+  if (!items.length) return {};
+
+  const existR = await client.query(`
+    SELECT DISTINCT ON (vendedor_id)
+           id::text, vendedor_id::text, abono, por_pagar, pendiente, estado
+    FROM caja_lotes
+    WHERE semana_id=$1 AND vendedor_id = ANY($2::uuid[])
+    ORDER BY vendedor_id, created_at, id
+  `, [semanaId, items.map(i => i.vendedor_id)]);
+  const lotes = {};
+  for (const row of existR.rows) lotes[row.vendedor_id] = row;
+
+  const nuevos = items.filter(i => !lotes[i.vendedor_id]);
+  const cambios = items.filter(i => {
+    const l = lotes[i.vendedor_id];
+    return l && !i.cuadrado && i.porPagar > 0 && Number(l.por_pagar) !== i.porPagar;
+  });
+
+  if (cambios.length) {
+    const upR = await client.query(`
+      UPDATE caja_lotes l
+      SET por_pagar=x.por_pagar, pendiente=GREATEST(x.por_pagar - COALESCE(l.abono,0), 0)
+      FROM unnest($1::uuid[], $2::numeric[]) AS x(id, por_pagar)
+      WHERE l.id = x.id
+      RETURNING l.id::text, l.vendedor_id::text, l.abono, l.por_pagar, l.pendiente, l.estado
+    `, [cambios.map(i => lotes[i.vendedor_id].id), cambios.map(i => i.porPagar)]);
+    for (const row of upR.rows) lotes[row.vendedor_id] = row;
   }
-  const n = await client.query(`
-    INSERT INTO caja_lotes
-      (semana_id, vendedor_nombre, vendedor_id, numeros_fijos,
-       cant_entregados, abono, por_pagar, pendiente, estado)
-    VALUES ($1,$2,$3,true,0,0,$4,$4,'pendiente')
-    RETURNING id, abono, por_pagar, pendiente, estado
-  `, [semanaId, vendedorNombre, vendedorId, porPagar]);
-  return n.rows[0];
+
+  if (nuevos.length) {
+    const insR = await client.query(`
+      INSERT INTO caja_lotes
+        (semana_id, vendedor_nombre, vendedor_id, numeros_fijos,
+         cant_entregados, abono, por_pagar, pendiente, estado)
+      SELECT $1, x.nombre, x.vendedor_id, true, 0, 0, x.por_pagar, x.por_pagar, 'pendiente'
+      FROM unnest($2::text[], $3::uuid[], $4::numeric[]) AS x(nombre, vendedor_id, por_pagar)
+      RETURNING id::text, vendedor_id::text, abono, por_pagar, pendiente, estado
+    `, [semanaId, nuevos.map(i => i.vendedor_nombre), nuevos.map(i => i.vendedor_id), nuevos.map(i => i.porPagar)]);
+    for (const row of insR.rows) lotes[row.vendedor_id] = row;
+  }
+
+  return lotes;
 }
 
 async function getSemana(client, rifaId, userId, rifaNombre) {
@@ -187,14 +204,19 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const rifaR = await client.query(`SELECT * FROM rifas WHERE id=$1`, [rifaId]);
+    // Rifa + configuración de porcentaje en un solo round-trip
+    const rifaR = await client.query(`
+      SELECT r.*, crc.porcentaje AS _cfg_porcentaje
+      FROM rifas r
+      LEFT JOIN caja_rifa_config crc ON crc.rifa_id = r.id
+      WHERE r.id=$1
+    `, [rifaId]);
     if (!rifaR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Rifa no encontrada' }); }
-    const rifa = rifaR.rows[0];
+    const { _cfg_porcentaje: cfgPorcentaje, ...rifa } = rifaR.rows[0];
     const precioBoleto = Number(rifa.precio || 0);
 
-    const cfgR = await client.query(`SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]);
-    const porcentaje = Number(cfgR.rows[0]?.porcentaje || 50);
-    if (!cfgR.rows[0]) {
+    const porcentaje = Number(cfgPorcentaje || 50);
+    if (cfgPorcentaje == null) {
       await client.query(`INSERT INTO caja_rifa_config (rifa_id,porcentaje) VALUES ($1,50) ON CONFLICT DO NOTHING`, [rifaId]);
     }
     const precioEfectivo = precioBoleto > 0 ? +(precioBoleto * porcentaje / 100).toFixed(2) : 0;
@@ -208,12 +230,16 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
     // extras o que aún no tenían ningún número cargado.
     // El conteo automático (fijos + extras) se trae aparte, solo como
     // referencia; nunca decide el por_pagar si hay un valor manual.
+    // Vendedores + conteo + cuadre en una sola query
     const vendsR = await client.query(`
       SELECT
         rvs.vendedor_id::text,
         u.nombre AS vendedor_nombre,
         u.cedula,
-        COALESCE(cnt.total_auto, 0)::int AS total_numeros_auto
+        COALESCE(cnt.total_auto, 0)::int AS total_numeros_auto,
+        ccv.cuadrado, ccv.pendiente_flag,
+        ccv.monto_cuadrado, ccv.nums_cuadrados, ccv.monto_entregado,
+        ccv.total_numeros_manual
       FROM rifa_vendedores_sel rvs
       JOIN users u ON u.id = rvs.vendedor_id
       LEFT JOIN (
@@ -222,51 +248,49 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
         WHERE rifa_id = $1
         GROUP BY vendedor_id
       ) cnt ON cnt.vendedor_id = rvs.vendedor_id
+      LEFT JOIN caja_cuadre_vendedor ccv
+        ON ccv.rifa_id = rvs.rifa_id AND ccv.vendedor_id = rvs.vendedor_id
       WHERE rvs.rifa_id = $1
       ORDER BY u.nombre
     `, [rifaId]);
 
-    const cuadresR = await client.query(`
-      SELECT vendedor_id::text, cuadrado, pendiente_flag,
-             monto_cuadrado, nums_cuadrados, monto_entregado, notas,
-             total_numeros_manual
-      FROM caja_cuadre_vendedor WHERE rifa_id=$1
-    `, [rifaId]);
-    const cuadreMap = {};
-    for (const row of cuadresR.rows) cuadreMap[row.vendedor_id] = row;
-
-    // Historial de abonos de todos los lotes de la semana (una sola query)
-    const lotesSemanaR = await client.query(
-      `SELECT id::text FROM caja_lotes WHERE semana_id=$1`, [semanaId]
-    );
-    const abonosMap = await getAbonosDeLotes(client, lotesSemanaR.rows.map(r => r.id));
-
-    const vendedores = [];
-    for (const v of vendsR.rows) {
-      const c = cuadreMap[v.vendedor_id] || {};
+    const calculados = vendsR.rows.map(v => {
       // El número manual (si existe) manda sobre el conteo automático.
-      const totalNumeros = c.total_numeros_manual != null
-        ? Number(c.total_numeros_manual)
+      const totalNumeros = v.total_numeros_manual != null
+        ? Number(v.total_numeros_manual)
         : v.total_numeros_auto;
       const porPagar = precioEfectivo > 0 ? +(precioEfectivo * totalNumeros).toFixed(2) : 0;
-      const lote = await garantizarLote(client, rifaId, semanaId, v.vendedor_id, v.vendedor_nombre, porPagar);
+      return { v, totalNumeros, porPagar };
+    });
+
+    const lotesMap = await sincronizarLotes(client, semanaId, calculados.map(({ v, porPagar }) => ({
+      vendedor_id: v.vendedor_id, vendedor_nombre: v.vendedor_nombre,
+      porPagar, cuadrado: v.cuadrado === true,
+    })));
+
+    // Historial de abonos de todos los lotes (una sola query)
+    const abonosMap = await getAbonosDeLotes(client, Object.values(lotesMap).map(l => l.id));
+
+    const vendedores = [];
+    for (const { v, totalNumeros } of calculados) {
+      const lote = lotesMap[v.vendedor_id];
       vendedores.push({
         vendedor_id:          v.vendedor_id,
         vendedor_nombre:      v.vendedor_nombre,
         cedula:               v.cedula || null,
         total_numeros:        totalNumeros,
         total_numeros_auto:   v.total_numeros_auto,
-        total_numeros_manual: c.total_numeros_manual ?? null,
+        total_numeros_manual: v.total_numeros_manual ?? null,
         lote_id:              lote.id,
         por_pagar:            Number(lote.por_pagar  || 0),
         abono:                Number(lote.abono      || 0),
         pendiente:            Number(lote.pendiente  || 0),
         estado_lote:          lote.estado || 'pendiente',
-        cuadrado:             c.cuadrado        || false,
-        pendiente_flag:       c.pendiente_flag  || false,
-        monto_cuadrado:       c.monto_cuadrado  ?? null,
-        nums_cuadrados:       c.nums_cuadrados  ?? null,
-        monto_entregado:      c.monto_entregado ?? null,
+        cuadrado:             v.cuadrado        || false,
+        pendiente_flag:       v.pendiente_flag  || false,
+        monto_cuadrado:       v.monto_cuadrado  ?? null,
+        nums_cuadrados:       v.nums_cuadrados  ?? null,
+        monto_entregado:      v.monto_entregado ?? null,
         abonos:               abonosMap[String(lote.id)] || [],
         total_abonado:        (abonosMap[String(lote.id)] || [])
                                 .reduce((s, a) => s + Number(a.monto || 0), 0),
@@ -323,7 +347,8 @@ router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
         rvs.vendedor_id::text,
         u.nombre AS vendedor_nombre,
         COALESCE(cnt.total_auto, 0)::int AS total_numeros_auto,
-        ccv.total_numeros_manual
+        ccv.total_numeros_manual,
+        ccv.cuadrado
       FROM rifa_vendedores_sel rvs
       JOIN users u ON u.id = rvs.vendedor_id
       LEFT JOIN (
@@ -334,17 +359,19 @@ router.get('/rifas/:rifaId/lotes-vendedores', async (req, res) => {
       WHERE rvs.rifa_id=$1
     `, [rifaId]);
 
-    const cuadreR = await client.query(
-      `SELECT vendedor_id::text, cuadrado FROM caja_cuadre_vendedor WHERE rifa_id=$1`, [rifaId]
-    );
-    const cuadreMap = {};
-    for (const row of cuadreR.rows) cuadreMap[row.vendedor_id] = row.cuadrado;
-
-    const lotes = [];
-    for (const v of vendsR.rows) {
+    const calculados = vendsR.rows.map(v => {
       const totalNumeros = v.total_numeros_manual != null ? Number(v.total_numeros_manual) : v.total_numeros_auto;
       const porPagar = precioConPct > 0 ? +(precioConPct * totalNumeros).toFixed(2) : 0;
-      const lote = await garantizarLote(client, rifaId, semanaId, v.vendedor_id, v.vendedor_nombre, porPagar);
+      return { v, totalNumeros, porPagar };
+    });
+    const lotesMap = await sincronizarLotes(client, semanaId, calculados.map(({ v, porPagar }) => ({
+      vendedor_id: v.vendedor_id, vendedor_nombre: v.vendedor_nombre,
+      porPagar, cuadrado: v.cuadrado === true,
+    })));
+
+    const lotes = [];
+    for (const { v, totalNumeros, porPagar } of calculados) {
+      const lote = lotesMap[v.vendedor_id];
       const abono = Number(lote.abono || 0);
       const porPagarFinal = Number(lote.por_pagar || porPagar);
       const pendiente = Number(lote.pendiente ?? Math.max(porPagarFinal - abono, 0));
@@ -374,35 +401,37 @@ router.get('/rifas/:rifaId/cobro-vendedores', async (req, res) => {
   const porcentajeParsed = Math.min(Math.max(Number(req.query.porcentaje) || 50, 1), 100);
 
   try {
-    const rifaR = await pool.query(`SELECT * FROM rifas WHERE id=$1`, [rifaId]);
+    // Queries independientes → en paralelo (cada una usa su propia conexión del pool)
+    const [rifaR, cfgR, vendR, pagosR, cuadreR] = await Promise.all([
+      pool.query(`SELECT * FROM rifas WHERE id=$1`, [rifaId]),
+      pool.query(`SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]),
+      pool.query(`
+        SELECT nv.vendedor_id, u.nombre AS vendedor_nombre,
+          JSON_AGG(JSON_BUILD_OBJECT(
+            'numero', LPAD(nv.numero::text,3,'0'), 'serie', COALESCE(nv.serie,'A'), 'origen','fijo'
+          ) ORDER BY nv.numero, nv.serie) AS numeros
+        FROM numeros_vendedor nv JOIN users u ON u.id=nv.vendedor_id
+        WHERE nv.rifa_id=$1 GROUP BY nv.vendedor_id, u.nombre ORDER BY u.nombre
+      `, [rifaId]),
+      pool.query(
+        `SELECT vendedor_id::text, numero, serie, pagado FROM caja_pagos_numero WHERE rifa_id=$1`, [rifaId]
+      ),
+      pool.query(`
+        SELECT vendedor_id::text, cuadrado, pendiente_flag,
+               monto_cuadrado, nums_cuadrados, monto_entregado, notas
+        FROM caja_cuadre_vendedor WHERE rifa_id=$1
+      `, [rifaId]),
+    ]);
     if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
     const rifa = rifaR.rows[0];
 
-    const cfgR = await pool.query(`SELECT porcentaje FROM caja_rifa_config WHERE rifa_id=$1`, [rifaId]);
     const porcentaje = req.query.porcentaje ? porcentajeParsed : Number(cfgR.rows[0]?.porcentaje || 50);
     const precioBoleto = Number(rifa.precio || 0);
     const precioConPct = +(precioBoleto * porcentaje / 100).toFixed(2);
 
-    const vendR = await pool.query(`
-      SELECT nv.vendedor_id, u.nombre AS vendedor_nombre,
-        JSON_AGG(JSON_BUILD_OBJECT(
-          'numero', LPAD(nv.numero::text,3,'0'), 'serie', COALESCE(nv.serie,'A'), 'origen','fijo'
-        ) ORDER BY nv.numero, nv.serie) AS numeros
-      FROM numeros_vendedor nv JOIN users u ON u.id=nv.vendedor_id
-      WHERE nv.rifa_id=$1 GROUP BY nv.vendedor_id, u.nombre ORDER BY u.nombre
-    `, [rifaId]);
-
-    const pagosR = await pool.query(
-      `SELECT vendedor_id::text, numero, serie, pagado FROM caja_pagos_numero WHERE rifa_id=$1`, [rifaId]
-    );
     const pagosMap = {};
     for (const p of pagosR.rows) pagosMap[`${p.vendedor_id}|${p.numero}|${p.serie}`] = p.pagado;
 
-    const cuadreR = await pool.query(`
-      SELECT vendedor_id::text, cuadrado, pendiente_flag,
-             monto_cuadrado, nums_cuadrados, monto_entregado, notas
-      FROM caja_cuadre_vendedor WHERE rifa_id=$1
-    `, [rifaId]);
     const cuadreMap = {};
     for (const row of cuadreR.rows) cuadreMap[row.vendedor_id] = row;
 
@@ -493,20 +522,25 @@ async function handleGuardarPorcentaje(req, res) {
           LEFT JOIN caja_cuadre_vendedor ccv ON ccv.rifa_id = rvs.rifa_id AND ccv.vendedor_id = rvs.vendedor_id
           WHERE rvs.rifa_id=$1
         `, [rifaId]);
-        for (const v of vendsR.rows) {
-          if (cuadrados.has(v.vendedor_id)) continue;
-          const total = v.total_numeros_manual != null ? Number(v.total_numeros_manual) : v.total_auto;
-          const nuevoPorPagar = +(precioEfectivo * total).toFixed(2);
+        // Un solo UPDATE para todos los vendedores no cuadrados
+        const aActualizar = vendsR.rows
+          .filter(v => !cuadrados.has(v.vendedor_id))
+          .map(v => {
+            const total = v.total_numeros_manual != null ? Number(v.total_numeros_manual) : v.total_auto;
+            return { vendedor_id: v.vendedor_id, por_pagar: +(precioEfectivo * total).toFixed(2) };
+          });
+        if (aActualizar.length) {
           await client.query(`
-            UPDATE caja_lotes
-            SET por_pagar=$1,
-                pendiente=GREATEST($1 - COALESCE(abono,0), 0),
+            UPDATE caja_lotes l
+            SET por_pagar=x.por_pagar,
+                pendiente=GREATEST(x.por_pagar - COALESCE(l.abono,0), 0),
                 estado=CASE
-                  WHEN GREATEST($1 - COALESCE(abono,0),0) <= 0 AND $1 > 0 THEN 'pagado'
-                  WHEN COALESCE(abono,0) > 0 THEN 'parcial'
+                  WHEN GREATEST(x.por_pagar - COALESCE(l.abono,0),0) <= 0 AND x.por_pagar > 0 THEN 'pagado'
+                  WHEN COALESCE(l.abono,0) > 0 THEN 'parcial'
                   ELSE 'pendiente' END
-            WHERE semana_id=$2 AND vendedor_id=$3
-          `, [nuevoPorPagar, semanaId, v.vendedor_id]);
+            FROM unnest($2::uuid[], $3::numeric[]) AS x(vendedor_id, por_pagar)
+            WHERE l.semana_id=$1 AND l.vendedor_id = x.vendedor_id
+          `, [semanaId, aActualizar.map(v => v.vendedor_id), aActualizar.map(v => v.por_pagar)]);
         }
       }
     }

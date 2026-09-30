@@ -133,6 +133,17 @@ async function procesar(jid, items) {
 }
 
 // ── Enviar respuesta como persona: "escribiendo…" y en partes ─
+// Markdown → formato de WhatsApp (**negrita** no existe allá: es *negrita*)
+function aFormatoWhatsApp(texto) {
+  return String(texto)
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    .replace(/__(.+?)__/g, '_$1_')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '$1: $2')
+    .replace(/^\s*[-*]\s+/gm, '• ')
+    .trim();
+}
+
 function dividir(texto) {
   const partes = String(texto).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
   if (partes.length <= 3) return partes;
@@ -141,7 +152,7 @@ function dividir(texto) {
 
 async function responder(jid, texto, cfg) {
   const cps = cfg.antiban.escribiendo_cps || 28;
-  const partes = dividir(texto);
+  const partes = dividir(aFormatoWhatsApp(texto));
   for (let i = 0; i < partes.length; i++) {
     const p = partes[i];
     const ms = Math.min(7000, Math.max(900, (p.length / cps) * 1000)) + azar(0, 600);
@@ -365,7 +376,9 @@ CÓMO VENDER
 
 FORMA DE ESCRIBIR
 - Mensajes cortos, máximo 2 o 3 frases. Si necesitas decir dos cosas distintas, sepáralas con una línea en blanco (cada párrafo se envía como un mensaje aparte).
-- Nada de listas numeradas ni negritas en cada línea. Escribe como en un chat real.
+- Nada de listas, viñetas ni títulos. Escribe como en un chat real, en frases.
+- Si quieres resaltar algo usa *un asterisco* (así es la negrita en WhatsApp), máximo una vez por mensaje.
+- Si hay varias rifas, menciónalas en una o dos frases con su premio y precio, sin fechas pasadas.
 ${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
 CONTEXTO DE ESTA CONVERSACIÓN
 - Fecha y hora en Venezuela: ${fmtFechaVE()}.
@@ -577,7 +590,7 @@ async function probarConversacion(mensajesPrueba) {
     ejecutar,
     maxPasos: 5,
   });
-  return { respuesta: texto, partes: dividir(texto || ''), llamadas };
+  return { respuesta: texto, partes: dividir(aFormatoWhatsApp(texto || '')), llamadas };
 }
 
 module.exports = { init, alRecibir, probarConversacion, HERRAMIENTAS };

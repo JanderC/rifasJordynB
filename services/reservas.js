@@ -66,6 +66,8 @@ async function rifasEnVenta(db = pool) {
      WHERE activa = true
        AND COALESCE(estado, 'activa') = 'activa'
        AND (fecha_desactivacion_compra IS NULL OR fecha_desactivacion_compra > NOW())
+       -- el bot no ofrece rifas cuyo sorteo ya pasó aunque sigan marcadas activas
+       AND (fecha_sorteo IS NULL OR fecha_sorteo >= (NOW() AT TIME ZONE 'America/Caracas')::date)
      ORDER BY fecha_sorteo NULLS LAST, created_at DESC`);
   return r.rows;
 }

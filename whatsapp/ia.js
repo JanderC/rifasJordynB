@@ -37,8 +37,9 @@ const PROVEEDORES = {
     nombre: 'Groq',
     base: 'https://api.groq.com/openai/v1',
     env: 'GROQ_API_KEY',
-    modeloDefecto: 'llama-3.3-70b-versatile',
-    nota: 'Gratis y muy rápido. Bloquea algunos países.',
+    modeloDefecto: 'openai/gpt-oss-120b',
+    modelosRespaldo: ['qwen/qwen3.8-27b', 'openai/gpt-oss-20b'],   // cada modelo tiene su propio cupo por minuto
+    nota: 'Gratis y muy rápido (cupo limitado por minuto). El servidor debe estar fuera de Venezuela.',
     urlClave: 'https://console.groq.com/keys',
   },
   openrouter: {
@@ -84,7 +85,29 @@ function aOpenAI(m) {
   };
 }
 
+// Reintenta si el proveedor dice "límite por minuto" (429) o falla temporalmente,
+// esperando lo que él indica. Si sigue limitado, prueba los modelos de respaldo.
 async function llamarOpenAI(cfg, cuerpo) {
+  const prov = PROVEEDORES[cfg.proveedor];
+  const modelos = [cuerpo.model, ...(prov.modelosRespaldo || []).filter((m) => m !== cuerpo.model)];
+  let ultimoError;
+  for (const model of modelos) {
+    for (let intento = 0; intento < 2; intento++) {
+      try {
+        return await llamarOpenAIUnaVez(cfg, { ...cuerpo, model });
+      } catch (e) {
+        ultimoError = e;
+        if (!e.reintentable) throw e;
+        const espera = Math.min(20, Number((e.message.match(/try again in ([\d.]+)s/i) || [])[1]) || 2 ** intento * 2);
+        if (e.status === 429 && espera > 8) break;      // cupo largo: mejor otro modelo
+        await new Promise((r) => setTimeout(r, espera * 1000 + 300));
+      }
+    }
+  }
+  throw ultimoError;
+}
+
+async function llamarOpenAIUnaVez(cfg, cuerpo) {
   const prov = PROVEEDORES[cfg.proveedor];
   const clave = claveDe(cfg);
   if (!clave) throw new ErrorIA(`Falta la API key de ${prov.nombre}.`);

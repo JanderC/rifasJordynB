@@ -28,6 +28,7 @@ const pool         = require('../config/db');
 const { cloudinary } = require('../config/cloudinary');
 const chats        = require('../services/waChats');
 const bot          = require('./bot');
+const envios       = require('./envios');
 const { obtenerConfig } = require('./botConfig');
 
 // La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
@@ -366,6 +367,8 @@ async function alRecibirMensaje(msg, tipoEvento) {
 
   // Solo mensajes nuevos de clientes van al bot (no el historial sincronizado)
   if (guardado && !deMi && tipoEvento === 'notify') {
+    // Si tenía tickets esperando (contacto frío), ahora que escribió salen ya
+    envios.clienteEscribio(jid).catch(() => {});
     bot.alRecibir({ mensaje: guardado.mensaje, chat: guardado.chat }).catch((e) => console.error('❌ [Bot]', e.message));
     waEvents.emit('mensaje', guardado);
   }
@@ -480,6 +483,15 @@ async function marcarChatLeido(jid) {
 }
 
 bot.init({ enviarTexto, escribiendo, leer, conectado: () => !!sock && connectionStatus === 'open' });
+
+// ¿El número tiene WhatsApp? (true/false; null si no se pudo saber)
+async function existeEnWhatsApp(jid) {
+  if (!sock || connectionStatus !== 'open') return null;
+  const [r] = await sock.onWhatsApp(String(jid).split('@')[0]);
+  return !!r?.exists;
+}
+
+envios.init({ enviarImagen, enviarTexto, escribiendo, existeEnWhatsApp, toJID, conectado: () => !!sock && connectionStatus === 'open' });
 
 // ── API usada por otras rutas ──────────────────────────────
 async function sendText(numero, mensaje) {

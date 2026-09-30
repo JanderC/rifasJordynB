@@ -60,10 +60,12 @@ router.get('/stream', (req, res) => {
   const onEstado  = (d) => enviar('estado', d);
   const onChat    = (d) => enviar('chat', d);
   const onReserva = (d) => enviar('reserva', d);
+  const onEnvio   = (d) => enviar('envio', d);
   bus.on('wa:mensaje', onMensaje);
   bus.on('wa:estado', onEstado);
   bus.on('wa:chat', onChat);
   bus.on('wa:reserva', onReserva);
+  bus.on('wa:envio', onEnvio);
   enviar('conexion', wa.getStatus());
   // Latido: mantiene viva la conexión a través de proxies y avisa el estado
   const latido = setInterval(() => enviar('conexion', wa.getStatus()), 20000);
@@ -74,6 +76,7 @@ router.get('/stream', (req, res) => {
     bus.off('wa:estado', onEstado);
     bus.off('wa:chat', onChat);
     bus.off('wa:reserva', onReserva);
+    bus.off('wa:envio', onEnvio);
   });
 });
 

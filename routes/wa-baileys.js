@@ -23,6 +23,7 @@ const multer  = require('multer');
 const pool    = require('../config/db');
 const { authMiddleware } = require('../middleware/auth');
 const { aprobarReservasTx, avisarAprobadas } = require('../services/reservas');
+const envios = require('../whatsapp/envios');
 
 const {
   sendText,
@@ -211,19 +212,21 @@ router.post('/reservas/:id/confirmar', waAuth, async (req, res) => {
     });
   }
 
-  // Enviar al chat de WhatsApp de donde vino la compra; si no, al teléfono
+  // El ticket NO se envía aquí: se encola y sale de forma dinámica (anti-bloqueo).
+  // Así aprobar es instantáneo y varias aprobaciones seguidas no generan ráfagas.
   const destino = reserva.wa_jid || reserva.telefono;
-  let waSent = false, waError = null;
+  let envio = null, waError = null;
   if (destino) {
+    // Foto de cada número aprobado (en su orden); si no vino emparejada, en el orden recibido
+    const porNumero = new Map((req.body.tickets || []).filter((x) => x?.url).map((x) => [String(x.numero).trim(), x.url]));
+    const tickets = porNumero.size
+      ? aprobadas.map((r) => ({ numero: String(r.numero).trim(), url: porNumero.get(String(r.numero).trim()) })).filter((x) => x.url)
+      : imagenesParaWA.filter((u) => /^https?:\/\//.test(u)).map((url, i) => ({ numero: String(aprobadas[i]?.numero || '').trim(), url }));
     try {
-      const pdfBuffer = pdfBase64
-        ? Buffer.from(pdfBase64.includes(',') ? pdfBase64.split(',')[1] : pdfBase64, 'base64')
-        : null;
-      await sendTicketConfirmacion(destino, mensajeTexto, imagenesParaWA, pdfBuffer);
-      waSent = true;
-    } catch (waErr) {
-      console.error('⚠️  [Confirmar] Error WA:', waErr.message);
-      waError = waErr.message;
+      envio = await envios.encolarTicket({ reservas: aprobadas, tickets, nota, destino });
+    } catch (e) {
+      console.error('⚠️  [Confirmar] No se pudo encolar el ticket:', e.message);
+      waError = e.message;
     }
   }
 
@@ -232,10 +235,15 @@ router.post('/reservas/:id/confirmar', waAuth, async (req, res) => {
     aprobados: aprobadas.length,
     ids: aprobadas.map((r) => r.id),
     auto_rechazados: autoRechazadas.length,
-    waSent, waError: waError || undefined,
+    envio,                                  // { id, estado: 'en_cola', frio, ... }
+    waEncolado: !!envio, waError: waError || undefined,
     sinTelefono: !destino,
-    imagenesEnviadas: waSent ? imagenesParaWA.length : 0,
   });
+});
+
+// Reintentar un envío de ticket que falló
+router.post('/envios/:id/reintentar', waAuth, async (req, res) => {
+  try { res.json(await envios.reintentar(Number(req.params.id))); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 module.exports = router;

@@ -22,6 +22,7 @@ const { obtenerConfig } = require('./botConfig');
 const ia = require('./ia');
 const metodosPago = require('../services/metodosPago');
 const dueno = require('./dueno');
+const envios = require('./envios');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -48,6 +49,36 @@ const pendientes = new Map();          // jid → { timer, items }
 const respuestasRecientes = new Map(); // jid → [timestamps] (anti-bucle)
 const avisosEnviados = new Map();      // `${tipo}|${jid}` → timestamp (no repetir avisos)
 const procesando = new Set();          // jids con un turno en curso
+
+// El cliente de la página escribe con su código de reserva: sus reservas quedan
+// unidas a este chat y, si su ticket esperaba en la cola, sale ya por aquí.
+async function vincularReservaWeb(jid, texto) {
+  const codigos = [...String(texto).matchAll(/#\s?([0-9a-f]{8})\b/gi)].map((m) => m[1].toLowerCase());
+  if (!codigos.length) return;
+  const r = await pool.query(`
+    UPDATE reservas_cliente rc SET wa_jid = $1
+     WHERE LEFT(rc.id::text, 8) = ANY($2) AND (rc.wa_jid IS NULL OR rc.wa_jid <> $1)
+       AND rc.created_at > NOW() - INTERVAL '60 days'
+     RETURNING rc.id`, [jid, codigos]);
+  if (!r.rows.length) return;
+  const ids = r.rows.map((x) => x.id);
+  await pool.query(`
+    UPDATE wa_envios SET jid = $1 WHERE reserva_ids && $2::uuid[] AND estado IN ('en_cola', 'esperando_cliente', 'error')`, [jid, ids]);
+  await envios.clienteEscribio(jid);
+}
+
+// Compras recientes del cliente (página o WhatsApp) para que la IA sepa qué tiene
+async function reservasDelCliente(chat) {
+  const r = await pool.query(`
+    SELECT TRIM(rc.numero) AS numero, rc.estado, r.nombre AS rifa
+      FROM reservas_cliente rc JOIN rifas r ON r.id = rc.rifa_id
+     WHERE (rc.wa_jid = $1 OR ($2::text IS NOT NULL AND regexp_replace(rc.telefono, '\\D', '', 'g') = $2))
+       AND rc.estado IN ('pendiente', 'aprobado') AND rc.created_at > NOW() - INTERVAL '45 days'
+     ORDER BY rc.created_at DESC LIMIT 12`, [chat.jid, chat.telefono || null]);
+  if (!r.rows.length) return null;
+  const txt = { pendiente: 'pendiente de verificar el pago (el ticket le llega al aprobarse)', aprobado: 'aprobado (ya tiene su ticket)' };
+  return r.rows.map((x) => `${x.numero} en "${x.rifa}": ${txt[x.estado]}`).join('; ');
+}
 
 // Un cliente necesita a una persona: se marca en el panel y se le avisa al dueño
 async function marcarAtencion(jid, motivo, { pausarBot = false, notificar = true } = {}) {
@@ -77,6 +108,8 @@ async function alRecibir(item) {
     if (mensaje.texto) dueno.alRecibirDueno(mensaje.texto).catch((e) => console.error('❌ [Dueño]', e.message));
     return;
   }
+  // "Hola, reservé el 045 (reserva #AB12CD34)" desde la página: se une su reserva a este chat
+  if (mensaje.texto) await vincularReservaWeb(mensaje.jid, mensaje.texto).catch((e) => console.error('❌ [Bot] vincular reserva:', e.message));
   if (!cfg.activo || !chat?.bot_activo) return;
 
   // Mensajes viejos (llegaron mientras estábamos desconectados): no contestar
@@ -470,7 +503,7 @@ function describirEstado(ec, cfg) {
   return 'Sin compra en curso.';
 }
 
-function construirSistema(cfg, chat, notaDueno = null) {
+function construirSistema(cfg, chat, notaDueno = null, compras = null) {
   const nombreCliente = chat.nombre_guardado || chat.nombre;
   return `${cfg.personalidad}
 
@@ -495,7 +528,8 @@ FORMA DE ESCRIBIR
 ${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
 CONTEXTO DE ESTA CONVERSACIÓN
 - Fecha y hora en Venezuela: ${fmtFechaVE()}.
-- Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.
+- Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.${compras ? `
+- Sus compras recientes: ${compras}. Si pregunta por su ticket o su reserva, respóndele con esto.` : ''}
 - Estado: ${describirEstado(chat.estado_compra, cfg)}${notaDueno ? `
 
 INSTRUCCIÓN DE ${String(cfg.dueno?.nombre || 'el dueño').toUpperCase()} (el dueño) PARA ESTE CLIENTE
@@ -539,7 +573,7 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   let resultado;
   try {
     resultado = await ia.chatConHerramientas(cfg, {
-      system: construirSistema(cfg, chat, notaDueno),
+      system: construirSistema(cfg, chat, notaDueno, await reservasDelCliente(chat).catch(() => null)),
       mensajes,
       herramientas: HERRAMIENTAS,
       ejecutar: crearEjecutor(jid, chat, cfg, efectos),

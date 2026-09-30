@@ -55,6 +55,11 @@ const DEFECTO = {
     agrupar_ms: 6000,            // espera para juntar ráfagas del cliente en una sola respuesta
     ignorar_viejos_min: 10,      // no responder solo mensajes con más de X min (al reconectar)
     max_respuestas_5min: 8,      // si el bot responde más que esto en 5 min a un chat → pausa (anti-bucle)
+    // Tickets a clientes "fríos" (compraron por la página y nunca escribieron):
+    frio_espera_min_seg: 90,     // pausa aleatoria entre uno y otro
+    frio_espera_max_seg: 240,
+    frio_desde: '08:00',         // solo de día
+    frio_hasta: '20:30',
   },
 };
 

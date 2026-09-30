@@ -474,6 +474,16 @@ router.post('/reservar', async (req, res) => {
    Datos de pago + tasas del día. Fuente única que usan la
    pantalla del cliente y el bot de WhatsApp.
 ────────────────────────────────────────────────────────── */
+// Número de WhatsApp del negocio (para "Recibir mi ticket por WhatsApp"):
+// que el cliente escriba primero es la forma más segura de enviarle el ticket.
+router.get('/whatsapp-negocio', (req, res) => {
+  try {
+    const { getStatus } = require('../whatsapp/whatsappService');
+    const s = getStatus();
+    res.json({ numero: s.status === 'open' ? s.numeroConectado : null });
+  } catch (_) { res.json({ numero: null }); }
+});
+
 router.get('/metodos-pago', async (req, res) => {
   try {
     res.json({ metodos: METODOS_PAGO, tasas: await obtenerTasas() });
@@ -536,9 +546,16 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
       SELECT rc.*,
              r.nombre AS rifa_nombre, r.precio, r.premio,
              ${FECHA_SQL('r')},
-             COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
+             COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
+             env.id AS envio_id, env.estado AS envio_estado, env.error AS envio_error,
+             env.frio AS envio_frio, env.enviado_at AS envio_enviado_at
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
+      -- Estado del envío del ticket por WhatsApp (cola anti-bloqueo)
+      LEFT JOIN LATERAL (
+        SELECT e.id, e.estado, e.error, e.frio, e.enviado_at FROM wa_envios e
+         WHERE rc.id = ANY(e.reserva_ids) ORDER BY e.id DESC LIMIT 1
+      ) env ON TRUE
       ${estado && estado !== 'todos' ? 'WHERE rc.estado=$1' : "WHERE rc.estado <> 'apartado'"}   -- los apartados sin comprobante no se aprueban
       ORDER BY rc.created_at DESC
     `, estado && estado !== 'todos' ? [estado] : []);

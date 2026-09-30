@@ -90,6 +90,13 @@ app.use((err, req, res, next) => {
 
 // ── Iniciar servidor ───────────────────────────────────────
 app.listen(PORT, () => {
+  // WhatsApp (Baileys) arranca solo con el servidor: si hay sesión guardada
+  // se reconecta sin escanear; si no, deja el QR listo en /api/baileys/qr.
+  // WA_AUTOSTART=false para no arrancarlo (p. ej. en local y no pelear la sesión).
+  if (process.env.WA_AUTOSTART !== 'false') {
+    startWhatsApp().catch((err) => console.error('❌ [WhatsApp] No se pudo iniciar:', err.message));
+  }
+
   console.log("");
   console.log("🎰  ══════════════════════════════════════");
   console.log("🎰       RIFAS JORDYN v2.0 — Backend     ");

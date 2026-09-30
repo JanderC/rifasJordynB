@@ -13,9 +13,9 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  Browsers,
 } = require('@whiskeysockets/baileys');
 
-const { Boom }    = require('@hapi/boom');
 const path        = require('path');
 const fs          = require('fs');
 const pino        = require('pino');
@@ -23,14 +23,21 @@ const EventEmitter = require('events');
 const { getAutoReply, procesarComprobante } = require('./autoReply');
 const { acumularMensaje }                   = require('./Geminiservice');
 
-const SESSION_PATH = path.join(__dirname, 'sessions');
+// La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
+// disco persistente si el servidor se redespliega.
+const SESSION_PATH = process.env.WA_SESSION_PATH || path.join(__dirname, 'sessions');
 const waEvents     = new EventEmitter();
 
 let sock             = null;
 let currentQR        = null;
-let connectionStatus = 'disconnected';
+let pairingCode      = null;   // { code, numero, at } — vinculación por número
+let connectionStatus = 'disconnected';   // 'disconnected' | 'connecting' | 'open' | 'replaced'
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
+let reconnectTimer   = null;
+let iniciando        = false;
+let ultimoError      = null;   // { code, motivo, at }
+let conectadoDesde   = null;
+const MAX_ESPERA_RECONEXION_MS = 60 * 1000;
 
 // ── Limpieza automática de sesión ──────────────────────────
 function clearSession() {
@@ -123,72 +130,145 @@ async function extractImageBase64(msg) {
 }
 
 // ── Inicio de WhatsApp ─────────────────────────────────────
+const MOTIVOS = {
+  [DisconnectReason.loggedOut]:           'Sesión cerrada desde el teléfono',
+  [DisconnectReason.connectionReplaced]:  'Se abrió la misma sesión en otro servidor',
+  [DisconnectReason.restartRequired]:     'Reinicio requerido tras vincular',
+  [DisconnectReason.timedOut]:            'Tiempo de espera agotado',
+  [DisconnectReason.connectionClosed]:    'Conexión cerrada',
+  [DisconnectReason.badSession]:          'Sesión dañada',
+  [DisconnectReason.forbidden]:           'Número bloqueado por WhatsApp',
+  [DisconnectReason.multideviceMismatch]: 'Versión de dispositivos incompatible',
+  [DisconnectReason.unavailableService]:  'Servicio de WhatsApp no disponible',
+};
+
+// Programa un (re)inicio; nunca hay dos pendientes a la vez
+function programarInicio(ms) {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    startWhatsApp().catch((err) => {
+      console.error('❌ [WhatsApp] Error iniciando:', err.message);
+      ultimoError = { code: null, motivo: err.message, at: new Date() };
+      programarInicio(10000);
+    });
+  }, ms);
+}
+
+// Cierra el socket actual sin disparar su lógica de reconexión
+function soltarSocket() {
+  const s = sock;
+  sock = null;
+  if (!s) return null;
+  try { s.ev.removeAllListeners(); } catch (_) {}
+  return s;
+}
+
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
-  const { version }          = await fetchLatestBaileysVersion();
+  if (iniciando) return;
+  iniciando = true;
+  try {
+    clearTimeout(reconnectTimer);
+    const anterior = soltarSocket();
+    if (anterior) { try { anterior.end(undefined); } catch (_) {} }
 
-  sock = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: true,
-    auth: state,
-    browser: ['Windows', 'Chrome', '120.0.0'],
-    generateHighQualityLinkPreview: false,
-    retryRequestDelayMs: 2000,
-    maxMsgRetryCount: 2,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+    // Si WhatsApp no responde la versión, Baileys usa la que trae incluida
+    let version;
+    try { ({ version } = await fetchLatestBaileysVersion()); } catch (_) {}
 
-  // ── Conexión y QR ────────────────────────────────────────
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    connectionStatus = 'connecting';
+    sock = makeWASocket({
+      ...(version ? { version } : {}),
+      logger: pino({ level: 'silent' }),
+      auth: state,
+      browser: Browsers.windows('Chrome'),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      retryRequestDelayMs: 2000,
+      maxMsgRetryCount: 2,
+    });
+    const esteSock = sock;
 
-    if (qr) {
-      currentQR        = qr;
-      connectionStatus = 'connecting';
-      waEvents.emit('qr', qr);
-      console.log('📱 [WhatsApp] QR generado.');
-    }
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', (update) => {
+      if (esteSock !== sock) return;   // eventos de un socket viejo
+      onConnectionUpdate(update);
+    });
+    registrarMensajes(sock);
+  } finally {
+    iniciando = false;
+  }
+}
 
-    if (connection === 'open') {
-      currentQR        = null;
-      connectionStatus = 'open';
-      reconnectAttempts = 0;
-      waEvents.emit('ready');
-      console.log('✅ [WhatsApp] Conectado.');
-    }
+function onConnectionUpdate({ connection, lastDisconnect, qr }) {
+  if (qr) {
+    currentQR        = qr;
+    connectionStatus = 'connecting';
+    waEvents.emit('qr', qr);
+    console.log('📱 [WhatsApp] QR generado.');
+  }
 
-    if (connection === 'close') {
-      connectionStatus = 'disconnected';
-      waEvents.emit('disconnected');
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log(`⚠️  [WhatsApp] Desconectado. Código: ${reason}`);
+  if (connection === 'open') {
+    currentQR         = null;
+    pairingCode       = null;
+    connectionStatus  = 'open';
+    reconnectAttempts = 0;
+    ultimoError       = null;
+    conectadoDesde    = new Date();
+    waEvents.emit('ready');
+    console.log(`✅ [WhatsApp] Conectado como ${sock?.user?.id || '?'}.`);
+  }
 
-      if (reason === DisconnectReason.loggedOut) {
-        console.log('🚪 [WhatsApp] Sesión cerrada remotamente. Limpiando y reconectando...');
-        clearSession();
-        reconnectAttempts = 0;
-        await sleep(3000);
-        startWhatsApp();
-        return;
-      }
+  if (connection !== 'close') return;
 
-      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++;
-        const waitSec = Math.pow(2, reconnectAttempts) * 3;
-        console.log(`🔄 [WhatsApp] Intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} en ${waitSec}s...`);
-        await sleep(waitSec * 1000);
-        startWhatsApp();
-      } else {
-        console.log('❌ [WhatsApp] Máximo de reconexiones. Limpiando sesión...');
-        clearSession();
-        reconnectAttempts = 0;
-        waEvents.emit('session_expired');
-      }
-    }
-  });
+  const code   = lastDisconnect?.error?.output?.statusCode;
+  const motivo = MOTIVOS[code] || lastDisconnect?.error?.message || 'Desconocido';
+  currentQR        = null;
+  pairingCode      = null;
+  conectadoDesde   = null;
+  connectionStatus = 'disconnected';
+  ultimoError      = { code: code ?? null, motivo, at: new Date() };
+  waEvents.emit('disconnected');
+  console.log(`⚠️  [WhatsApp] Desconectado (${code}): ${motivo}`);
+
+  // Cerró sesión desde el teléfono: la sesión ya no sirve → nuevo QR
+  if (code === DisconnectReason.loggedOut) {
+    soltarSocket();
+    clearSession();
+    reconnectAttempts = 0;
+    programarInicio(2000);
+    return;
+  }
+
+  // Otra instancia (p. ej. el backend corriendo en local) tomó la sesión.
+  // No reconectamos solos para no pelear entre servidores.
+  if (code === DisconnectReason.connectionReplaced) {
+    soltarSocket();
+    connectionStatus = 'replaced';
+    return;
+  }
+
+  // Normal justo después de escanear: reiniciar de inmediato
+  if (code === DisconnectReason.restartRequired) {
+    programarInicio(0);
+    return;
+  }
+
+  // Cualquier otra caída: reintentar SIEMPRE, sin borrar la sesión
+  // (antes a los 5 intentos se borraba y había que volver a escanear).
+  reconnectAttempts++;
+  const espera = Math.min(MAX_ESPERA_RECONEXION_MS, 2000 * 2 ** Math.min(reconnectAttempts, 5));
+  console.log(`🔄 [WhatsApp] Reintento ${reconnectAttempts} en ${Math.round(espera / 1000)}s...`);
+  programarInicio(espera);
+}
+
+// Dentro del handler se usa `sock` (el socket vigente del módulo), no `s`:
+// si hubo una reconexión mientras se armaba la respuesta, se envía por la nueva.
+function registrarMensajes(s) {
 
   // ── Mensajes entrantes ────────────────────────────────────
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  s.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -261,8 +341,6 @@ async function startWhatsApp() {
       }
     }
   });
-
-  sock.ev.on('creds.update', saveCreds);
 }
 
 // ── Helpers ────────────────────────────────────────────────
@@ -275,7 +353,7 @@ function toJID(numero) {
 
 function assertConnected() {
   if (!sock || connectionStatus !== 'open') {
-    throw new Error('WhatsApp no está conectado. Escanea el QR primero.');
+    throw new Error('WhatsApp no está conectado. Vincúlalo desde WhatsApp → Conexión.');
   }
 }
 
@@ -397,9 +475,18 @@ function getStatus() {
     rateLimit.sentInWindow = 0;
     rateLimit.windowStart  = now;
   }
+  // El código de vinculación vence a los ~2 min (o antes si WhatsApp rota la conexión)
+  const codigoVigente = pairingCode && now - pairingCode.at < 2 * 60 * 1000 ? pairingCode : null;
   return {
     status: connectionStatus,
     hasQR: !!currentQR,
+    pairingCode: codigoVigente ? codigoVigente.code : null,
+    pairingNumero: codigoVigente ? codigoVigente.numero : null,
+    numeroConectado: sock?.user?.id ? sock.user.id.split(':')[0].split('@')[0] : null,
+    nombreConectado: sock?.user?.name || null,
+    conectadoDesde,
+    reintentos: reconnectAttempts,
+    ultimoError,
     queueLength: messageQueue.length,
     rateLimitInfo: {
       sentInLastMinute: rateLimit.sentInWindow,
@@ -415,30 +502,60 @@ async function getQRBase64() {
   return await QRCode.toDataURL(currentQR);
 }
 
-async function logout() {
-  if (sock) {
-    try { await sock.logout(); } catch (_) {}
-    sock             = null;
-    connectionStatus = 'disconnected';
-    currentQR        = null;
-    reconnectAttempts = 0;
+// Vincular sin QR: WhatsApp → Dispositivos vinculados → Vincular con número de teléfono
+async function requestPairingCode(numero) {
+  let n = String(numero || '').replace(/\D/g, '');
+  if (n.startsWith('0')) n = '58' + n.slice(1);   // mismo criterio que toJID
+  if (n.length < 10) throw new Error('Número inválido: incluye el código de país (ej. 584241234567).');
+  if (connectionStatus === 'open') throw new Error('WhatsApp ya está conectado.');
+
+  if (!sock) await startWhatsApp();
+  if (sock?.authState?.creds?.registered) {
+    throw new Error('Ya hay una sesión vinculada. Usa "Reset forzado" para vincular otro número.');
   }
-  clearSession();
+
+  // El código solo se puede pedir con el socket listo (cuando ya emitió QR)
+  const limite = Date.now() + 25000;
+  while (!currentQR && Date.now() < limite) await sleep(500);
+  if (!currentQR || !sock) throw new Error('WhatsApp aún no está listo, intenta de nuevo en unos segundos.');
+
+  const code = await sock.requestPairingCode(n);
+  pairingCode = { code, numero: n, at: Date.now() };
+  console.log(`🔢 [WhatsApp] Código de vinculación generado para ${n}.`);
+  return code;
 }
 
-async function resetAndReconnect() {
-  console.log('🔁 [WhatsApp] Reset forzado solicitado...');
-  if (sock) {
-    try { await sock.end(); } catch (_) {}
-    sock = null;
-  }
+// Reconectar con la sesión guardada (sin borrarla)
+function reconectar() {
+  reconnectAttempts = 0;
+  programarInicio(0);
+}
+
+// Cerrar sesión: desvincula el dispositivo y deja un QR nuevo listo
+async function logout() {
+  clearTimeout(reconnectTimer);
+  const s = soltarSocket();
+  if (s) { try { await s.logout(); } catch (_) {} }
   connectionStatus  = 'disconnected';
   currentQR         = null;
+  pairingCode       = null;
   reconnectAttempts = 0;
   clearSession();
-  await sleep(1000);
-  await startWhatsApp();
-  console.log('🔁 [WhatsApp] Reconectando con sesión limpia...');
+  programarInicio(1000);
+}
+
+// Reset forzado: borra la sesión local (sin avisar al teléfono) y pide QR nuevo
+async function resetAndReconnect() {
+  console.log('🔁 [WhatsApp] Reset forzado solicitado...');
+  clearTimeout(reconnectTimer);
+  const s = soltarSocket();
+  if (s) { try { s.end(undefined); } catch (_) {} }
+  connectionStatus  = 'disconnected';
+  currentQR         = null;
+  pairingCode       = null;
+  reconnectAttempts = 0;
+  clearSession();
+  programarInicio(1000);
 }
 
 module.exports = {
@@ -448,6 +565,8 @@ module.exports = {
   sendTicketConfirmacion,   // ✅ nuevo
   getStatus,
   getQRBase64,
+  requestPairingCode,
+  reconectar,
   logout,
   resetAndReconnect,
   clearSession,

@@ -36,6 +36,8 @@ const {
   sendTicketConfirmacion,
   getStatus,
   getQRBase64,
+  requestPairingCode,
+  reconectar,
   logout,
 } = require('../whatsapp/whatsappService');
 
@@ -51,13 +53,25 @@ const upload = multer({
   },
 });
 
-// ── Middleware de auth simple ───────────────────────────────
+// ── Middleware de auth para control de la conexión ──────────
+// Acepta el JWT del frontend (solo dueño) o la clave x-wa-key.
+// Antes solo aceptaba x-wa-key, y como el frontend manda el JWT,
+// /status y /qr respondían 401 y el QR nunca aparecía en pantalla.
+// Y si WA_SECRET_KEY estaba vacía quedaban abiertos a cualquiera
+// (cualquiera podía escanear el QR y quedarse con el WhatsApp).
 function waAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const jwt = require('jsonwebtoken');
+      req.user = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
+      if (req.user.rol !== 'dueno') return res.status(403).json({ error: 'Solo el dueño puede gestionar WhatsApp.' });
+      return next();
+    } catch (_) {}
+  }
   const secret = process.env.WA_SECRET_KEY;
-  if (!secret) return next();
-  const key = req.headers['x-wa-key'];
-  if (key !== secret) return res.status(401).json({ error: 'No autorizado.' });
-  next();
+  if (secret && req.headers['x-wa-key'] === secret) return next();
+  return res.status(401).json({ error: 'No autorizado.' });
 }
 
 // ────────────────────────────────────────────────────────────
@@ -112,6 +126,21 @@ router.post(
     } catch (err) { res.status(500).json({ error: err.message }); }
   }
 );
+
+// Vincular con código de 8 dígitos (sin escanear QR)
+// Body: { numero: "584241234567" }
+router.post('/pairing-code', waAuth, async (req, res) => {
+  try {
+    const code = await requestPairingCode(req.body?.numero);
+    res.json({ ok: true, code });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Reconectar con la sesión guardada (sin borrarla)
+router.post('/reconnect', waAuth, (req, res) => {
+  reconectar();
+  res.json({ ok: true, message: 'Reconectando…' });
+});
 
 router.post('/logout', waAuth, async (req, res) => {
   try {

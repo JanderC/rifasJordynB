@@ -15,6 +15,7 @@ const {
   crearReservasTx, aprobarReservasTx, rechazarReservasTx,
   avisarAprobadas, avisarRechazadas,
 } = require('../services/reservas');
+const { METODOS_PAGO, obtenerTasas } = require('../services/metodosPago');
 
 
 /* ─────────────────────────────────────────────────────────────
@@ -127,7 +128,7 @@ router.get('/rifas/:id/numero/:n', async (req, res) => {
 
     const [vend, resv, asig] = await Promise.all([
       pool.query(`SELECT COUNT(*)::int n FROM ventas WHERE rifa_id=$1 AND numero=$2`, [req.params.id, numero]),
-      pool.query(`SELECT COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`, [req.params.id, numero]),
+      pool.query(`SELECT COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`, [req.params.id, numero]),
       pool.query(`SELECT 1 FROM numeros_vendedor WHERE rifa_id=$1 AND numero=$2
                   UNION SELECT 1 FROM boleteria_numeros_extra WHERE rifa_id=$1 AND numero=$2 LIMIT 1`,
                  [req.params.id, numero]),
@@ -174,7 +175,7 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
     // 3. Reservas pendientes por número (contamos cuántas hay, no solo si existe una)
     const reservados = await pool.query(
-      `SELECT numero, COUNT(*) AS veces FROM reservas_cliente WHERE rifa_id=$1 AND estado='pendiente' GROUP BY numero`,
+      `SELECT numero, COUNT(*) AS veces FROM reservas_cliente WHERE rifa_id=$1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW())) GROUP BY numero`,
       [req.params.id]
     );
 
@@ -315,13 +316,13 @@ router.get('/rifas/:id/progreso', async (req, res) => {
         ? pool.query(
             `SELECT COUNT(*)::int AS n
                FROM reservas_cliente
-              WHERE rifa_id = $1 AND estado = 'pendiente'`,
+              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`,
             [req.params.id]
           )
         : pool.query(
             `SELECT COUNT(DISTINCT numero)::int AS n
                FROM reservas_cliente
-              WHERE rifa_id = $1 AND estado = 'pendiente'`,
+              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`,
             [req.params.id]
           ),
       // Números en poder de vendedores
@@ -469,6 +470,16 @@ router.post('/reservar', async (req, res) => {
   }
 });
 
+/* ── GET /api/publico/metodos-pago ─────────────────────────
+   Datos de pago + tasas del día. Fuente única que usan la
+   pantalla del cliente y el bot de WhatsApp.
+────────────────────────────────────────────────────────── */
+router.get('/metodos-pago', async (req, res) => {
+  try {
+    res.json({ metodos: METODOS_PAGO, tasas: await obtenerTasas() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ── GET /api/publico/reserva/:id ───────────────────────── */
 router.get('/reserva/:id', async (req, res) => {
   try {
@@ -528,7 +539,7 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
-      ${estado && estado !== 'todos' ? 'WHERE rc.estado=$1' : ''}
+      ${estado && estado !== 'todos' ? 'WHERE rc.estado=$1' : "WHERE rc.estado <> 'apartado'"}   -- los apartados sin comprobante no se aprueban
       ORDER BY rc.created_at DESC
     `, estado && estado !== 'todos' ? [estado] : []);
     res.json(r.rows);

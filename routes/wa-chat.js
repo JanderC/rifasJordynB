@@ -197,7 +197,7 @@ router.post('/bot/probar-conversacion', async (req, res) => {
   if (!mensajes.length || mensajes[mensajes.length - 1].role !== 'user') {
     return res.status(400).json({ error: 'El último mensaje debe ser del cliente.' });
   }
-  try { res.json(await bot.probarConversacion(mensajes)); }
+  try { res.json(await bot.probarConversacion(mensajes, req.body?.estado_compra || null)); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 

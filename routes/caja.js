@@ -344,10 +344,31 @@ router.get('/rifas/:rifaId/ventas-online', async (req, res) => {
     const redondear = (n) => +n.toFixed(2);
     porOrigen.web.monto = redondear(porOrigen.web.monto);
     porOrigen.whatsapp.monto = redondear(porOrigen.whatsapp.monto);
+
+    // Lo que viene en camino: comprobantes por aprobar y números apartados por el bot
+    const enCamino = await pool.query(`
+      SELECT COALESCE(rc.origen, 'web') AS origen, rc.estado, COUNT(*)::int AS numeros
+        FROM reservas_cliente rc
+       WHERE rc.rifa_id = $1
+         AND (rc.estado = 'pendiente' OR (rc.estado = 'apartado' AND rc.apartado_hasta > NOW()))
+       GROUP BY 1, 2`, [req.params.rifaId]);
+    const precioR = await pool.query(`SELECT precio FROM rifas WHERE id=$1`, [req.params.rifaId]);
+    const precio = Number(precioR.rows[0]?.precio || 0);
+    const pendientes = { web: { numeros: 0, monto: 0 }, whatsapp: { numeros: 0, monto: 0 } };
+    let apartadosWhatsapp = 0;
+    for (const row of enCamino.rows) {
+      const o = row.origen === 'whatsapp' ? 'whatsapp' : 'web';
+      if (row.estado === 'apartado') { apartadosWhatsapp += row.numeros; continue; }
+      pendientes[o].numeros += row.numeros;
+      pendientes[o].monto = redondear(pendientes[o].numeros * precio);
+    }
+
     res.json({
       total_numeros: ventas.length,
       total_monto: redondear(porOrigen.web.monto + porOrigen.whatsapp.monto),
       por_origen: porOrigen,
+      pendientes,                          // comprobantes recibidos, por aprobar en Reservas
+      apartados_whatsapp: apartadosWhatsapp, // bloqueados por el bot esperando comprobante
       ventas,
     });
   } catch (e) {

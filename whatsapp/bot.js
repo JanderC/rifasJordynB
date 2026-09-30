@@ -20,6 +20,7 @@ const chats = require('../services/waChats');
 const reservas = require('../services/reservas');
 const { obtenerConfig } = require('./botConfig');
 const ia = require('./ia');
+const metodosPago = require('../services/metodosPago');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -151,6 +152,16 @@ function dividir(texto) {
   return [...partes.slice(0, 2), partes.slice(2).join('\n\n')];
 }
 
+// Un mensaje tal cual, sin partir en párrafos (p. ej. los datos de pago)
+async function enviarBloque(jid, texto, cfg) {
+  const cps = cfg.antiban.escribiendo_cps || 28;
+  await transporte.escribiendo(jid, Math.min(5000, Math.max(900, (texto.length / (cps * 2)) * 1000)));
+  await transporte.enviarTexto(jid, texto, { autor: 'bot' });
+  const r = respuestasRecientes.get(jid) || [];
+  r.push(Date.now());
+  respuestasRecientes.set(jid, r.slice(-30));
+}
+
 async function responder(jid, texto, cfg) {
   const cps = cfg.antiban.escribiendo_cps || 28;
   const partes = dividir(aFormatoWhatsApp(texto));
@@ -202,7 +213,7 @@ const HERRAMIENTAS = [
   },
   {
     nombre: 'preparar_compra',
-    descripcion: 'Aparta la compra cuando ya tienes rifa, números disponibles y los datos del cliente. Devuelve el total a pagar y los datos de pago que debes enviarle al cliente. Después el cliente debe mandar la foto del comprobante.',
+    descripcion: 'Aparta (bloquea) los números para el cliente cuando ya tienes rifa, números disponibles, nombre y cédula. Si ya sabes cómo va a pagar, pasa metodo_pago y el SISTEMA le envía solo los datos de pago y el monto exacto. Después el cliente manda la captura del comprobante.',
     parametros: {
       type: 'object',
       properties: {
@@ -210,13 +221,23 @@ const HERRAMIENTAS = [
         numeros: { type: 'array', items: { type: 'string' } },
         nombre: { type: 'string', description: 'Nombre y apellido del cliente' },
         cedula: { type: 'string', description: 'Cédula de identidad del cliente' },
+        metodo_pago: { type: 'string', description: 'Pago Móvil, Nequi, Bancolombia o Zelle (opcional si aún no lo dijo)' },
       },
       required: ['rifa_id', 'numeros', 'nombre'],
     },
   },
   {
+    nombre: 'elegir_metodo_pago',
+    descripcion: 'Cuando el cliente dice con qué va a pagar (o cambia de método) en una compra ya apartada: el SISTEMA le envía los datos de pago y el monto exacto en la moneda de ese método.',
+    parametros: {
+      type: 'object',
+      properties: { metodo_pago: { type: 'string', description: 'Pago Móvil, Nequi, Bancolombia o Zelle' } },
+      required: ['metodo_pago'],
+    },
+  },
+  {
     nombre: 'cancelar_compra',
-    descripcion: 'Cancela la compra que estaba en curso (cuando el cliente ya no la quiere o quiere cambiar los números).',
+    descripcion: 'Cancela la compra apartada y libera los números (cuando el cliente ya no la quiere o quiere cambiar los números).',
     parametros: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -226,7 +247,7 @@ const HERRAMIENTAS = [
   },
   {
     nombre: 'pasar_a_humano',
-    descripcion: 'Pasa la conversación a una persona del equipo. Úsala si el cliente lo pide, está molesto, reclama un pago/premio, o no puedes resolver algo.',
+    descripcion: 'Pasa la conversación a una persona del equipo. Úsala SOLO si: el cliente pide explícitamente hablar con una persona, quiere pagar en efectivo, reclama un pago o un premio que no puedes verificar, o pregunta algo que no puedes responder con tus herramientas ni con la información del negocio. No la uses por dudas normales ni porque el cliente esté impaciente.',
     parametros: {
       type: 'object',
       properties: { motivo: { type: 'string' } },
@@ -240,7 +261,21 @@ async function rifaValida(rifaId) {
   return enVenta.find((r) => r.id === rifaId) || null;
 }
 
-function crearEjecutor(jid, chat, cfg, efectos) {
+// Envía los datos de pago y el monto EXACTOS (no los redacta la IA)
+async function prepararPago(metodo, ec, efectos) {
+  const tasas = await metodosPago.obtenerTasas();
+  const monto = metodosPago.montoEnMetodo(ec.total, metodo, tasas);
+  efectos.mensajePago = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });
+  return monto;
+}
+
+const NOTA_PAGO_ENVIADO = (min) =>
+  `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${min} minutos mientras paga.`;
+
+// prueba=true: modo simulador del panel (no escribe nada en la BD)
+function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
+  const minutos = cfg.apartado_minutos || 45;
+  const nombresMetodos = Object.keys(metodosPago.METODOS_PAGO);
   return async (nombre, args) => {
     try {
       switch (nombre) {
@@ -289,41 +324,95 @@ function crearEjecutor(jid, chat, cfg, efectos) {
           const nums = [...new Set((args.numeros || []).map((n) => reservas.normalizarNumero(n, rifa.cifras)).filter(Boolean))];
           if (!nums.length) return { error: 'No hay números válidos.' };
           if (nums.length > 20) return { error: 'Máximo 20 números por compra.' };
-          const occ = await reservas.ocupacionNumeros(pool, rifa, nums);
-          const ocupados = nums.filter((n) => !occ[n].disponible);
-          if (ocupados.length) return { error: 'Algunos números ya no están disponibles.', no_disponibles: ocupados };
-          if (!String(cfg.datos_pago || '').trim()) {
-            return { error: 'No hay datos de pago configurados. Usa pasar_a_humano para que una persona le pase los datos.' };
+          const metodo = args.metodo_pago ? metodosPago.normalizarMetodo(args.metodo_pago) : null;
+          if (args.metodo_pago && !metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
+          if (metodo && metodosPago.METODOS_PAGO[metodo].presencial) {
+            return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
+          }
+
+          // Si ya tenía números apartados (cambió de idea), se liberan primero
+          const ecPrevio = chat.estado_compra;
+          const apartadoHasta = new Date(Date.now() + minutos * 60000);
+          let idsApartados = [];
+          if (prueba) {
+            const occ = await reservas.ocupacionNumeros(pool, rifa, nums);
+            const ocupados = nums.filter((n) => !occ[n].disponible);
+            if (ocupados.length) return { error: 'Algunos números ya no están disponibles.', no_disponibles: ocupados };
+          } else {
+            if (ecPrevio?.paso === 'esperando_comprobante' && ecPrevio.reservas?.length) await reservas.liberarApartados(ecPrevio.reservas);
+            // Apartar = BLOQUEAR: desde ya nadie más puede tomarlos (ni por la página ni por WhatsApp)
+            const client = await pool.connect();
+            try {
+              await client.query('BEGIN');
+              const r = await reservas.crearReservasTx(client, {
+                rifa_id: rifa.id, numeros: nums, nombre_cliente: nombreCli, cedula, telefono: chat.telefono,
+                metodo_pago: metodo, comprobanteUrl: null, origen: 'whatsapp', wa_jid: jid,
+                estado: 'apartado', apartadoHasta,
+              });
+              if (!r.ok || r.conflictos.length) {
+                await client.query('ROLLBACK');
+                return { error: 'Algunos números ya no están disponibles.', no_disponibles: (r.conflictos || []).map((c) => c.numero) };
+              }
+              await client.query('COMMIT');
+              idsApartados = r.reservas.map((x) => x.id);
+            } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
           }
 
           const total = reservas.calcularPrecioReal(nums.length, rifa.ofertas, Number(rifa.precio));
-          const previo = chat.estado_compra?.paso === 'comprobante_sin_compra' ? chat.estado_compra.comprobante : null;
+          const previo = ecPrevio?.paso === 'comprobante_sin_compra' ? ecPrevio.comprobante : null;
           const estado = {
             paso: 'esperando_comprobante',
             rifa_id: rifa.id, rifa_nombre: rifa.nombre, numeros: nums,
-            nombre: nombreCli, cedula: cedula || null, total, desde: Date.now(),
+            nombre: nombreCli, cedula: cedula || null, total, metodo,
+            reservas: idsApartados, apartado_hasta: apartadoHasta.getTime(), desde: Date.now(),
           };
-          await chats.actualizarChat(jid, { estado_compra: estado });
+          if (metodo) estado.monto = await prepararPago(metodo, estado, efectos);
+          if (!prueba) await chats.actualizarChat(jid, { estado_compra: estado });
           chat.estado_compra = estado;
 
           // El cliente ya había mandado el comprobante antes: registrarlo ya
           if (previo && Date.now() - previo.at < 60 * 60000) {
             efectos.comprobantePrevio = previo;
+            delete efectos.mensajePago;
             return {
               ok: true, total_a_pagar: fmtMonto(total, cfg), numeros: nums,
               comprobante: 'El cliente YA envió una imagen de comprobante antes; el sistema la registrará automáticamente. Solo confírmale en una frase que ya la recibiste y que apenas se verifique el pago le llega su ticket.',
             };
           }
+          if (metodo) {
+            return { ok: true, numeros: nums, apartados_por_minutos: minutos, total: fmtMonto(total, cfg), monto_en_su_metodo: estado.monto.texto, nota: NOTA_PAGO_ENVIADO(minutos) };
+          }
           return {
-            ok: true, rifa: rifa.nombre, numeros: nums, total_a_pagar: fmtMonto(total, cfg),
-            datos_de_pago: cfg.datos_pago,
-            siguiente_paso: 'Envíale el total y los datos de pago y pídele que mande la captura del comprobante por aquí.',
+            ok: true, numeros: nums, apartados_por_minutos: minutos, total: fmtMonto(total, cfg),
+            metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial),
+            instruccion: 'Ya quedaron apartados. Pregúntale con qué método va a pagar y luego usa elegir_metodo_pago.',
           };
         }
+        case 'elegir_metodo_pago': {
+          const ec = chat.estado_compra;
+          if (ec?.paso !== 'esperando_comprobante') return { error: 'No hay una compra apartada. Usa preparar_compra primero.' };
+          const metodo = metodosPago.normalizarMetodo(args.metodo_pago);
+          if (!metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
+          if (metodosPago.METODOS_PAGO[metodo].presencial) {
+            return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
+          }
+          const monto = await prepararPago(metodo, ec, efectos);
+          const nuevo = { ...ec, metodo, monto };
+          if (!prueba) {
+            await chats.actualizarChat(jid, { estado_compra: nuevo });
+            if (ec.reservas?.length) await pool.query(`UPDATE reservas_cliente SET metodo_pago=$1 WHERE id = ANY($2)`, [metodo, ec.reservas]);
+          }
+          chat.estado_compra = nuevo;
+          const quedan = Math.max(1, Math.round((ec.apartado_hasta - Date.now()) / 60000));
+          return { ok: true, metodo, monto: monto.texto, nota: NOTA_PAGO_ENVIADO(quedan) };
+        }
         case 'cancelar_compra': {
-          await chats.actualizarChat(jid, { estado_compra: null });
+          if (!prueba) {
+            if (chat.estado_compra?.reservas?.length) await reservas.liberarApartados(chat.estado_compra.reservas);
+            await chats.actualizarChat(jid, { estado_compra: null });
+          }
           chat.estado_compra = null;
-          return { ok: true };
+          return { ok: true, nota: 'Números liberados.' };
         }
         case 'mis_compras': {
           const r = await pool.query(`
@@ -334,7 +423,7 @@ function crearEjecutor(jid, chat, cfg, efectos) {
           return { compras: r.rows.map((x) => ({ ...x, numero: String(x.numero).trim() })) };
         }
         case 'pasar_a_humano': {
-          await chats.actualizarChat(jid, { bot_activo: false, necesita_humano: true, motivo_humano: String(args.motivo || 'Pidió hablar con una persona').slice(0, 200) });
+          if (!prueba) await chats.actualizarChat(jid, { bot_activo: false, necesita_humano: true, motivo_humano: String(args.motivo || 'Pidió hablar con una persona').slice(0, 200) });
           efectos.pasadoAHumano = true;
           return { ok: true, instruccion: 'Dile en una frase corta que ya lo atiende una persona del equipo.' };
         }
@@ -351,8 +440,12 @@ function crearEjecutor(jid, chat, cfg, efectos) {
 // ── Prompt del sistema ───────────────────────────────────────
 function describirEstado(ec, cfg) {
   if (!ec?.paso) return 'Sin compra en curso.';
-  if (ec.paso === 'esperando_comprobante')
-    return `Compra apartada esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}. Si pregunta, recuérdale que mande la captura del pago.`;
+  if (ec.paso === 'esperando_comprobante') {
+    const quedan = ec.apartado_hasta ? Math.max(0, Math.round((ec.apartado_hasta - Date.now()) / 60000)) : null;
+    return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
+      (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron` : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
+      (quedan != null ? `. Le quedan ${quedan} minutos de apartado` : '') + '. Si pregunta, recuérdale que mande la captura del pago.';
+  }
   if (ec.paso === 'esperando_confirmacion')
     return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
   if (ec.paso === 'comprobante_sin_compra')
@@ -370,9 +463,11 @@ CÓMO VENDER
 - Cuando el cliente pregunte por rifas o números, consulta con tus herramientas antes de responder. Si hay una sola rifa en venta, asume esa sin preguntar.
 - Si un número no está disponible, dilo sin rodeos y ofrece alternativas parecidas (numeros_disponibles, por ejemplo con la misma terminación).
 - Para apartar necesitas: la rifa, los números, nombre y apellido${cfg.pedir_cedula ? ' y cédula' : ''}. Pídelos conversando, no como formulario, y solo lo que falte.
-- Con todo listo usa preparar_compra y pásale al cliente el total y los datos de pago que te devuelva, tal cual. Luego pídele la captura del pago.
-- La foto del comprobante la registra el sistema automáticamente; tú solo acompañas.
-- Si el cliente pide una persona, reclama algo, está molesto o no puedes resolverlo, usa pasar_a_humano.
+- Con todo listo usa preparar_compra: los números quedan bloqueados ${cfg.apartado_minutos || 45} minutos para el cliente. Si ya dijo cómo paga, pásalo en metodo_pago; si no, pregúntale y usa elegir_metodo_pago.
+- Métodos de pago: ${Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial).join(', ')} (efectivo lo coordina una persona).
+- Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
+- Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
+- Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
 - Nunca menciones "series" ni detalles internos del sistema.
 
 FORMA DE ESCRIBIR
@@ -434,6 +529,12 @@ async function turnoIA(jid, chat, items, cfg) {
 
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
 
+  // Datos de pago + monto exacto: los manda el sistema, en un solo mensaje
+  if (efectos.mensajePago) {
+    await sleep(azar(700, 1500));
+    await enviarBloque(jid, efectos.mensajePago, cfg);
+  }
+
   // Comprobante enviado antes de preparar la compra → registrarlo ahora
   if (efectos.comprobantePrevio) {
     const chatAct = await chats.obtenerChat(jid);
@@ -467,20 +568,37 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
     await responder(jid, 'Mmm esa imagen no parece un comprobante de pago 🤔\n\n¿Me mandas la captura del pago cuando puedas?', cfg);
     return;
   }
-  if (datos && Number(datos.monto) && ec.total && datos.moneda && /usd|\$/i.test(datos.moneda)) {
-    datos.diferencia = Number(datos.monto) - Number(ec.total);
+  // Lo que el sistema le pidió pagar queda junto al comprobante para revisarlo en Reservas
+  datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg) };
+  if (Number(datos.monto) && ec.monto?.valor && ec.monto.moneda === (/usd|\$/i.test(datos.moneda || '') ? 'USD' : /bs|ves|bol/i.test(datos.moneda || '') ? 'VES' : 'COP')) {
+    datos.diferencia = +(Number(datos.monto) - Number(ec.monto.valor)).toFixed(2);
   }
+  const metodoPago = ec.metodo || (datos.banco ? `WhatsApp · ${datos.banco}` : 'WhatsApp');
 
   const client = await pool.connect();
   let r;
   try {
     await client.query('BEGIN');
-    r = await reservas.crearReservasTx(client, {
-      rifa_id: ec.rifa_id, numeros: ec.numeros, nombre_cliente: ec.nombre, cedula: ec.cedula,
-      telefono: chat.telefono, metodo_pago: datos?.banco ? `WhatsApp · ${datos.banco}` : 'WhatsApp',
-      comprobanteUrl: url, comprobante_nombre: 'comprobante-whatsapp', comprobante_datos: datos,
-      wa_jid: jid, origen: 'whatsapp',
-    });
+    // 1) Los números apartados pasan a "pendiente" con la foto del comprobante
+    const confirmadas = ec.reservas?.length
+      ? await reservas.confirmarApartadoTx(client, ec.reservas, { comprobanteUrl: url, comprobante_datos: datos, metodo_pago: metodoPago })
+      : [];
+    r = { ok: true, reservas: confirmadas, conflictos: [] };
+    // 2) Si el apartado venció (o no existía), se intenta reservar lo que falte
+    const yaConfirmados = new Set(confirmadas.map((x) => String(x.numero).trim()));
+    const faltan = ec.numeros.filter((n) => !yaConfirmados.has(n));
+    if (faltan.length) {
+      const r2 = await reservas.crearReservasTx(client, {
+        rifa_id: ec.rifa_id, numeros: faltan, nombre_cliente: ec.nombre, cedula: ec.cedula,
+        telefono: chat.telefono, metodo_pago: metodoPago,
+        comprobanteUrl: url, comprobante_nombre: 'comprobante-whatsapp', comprobante_datos: datos,
+        wa_jid: jid, origen: 'whatsapp',
+      });
+      r.reservas.push(...(r2.reservas || []));
+      r.conflictos = r2.conflictos || [];
+      if (!r2.ok && !r2.conflictos?.length) r.error = r2.error;
+    }
+    r.ok = r.reservas.length > 0;
     if (r.ok) await client.query('COMMIT'); else await client.query('ROLLBACK');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -566,21 +684,50 @@ bus.on('reservas:rechazadas', async (lista) => {
   }
 });
 
-// ── Probar el bot desde el panel (no envía nada por WhatsApp) ─
-async function probarConversacion(mensajesPrueba) {
-  const cfg = await obtenerConfig({ fresca: true });
-  const chatFalso = { jid: 'prueba@panel', nombre: 'Cliente de prueba', telefono: null, estado_compra: null };
-  const llamadas = [];
-  const ejecutar = async (nombre, args) => {
-    // En modo prueba no se escribe nada en la BD
-    if (['preparar_compra', 'cancelar_compra', 'pasar_a_humano', 'mis_compras'].includes(nombre)) {
-      const r = nombre === 'preparar_compra'
-        ? { ok: true, total_a_pagar: '(se calcula en real)', datos_de_pago: cfg.datos_pago || '(sin datos de pago configurados)', nota: 'modo prueba' }
-        : { ok: true, nota: 'modo prueba' };
-      llamadas.push({ nombre, args, resultado: r });
-      return r;
+// ─────────────────────────────────────────────────────────────
+// APARTADOS VENCIDOS: si no llegó el comprobante a tiempo se liberan
+// los números y se le avisa al cliente (una sola vez, con amabilidad).
+// ─────────────────────────────────────────────────────────────
+async function revisarApartadosVencidos() {
+  const liberadas = await reservas.liberarApartadosVencidos();
+  if (!liberadas.length) return;
+  const cfg = await obtenerConfig();
+  const porChat = new Map();
+  for (const rv of liberadas) {
+    if (!rv.wa_jid) continue;
+    const e = porChat.get(rv.wa_jid) || { numeros: [], nombre: rv.nombre_cliente, ids: [] };
+    e.numeros.push(String(rv.numero).trim());
+    e.ids.push(rv.id);
+    porChat.set(rv.wa_jid, e);
+  }
+  for (const [jid, { numeros, nombre, ids }] of porChat) {
+    const chat = await chats.obtenerChat(jid);
+    if (!chat) continue;
+    const ec = chat.estado_compra;
+    if (ec?.paso === 'esperando_comprobante' && (ec.reservas || []).some((id) => ids.includes(id))) {
+      await chats.actualizarChat(jid, { estado_compra: null });
     }
-    const r = await crearEjecutor(chatFalso.jid, chatFalso, cfg, {})(nombre, args);
+    await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `⌛ Apartado vencido sin comprobante · números ${numeros.join(', ')} liberados` });
+    if (cfg.activo && chat.bot_activo && transporte?.conectado()) {
+      const primer = String(nombre || '').split(' ')[0];
+      await responder(jid, `Hola${primer ? ' ' + primer : ''}, como no me llegó el comprobante liberé ${numeros.length > 1 ? 'los números' : 'el número'} ${numeros.join(', ')} 🙏
+
+Si todavía lo quieres, avísame y lo reviso de nuevo.`, cfg).catch(() => {});
+    }
+  }
+}
+setInterval(() => revisarApartadosVencidos().catch((e) => console.error('❌ [Bot] Apartados vencidos:', e.message)), 60 * 1000).unref();
+
+// ── Probar el bot desde el panel (no envía nada ni escribe en la BD) ─
+// estadoPrevio: el estado de compra de la simulación anterior (lo guarda el panel)
+async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
+  const cfg = await obtenerConfig({ fresca: true });
+  const chatFalso = { jid: 'prueba@panel', nombre: 'Cliente de prueba', telefono: null, estado_compra: estadoPrevio };
+  const llamadas = [];
+  const efectos = {};
+  const ejecutarReal = crearEjecutor(chatFalso.jid, chatFalso, cfg, efectos, { prueba: true });
+  const ejecutar = async (nombre, args) => {
+    const r = nombre === 'mis_compras' ? { compras: [], nota: 'modo prueba' } : await ejecutarReal(nombre, args);
     llamadas.push({ nombre, args, resultado: r });
     return r;
   };
@@ -591,7 +738,9 @@ async function probarConversacion(mensajesPrueba) {
     ejecutar,
     maxPasos: 5,
   });
-  return { respuesta: texto, partes: dividir(aFormatoWhatsApp(texto || '')), llamadas };
+  const partes = dividir(aFormatoWhatsApp(texto || ''));
+  if (efectos.mensajePago) partes.push(efectos.mensajePago);
+  return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { init, alRecibir, probarConversacion, HERRAMIENTAS };
+module.exports = { init, alRecibir, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };

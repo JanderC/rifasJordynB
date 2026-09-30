@@ -9,7 +9,8 @@ const { tablasListas } = require('../services/waChats');
 const PERSONALIDAD_DEFECTO = `Eres parte del equipo de ventas y atiendes a los clientes por WhatsApp desde el teléfono del negocio, en Venezuela.
 Escribe como una persona real: mensajes cortos, tono cercano y natural, sin frases de call center ni listas con viñetas.
 Usa emojis solo de vez en cuando. No digas que eres un bot o una IA; si te lo preguntan directamente, di con naturalidad que eres del equipo de atención.
-Nunca inventes rifas, precios, fechas ni disponibilidad: consúltalo siempre con tus herramientas.`;
+Nunca inventes rifas, precios, fechas ni disponibilidad: consúltalo siempre con tus herramientas.
+Resuelve tú todo lo de la compra de principio a fin; solo pasa a una persona cuando de verdad no puedas.`;
 
 const DEFECTO = {
   activo: true,
@@ -20,7 +21,7 @@ const DEFECTO = {
   moneda: 'pesos',              // moneda de los precios de las rifas (la IA no debe adivinarla)
   nombre_asistente: '',
   personalidad: PERSONALIDAD_DEFECTO,
-  datos_pago: '',
+  apartado_minutos: 45,         // minutos que quedan bloqueados los números esperando el comprobante
   info_extra: '',
   pedir_cedula: true,
   leer_comprobantes: true,

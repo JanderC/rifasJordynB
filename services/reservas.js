@@ -16,6 +16,17 @@ const esquemaListo = (async () => {
     `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS reserva_id UUID`,
     `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS comprobante_datos JSONB`,
     `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS wa_jid TEXT`,
+    `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS apartado_hasta TIMESTAMPTZ`,
+    // Nuevo estado 'apartado' (el CHECK original solo permitía pendiente/aprobado/rechazado)
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'reservas_cliente_estado_check'
+                         AND pg_get_constraintdef(oid) LIKE '%apartado%') THEN
+         ALTER TABLE reservas_cliente DROP CONSTRAINT IF EXISTS reservas_cliente_estado_check;
+         ALTER TABLE reservas_cliente ADD CONSTRAINT reservas_cliente_estado_check
+           CHECK (estado IN ('pendiente','aprobado','rechazado','apartado'));
+       END IF;
+     END $$`,
     `CREATE INDEX IF NOT EXISTS idx_ventas_rifa_origen ON ventas (rifa_id, origen)`,
     `CREATE INDEX IF NOT EXISTS idx_reservas_telefono ON reservas_cliente (telefono)`,
   ];
@@ -23,6 +34,10 @@ const esquemaListo = (async () => {
     try { await pool.query(sql); } catch (e) { console.error('[reservas] esquema:', e.message); }
   }
 })();
+
+// Una reserva ocupa el número si está pendiente de aprobar o si está
+// "apartada" (el bot de WhatsApp la bloqueó mientras llega el comprobante).
+const SQL_RESERVA_OCUPA = `(estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`;
 
 // Mejor precio total aplicando ofertas (p. ej. 3 números por $X)
 function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
@@ -85,7 +100,7 @@ async function ocupacionNumeros(db, rifa, numeros) {
   const maxRanuras = rifa.tipo === 'simultanea' ? 2 : 1;
   const consultas = [
     [`SELECT numero, COUNT(*)::int n FROM ventas WHERE rifa_id=$1 AND numero = ANY($2) GROUP BY numero`],
-    [`SELECT numero, COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero = ANY($2) AND estado='pendiente' GROUP BY numero`],
+    [`SELECT numero, COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero = ANY($2) AND ${SQL_RESERVA_OCUPA} GROUP BY numero`],
     [`SELECT numero, COUNT(DISTINCT serie)::int n FROM (
         SELECT numero, COALESCE(serie,'A') AS serie FROM numeros_vendedor WHERE rifa_id=$1 AND numero = ANY($2)
         UNION
@@ -140,6 +155,8 @@ async function crearReservasTx(client, datos) {
     rifa_id, nombre_cliente, cedula, correo, telefono, metodo_pago,
     comprobanteUrl, comprobante_nombre, comprobante_datos, wa_jid,
     origen = 'web',
+    estado = 'pendiente',        // 'apartado' = bloqueado por el bot hasta que llegue el comprobante
+    apartadoHasta = null,
   } = datos;
   const numeros = [...datos.numeros];
 
@@ -172,14 +189,16 @@ async function crearReservasTx(client, datos) {
     const r = await client.query(`
       INSERT INTO reservas_cliente
         (rifa_id, numero, nombre_cliente, cedula, correo, telefono, metodo_pago,
-         comprobante_base64, comprobante_nombre, origen, comprobante_datos, wa_jid)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         comprobante_base64, comprobante_nombre, origen, comprobante_datos, wa_jid,
+         estado, apartado_hasta)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING id, numero, nombre_cliente, cedula, correo, estado, created_at`,
     [
       rifa_id, numero, String(nombre_cliente).trim(), String(cedula || '').trim() || null,
       correo?.trim() || null, telefono || null, metodo_pago || null,
       comprobanteUrl, comprobante_nombre || null, origen,
       comprobante_datos ? JSON.stringify(comprobante_datos) : null, wa_jid || null,
+      estado, estado === 'apartado' ? apartadoHasta : null,
     ]);
     reservas.push(r.rows[0]);
   }
@@ -257,6 +276,30 @@ async function aprobarReservasTx(client, ids, nota) {
   return { aprobadas, autoRechazadas };
 }
 
+// El comprobante llegó: los números apartados pasan a "pendiente" (aparecen en Reservas)
+async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_datos, metodo_pago }) {
+  const r = await client.query(`
+    UPDATE reservas_cliente
+       SET estado = 'pendiente', apartado_hasta = NULL, comprobante_base64 = $2,
+           comprobante_nombre = 'comprobante-whatsapp', comprobante_datos = $3,
+           metodo_pago = COALESCE($4, metodo_pago), updated_at = NOW()
+     WHERE id = ANY($1) AND estado = 'apartado'
+     RETURNING id, numero, nombre_cliente, estado`,
+  [ids, comprobanteUrl, comprobante_datos ? JSON.stringify(comprobante_datos) : null, metodo_pago || null]);
+  return r.rows;
+}
+
+// Libera apartados (cancelados por el cliente o vencidos sin comprobante)
+async function liberarApartados(ids) {
+  if (!ids?.length) return [];
+  const r = await pool.query(`DELETE FROM reservas_cliente WHERE id = ANY($1) AND estado = 'apartado' RETURNING *`, [ids]);
+  return r.rows;
+}
+async function liberarApartadosVencidos() {
+  const r = await pool.query(`DELETE FROM reservas_cliente WHERE estado = 'apartado' AND apartado_hasta <= NOW() RETURNING *`);
+  return r.rows;
+}
+
 async function rechazarReservasTx(client, ids, nota, { soloPendientes = true } = {}) {
   const r = await client.query(`
     UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW()
@@ -271,6 +314,10 @@ function avisarRechazadas(reservas) { if (reservas?.length) bus.emit('reservas:r
 
 module.exports = {
   esquemaListo,
+  SQL_RESERVA_OCUPA,
+  confirmarApartadoTx,
+  liberarApartados,
+  liberarApartadosVencidos,
   calcularPrecioReal,
   infoRifa,
   rifasEnVenta,

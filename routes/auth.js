@@ -4,13 +4,21 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const { verificarBloqueoLogin, registrarLoginFallido, registrarLoginExitoso } = require('../middleware/loginLimiter');
+
+// Hash de relleno: si el usuario no existe igual se ejecuta bcrypt, para que el tiempo
+// de respuesta no revele qué usuarios existen
+const HASH_RELLENO = bcrypt.hashSync('usuario-inexistente', 10);
 
 // ── POST /api/auth/login ───────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', verificarBloqueoLogin, async (req, res) => {
   const { usuario, password } = req.body;
 
-  if (!usuario || !password) {
+  if (typeof usuario !== 'string' || typeof password !== 'string' || !usuario.trim() || !password) {
     return res.status(400).json({ error: 'Usuario y contraseña son requeridos' });
+  }
+  if (usuario.length > 100 || password.length > 200) {
+    return res.status(400).json({ error: 'Credenciales incorrectas' });
   }
 
   try {
@@ -19,21 +27,20 @@ router.post('/login', async (req, res) => {
       [usuario.trim().toLowerCase()]
     );
 
-    if (!result.rows[0]) {
-      return res.status(401).json({ error: 'Credenciales incorrectas' });
-    }
-
     const user = result.rows[0];
-    const passwordValida = await bcrypt.compare(password, user.password);
+    const passwordValida = await bcrypt.compare(password, user ? user.password : HASH_RELLENO);
 
-    if (!passwordValida) {
+    if (!user || !passwordValida) {
+      registrarLoginFallido(req);
       return res.status(401).json({ error: 'Credenciales incorrectas' });
     }
+
+    registrarLoginExitoso(req);
 
     const token = jwt.sign(
       { id: user.id, rol: user.rol },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+      { algorithm: 'HS256', expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
     );
 
     res.json({

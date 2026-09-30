@@ -55,7 +55,7 @@ function waAuth(req, res, next) {
   if (authHeader && authHeader.startsWith('Bearer ')) {
     try {
       const jwt = require('jsonwebtoken');
-      req.user = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
+      req.user = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET, { algorithms: ['HS256'] });
       if (req.user.rol !== 'dueno') return res.status(403).json({ error: 'Solo el dueño puede gestionar WhatsApp.' });
       return next();
     } catch (_) {}

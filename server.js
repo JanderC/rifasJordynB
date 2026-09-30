@@ -6,6 +6,21 @@ const { startWhatsApp } = require("./whatsapp/whatsappService");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Railway pone un proxy delante: así req.ip es la IP real del cliente (la usa el límite de intentos de login)
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
+// ── Cabeceras de seguridad ─────────────────────────────────
+app.use((req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+  });
+  next();
+});
+
 // ── Middlewares globales ───────────────────────────────────/
 app.use(
    cors({

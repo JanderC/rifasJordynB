@@ -21,10 +21,11 @@ const uploadMemoria = multer({
    Sube un ticket generado (PNG) a Cloudinary y devuelve su URL pública.
    Form-data: campo "ticket" con el archivo PNG del ticket.
    Devuelve: { ok, url }
-   No requiere autenticación de dueño — cualquier usuario logueado puede usarlo.
+   No requiere ser dueño — cualquier usuario logueado puede usarlo.
 ────────────────────────────────────────────────────────────*/
 router.post(
   '/ticket',
+  authMiddleware,
   uploadMemoria.single('ticket'),
   async (req, res) => {
     if (!req.file) {
@@ -66,6 +67,7 @@ router.post(
 ────────────────────────────────────────────────────────────*/
 router.post(
   '/rifa/:id/imagen',
+  authMiddleware,
   soloDueno,
   uploadRifa.single('imagen'),   // campo del form-data
   async (req, res) => {

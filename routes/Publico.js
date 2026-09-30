@@ -491,7 +491,8 @@ router.get('/metodos-pago', async (req, res) => {
 });
 
 /* ── GET /api/publico/reserva/:id ───────────────────────── */
-router.get('/reserva/:id', async (req, res) => {
+// Devuelve cédula y correo del cliente: solo el dueño puede consultarla
+router.get('/reserva/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.cedula, rc.correo,
@@ -510,7 +511,8 @@ router.get('/reserva/:id', async (req, res) => {
 });
 
 /* ── GET /api/publico/reservas-cliente ─────────────────── */
-router.get('/reservas-cliente', async (req, res) => {
+// Busca por nombre y devuelve datos personales: solo el dueño puede consultarla
+router.get('/reservas-cliente', authMiddleware, soloDueno, async (req, res) => {
   const { nombre_cliente, rifa_id } = req.query;
   if (!nombre_cliente)
     return res.status(400).json({ error: 'nombre_cliente es requerido' });

@@ -104,9 +104,11 @@ function yaAvisado(tipo, jid, horas) {
 async function alRecibir(item) {
   const cfg = await obtenerConfig();
   const { mensaje, chat } = item;
+  // El dueño: si es una orden (cola, 1, 2, "dile que…") la atiende su asistente;
+  // si no, el bot le responde normal (así también puede preguntarle o probarlo).
   if (dueno.esDueno(mensaje.jid, cfg)) {
-    if (mensaje.texto) dueno.alRecibirDueno(mensaje.texto).catch((e) => console.error('❌ [Dueño]', e.message));
-    return;
+    const esOrden = mensaje.texto ? await dueno.alRecibirDueno(mensaje.texto).catch((e) => { console.error('❌ [Dueño]', e.message); return true; }) : false;
+    if (esOrden) return;
   }
   // "Hola, reservé el 045 (reserva #AB12CD34)" desde la página: se une su reserva a este chat
   if (mensaje.texto) await vincularReservaWeb(mensaje.jid, mensaje.texto).catch((e) => console.error('❌ [Bot] vincular reserva:', e.message));
@@ -528,7 +530,7 @@ FORMA DE ESCRIBIR
 ${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
 CONTEXTO DE ESTA CONVERSACIÓN
 - Fecha y hora en Venezuela: ${fmtFechaVE()}.
-- Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.${compras ? `
+- ${dueno.esDueno(chat.jid, cfg) ? `Quien te escribe es ${cfg.dueno?.nombre || 'el dueño'}, EL DUEÑO del negocio (te está preguntando o probando): háblale con confianza, respóndele lo que pregunte con tus herramientas y no le pidas cédula ni le vendas como a un cliente salvo que te lo pida.` : `Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.`}${compras ? `
 - Sus compras recientes: ${compras}. Si pregunta por su ticket o su reserva, respóndele con esto.` : ''}
 - Estado: ${describirEstado(chat.estado_compra, cfg)}${notaDueno ? `
 

@@ -114,7 +114,7 @@ async function avisarAtencion(jid, motivo) {
     `*1* → lo atiendes tú${chat.telefono ? ` (wa.me/${chat.telefono})` : ''}\n` +
     `*2* → sigo yo con ${primerNombre(chat)}\n` +
     `o escríbeme qué le digo y yo se lo paso 😉`;
-  if (await enviarAlDueno(texto)) foco = { tipo: 'chat', jid };
+  if (await enviarAlDueno(texto)) foco = { at: Date.now(), tipo: 'chat', jid };
 }
 
 // ── Resumen periódico de pendientes ──────────────────────────
@@ -139,7 +139,7 @@ async function enviarResumen({ forzar = false } = {}) {
     `*2* → te los paso uno por uno\n` +
     `*3* → entras tú al panel${cfg.dueno?.panel_url ? `: ${cfg.dueno.panel_url}` : ''}`;
   if (await enviarAlDueno(texto)) {
-    foco = { tipo: 'resumen', jids: lista.map((c) => c.jid) };
+    foco = { at: Date.now(), tipo: 'resumen', jids: lista.map((c) => c.jid) };
     ultimoResumen = { at: Date.now(), firma: lista.map((c) => c.jid).sort().join(',') };
   }
 }
@@ -163,7 +163,7 @@ async function enviarDetalle(jid, prefijo = '') {
   const lista = await cola();
   const c = lista.find((x) => x.jid === jid) || await chats.obtenerChat(jid);
   if (!c) return enviarAlDueno('Ese chat ya no está en la cola 👍');
-  foco = { tipo: 'chat', jid };
+  foco = { at: Date.now(), tipo: 'chat', jid };
   const tel = telefonoBonito(c.telefono);
   return enviarAlDueno(
     `${prefijo}*${nombreDe(c)}*${tel ? ` (${tel})` : ''}` +
@@ -179,10 +179,19 @@ async function siguiente(anteriorJid) {
 }
 
 // ── Mensajes del dueño ───────────────────────────────────────
+const NO_ES_ORDEN = Symbol('no es orden');
+const FOCO_MAX_MS = 30 * 60000;
+
+// Devuelve true si el mensaje era una orden para el asistente; false si no
+// (entonces el bot le responde normal, como a cualquiera: sirve para probarlo).
 async function alRecibirDueno(texto) {
+  return (await manejarOrden(texto)) !== NO_ES_ORDEN;
+}
+
+async function manejarOrden(texto) {
   const t = normalizar(texto);
   if (!t) return;
-  const f = foco;
+  const f = foco && Date.now() - foco.at < FOCO_MAX_MS ? foco : null;
 
   if (/^(cola|pendientes?|mensajes|que hay|lista|quien espera)\b/.test(t)) return enviarResumen({ forzar: true });
   if (/^(siguiente|proximo|otro)\b/.test(t)) return siguiente(f?.tipo === 'chat' ? f.jid : null);
@@ -245,6 +254,8 @@ async function alRecibirDueno(texto) {
       await enviarAlDueno(elegir(['Anotado ✅', 'Perfecto, lo marco como atendido ✅']));
       return siguienteSiHay(f.jid);
     }
+    // Una pregunta (termina en "?") es para el bot, no una instrucción para el cliente
+    if (/\?\s*$/.test(texto.trim())) return NO_ES_ORDEN;
     // Cualquier otro texto: instrucción de qué responderle al cliente
     avisados.set(f.jid, Date.now());
     const enviado = await deps.atenderConBot(f.jid, texto);
@@ -254,16 +265,14 @@ async function alRecibirDueno(texto) {
     return siguienteSiHay(f.jid);
   }
 
-  // Sin contexto
-  const lista = await cola();
-  if (!lista.length) return enviarAlDueno(elegir(['Todo al día por aquí 🙌 no hay nadie esperando.', 'Por ahora nadie esperando 👌 cuando alguien me necesite te aviso.']));
-  return enviarResumen({ forzar: true });
+  // Sin contexto: no es una orden → que el bot le responda como a cualquiera
+  return NO_ES_ORDEN;
 }
 
 async function siguienteSiHay(jidActual) {
   const quedan = (await cola()).filter((c) => c.jid !== jidActual);
   if (!quedan.length) { foco = null; return; }
-  foco = { tipo: 'lista', jids: quedan.map((c) => c.jid) };
+  foco = { at: Date.now(), tipo: 'lista', jids: quedan.map((c) => c.jid) };
   await sleep(1500);
   return enviarAlDueno(`Te ${quedan.length === 1 ? 'queda 1' : `quedan ${quedan.length}`} esperando. Escribe *siguiente* para verlo${quedan.length === 1 ? '' : 's'} o *cola* para la lista.`);
 }

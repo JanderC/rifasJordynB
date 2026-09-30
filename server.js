@@ -12,6 +12,8 @@ app.use(
     origin: (origin, callback) => {
       const allowed = [
         process.env.FRONTEND_URL || "https://rifas-jordyn-f.vercel.app",
+        "https://www.resuelvetusemana.com",
+        "https://resuelvetusemana.com",
         "http://localhost:5000",
         "http://localhost:3000",
         "http://127.0.0.1:5000",

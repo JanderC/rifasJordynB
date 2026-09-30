@@ -1,10 +1,13 @@
 /**
- * whatsappService.js — con protecciones anti-ban, respuestas automáticas (Groq AI),
- * gestión automática de sesiones y procesamiento de comprobantes de pago.
+ * whatsappService.js — Conexión con WhatsApp (Baileys)
  *
- * ✅ NUEVO: manejo de mensajes con imagen → procesarComprobante()
- * ✅ NUEVO: sendTicketImage() para enviar imagen de ticket al confirmar
- * ✅ NUEVO: sendPDFTickets() para enviar PDF con varios tickets
+ *  - Conexión estable: reconexión sin límite, sin borrar la sesión.
+ *  - Todo mensaje se guarda en la BD (services/waChats) y se emite en
+ *    tiempo real al panel de Chats. Las fotos/audios/documentos se suben
+ *    a Cloudinary: nada de base64 guardado.
+ *  - Envíos por una cola anti-bloqueo: límite por minuto y por día, pausas
+ *    aleatorias, "escribiendo…" y tope de chats nuevos iniciados por nosotros.
+ *  - Los mensajes de clientes pasan al bot conversacional (whatsapp/bot.js).
  */
 
 const {
@@ -13,20 +16,25 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  generateMessageIDV2,
   Browsers,
 } = require('@whiskeysockets/baileys');
 
-const path        = require('path');
-const fs          = require('fs');
-const pino        = require('pino');
+const path         = require('path');
+const fs           = require('fs');
+const pino         = require('pino');
 const EventEmitter = require('events');
-const { getAutoReply, procesarComprobante } = require('./autoReply');
-const { acumularMensaje }                   = require('./Geminiservice');
+const pool         = require('../config/db');
+const { cloudinary } = require('../config/cloudinary');
+const chats        = require('../services/waChats');
+const bot          = require('./bot');
+const { obtenerConfig } = require('./botConfig');
 
 // La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
 // disco persistente si el servidor se redespliega.
 const SESSION_PATH = process.env.WA_SESSION_PATH || path.join(__dirname, 'sessions');
 const waEvents     = new EventEmitter();
+const logger       = pino({ level: 'silent' });
 
 let sock             = null;
 let currentQR        = null;
@@ -39,7 +47,10 @@ let ultimoError      = null;   // { code, motivo, at }
 let conectadoDesde   = null;
 const MAX_ESPERA_RECONEXION_MS = 60 * 1000;
 
-// ── Limpieza automática de sesión ──────────────────────────
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+const azar = (a, b) => Math.floor(a + Math.random() * Math.max(1, b - a));
+
+// ── Limpieza de sesión ─────────────────────────────────────
 function clearSession() {
   try {
     if (fs.existsSync(SESSION_PATH)) {
@@ -51,82 +62,77 @@ function clearSession() {
   }
 }
 
-// ── Rate limiting ──────────────────────────────────────────
-const rateLimit = {
-  windowMs: 60 * 1000,
-  maxPerWindow: 10,
-  minDelayMs: 2000,
-  maxDelayMs: 5000,
-  sentInWindow: 0,
-  windowStart: Date.now(),
-  lastSentAt: 0,
+// ─────────────────────────────────────────────────────────────
+// ANTI-BLOQUEO: cola única de envío
+//  - Tope por minuto: si se llena, ESPERA (no falla).
+//  - Tope diario: si se llena, falla con un mensaje claro.
+//  - Pausa aleatoria entre mensajes (más corta si escribe una persona).
+//  - Tope de chats nuevos por día (números que nunca nos escribieron).
+// ─────────────────────────────────────────────────────────────
+const hoyVE = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' });
+const cuota = {
+  minuto: { inicio: Date.now(), n: 0 },
+  dia: { fecha: hoyVE(), n: 0, chatsNuevos: new Set() },
 };
+const cola = [];
+let procesandoCola = false;
+let ultimoEnvio = 0;
 
-// ── Cola de mensajes ───────────────────────────────────────
-const messageQueue   = [];
-let isProcessingQueue = false;
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function randomDelay() {
-  const { minDelayMs, maxDelayMs } = rateLimit;
-  return Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
+function resetCuotas() {
+  if (Date.now() - cuota.minuto.inicio >= 60000) cuota.minuto = { inicio: Date.now(), n: 0 };
+  if (cuota.dia.fecha !== hoyVE()) cuota.dia = { fecha: hoyVE(), n: 0, chatsNuevos: new Set() };
 }
 
-function checkRateLimit() {
-  const now = Date.now();
-  if (now - rateLimit.windowStart > rateLimit.windowMs) {
-    rateLimit.sentInWindow = 0;
-    rateLimit.windowStart  = now;
-  }
-  if (rateLimit.sentInWindow >= rateLimit.maxPerWindow) {
-    const waitMs = rateLimit.windowMs - (now - rateLimit.windowStart);
-    throw new Error(`Límite alcanzado: máximo ${rateLimit.maxPerWindow} mensajes/min. Espera ${Math.ceil(waitMs / 1000)}s.`);
-  }
-}
-
-async function processQueue() {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
-  while (messageQueue.length > 0) {
-    const { task, resolve, reject } = messageQueue.shift();
-    const delay = randomDelay();
-    await sleep(delay);
+async function procesarCola() {
+  if (procesandoCola) return;
+  procesandoCola = true;
+  while (cola.length) {
+    const tarea = cola.shift();
     try {
-      const result = await task();
-      rateLimit.sentInWindow++;
-      rateLimit.lastSentAt = Date.now();
-      resolve(result);
-    } catch (err) { reject(err); }
+      const ab = (await obtenerConfig()).antiban;
+      resetCuotas();
+      if (cuota.dia.n >= ab.max_por_dia) throw new Error(`Límite diario de ${ab.max_por_dia} mensajes alcanzado (protección anti-bloqueo).`);
+      while (cuota.minuto.n >= ab.max_por_minuto) {
+        await sleep(Math.max(500, 60000 - (Date.now() - cuota.minuto.inicio)));
+        resetCuotas();
+      }
+      const pausa = tarea.prioridad === 'humano' ? azar(300, 1000) : azar(ab.espera_min_ms, ab.espera_max_ms);
+      const falta = pausa - (Date.now() - ultimoEnvio);
+      if (falta > 0) await sleep(falta);
+      const r = await tarea.fn();
+      cuota.minuto.n++;
+      cuota.dia.n++;
+      ultimoEnvio = Date.now();
+      tarea.resolve(r);
+    } catch (err) { tarea.reject(err); }
   }
-  isProcessingQueue = false;
+  procesandoCola = false;
 }
 
-function enqueue(task) {
+function enqueue(fn, prioridad = 'bot') {
   return new Promise((resolve, reject) => {
-    checkRateLimit();
-    messageQueue.push({ task, resolve, reject });
-    processQueue();
+    const tarea = { fn, resolve, reject, prioridad };
+    // Lo que escribe una persona desde el panel pasa delante del bot
+    if (prioridad === 'humano') {
+      const i = cola.findIndex((t) => t.prioridad !== 'humano');
+      if (i === -1) cola.push(tarea); else cola.splice(i, 0, tarea);
+    } else cola.push(tarea);
+    procesarCola();
   });
 }
 
-// ── Anti-flood ─────────────────────────────────────────────
-const recentlyReplied = new Set();
-
-function markReplied(msgId) {
-  recentlyReplied.add(msgId);
-  setTimeout(() => recentlyReplied.delete(msgId), 5 * 60 * 1000);
-}
-
-// ── Extraer base64 de imagen de un mensaje ─────────────────
-async function extractImageBase64(msg) {
-  try {
-    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-    return buffer ? buffer.toString('base64') : null;
-  } catch (err) {
-    console.error('❌ [WhatsApp] Error descargando imagen:', err.message);
-    return null;
+// Escribirle primero a un número que nunca nos escribió es lo que más
+// dispara los bloqueos: se limita por día.
+async function verificarChatNuevo(jid) {
+  const r = await pool.query(`SELECT 1 FROM wa_chat_mensajes WHERE jid=$1 AND de_mi = FALSE LIMIT 1`, [jid]);
+  if (r.rows.length) return;
+  resetCuotas();
+  if (cuota.dia.chatsNuevos.has(jid)) return;
+  const max = (await obtenerConfig()).antiban.max_chats_nuevos_dia;
+  if (cuota.dia.chatsNuevos.size >= max) {
+    throw new Error(`Límite de ${max} chats nuevos por día alcanzado (protección anti-bloqueo). El cliente puede escribirnos primero.`);
   }
+  cuota.dia.chatsNuevos.add(jid);
 }
 
 // ── Inicio de WhatsApp ─────────────────────────────────────
@@ -263,92 +269,130 @@ function onConnectionUpdate({ connection, lastDisconnect, qr }) {
   programarInicio(espera);
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// MENSAJES ENTRANTES / ESTADOS
+// ─────────────────────────────────────────────────────────────
+const IGNORAR_JID = /@(g\.us|broadcast|newsletter)$|^status@/;
+const ESTADOS_WA = { 0: 'error', 1: 'pendiente', 2: 'enviado', 3: 'entregado', 4: 'leido', 5: 'leido' };
+
+// Desenvuelve mensajes temporales / de una sola vista
+function contenidoReal(message) {
+  let m = message || {};
+  for (let i = 0; i < 4; i++) {
+    const w = m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension || m.documentWithCaptionMessage;
+    if (!w?.message) break;
+    m = w.message;
+  }
+  return m;
+}
+
+function clasificar(m) {
+  if (m.conversation) return { tipo: 'texto', texto: m.conversation };
+  if (m.extendedTextMessage) return { tipo: 'texto', texto: m.extendedTextMessage.text };
+  if (m.imageMessage) return { tipo: 'imagen', texto: m.imageMessage.caption || null, media: true, mime: m.imageMessage.mimetype };
+  if (m.audioMessage) return { tipo: 'audio', media: true, mime: m.audioMessage.mimetype };
+  if (m.documentMessage) return { tipo: 'documento', texto: m.documentMessage.caption || m.documentMessage.fileName || null, media: true, mime: m.documentMessage.mimetype };
+  if (m.stickerMessage) return { tipo: 'sticker', media: true, mime: m.stickerMessage.mimetype };
+  if (m.videoMessage) return { tipo: 'video', texto: m.videoMessage.caption || null };
+  if (m.buttonsResponseMessage) return { tipo: 'texto', texto: m.buttonsResponseMessage.selectedDisplayText };
+  if (m.listResponseMessage) return { tipo: 'texto', texto: m.listResponseMessage.title };
+  if (m.contactMessage) return { tipo: 'otro', texto: `👤 Contacto: ${m.contactMessage.displayName || ''}` };
+  if (m.locationMessage) return { tipo: 'otro', texto: '📍 Ubicación' };
+  return null;   // reacciones, protocolo, etc.: no se guardan
+}
+
+function subirACloudinary(buffer, { tipo }) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: 'rifas-jordyn/whatsapp', resource_type: 'auto', tags: ['whatsapp', tipo] },
+      (err, res) => (err ? reject(err) : resolve(res.secure_url)),
+    );
+    stream.end(buffer);
+  });
+}
+
+// En Baileys v7 un chat puede venir con un id anónimo (@lid): usamos el
+// número real (@s.whatsapp.net) cuando se conoce, para unir el chat con
+// las reservas por teléfono.
+async function jidCanonico(key) {
+  const principal = key.remoteJid;
+  if (!principal?.endsWith('@lid')) return principal;
+  if (key.remoteJidAlt?.endsWith('@s.whatsapp.net')) return key.remoteJidAlt;
+  try {
+    const pn = await sock?.signalRepository?.lidMapping?.getPNForLID(principal);
+    if (pn) return pn.includes('@') ? pn.replace(/:\d+@/, '@') : `${pn}@s.whatsapp.net`;
+  } catch (_) {}
+  return principal;
+}
+
+async function alRecibirMensaje(msg, tipoEvento) {
+  if (!msg?.key?.remoteJid || IGNORAR_JID.test(msg.key.remoteJid)) return;
+  const m = contenidoReal(msg.message);
+  const info = clasificar(m);
+  if (!info) return;
+
+  const jid = await jidCanonico(msg.key);
+  const deMi = !!msg.key.fromMe;
+  const fecha = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date();
+
+  let mediaUrl = null;
+  if (info.media) {
+    try {
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+      if (buffer && buffer.length < 15 * 1024 * 1024) mediaUrl = await subirACloudinary(buffer, info);
+    } catch (err) {
+      console.error('❌ [WhatsApp] No se pudo guardar el adjunto:', err.message);
+    }
+  }
+
+  const guardado = await chats.guardarMensaje({
+    jid, deMi, autor: deMi ? 'telefono' : 'cliente',
+    tipo: info.tipo, texto: info.texto, mediaUrl, mediaMime: info.mime || null,
+    waId: msg.key.id, waKey: deMi ? null : { remoteJid: msg.key.remoteJid, id: msg.key.id, fromMe: false, participant: msg.key.participant },
+    nombre: deMi ? null : (msg.pushName || null),
+    estado: deMi ? 'enviado' : null,
+    noLeido: tipoEvento === 'notify',
+    fecha,
+  });
+
+  // Solo mensajes nuevos de clientes van al bot (no el historial sincronizado)
+  if (guardado && !deMi && tipoEvento === 'notify') {
+    bot.alRecibir({ mensaje: guardado.mensaje, chat: guardado.chat }).catch((e) => console.error('❌ [Bot]', e.message));
+    waEvents.emit('mensaje', guardado);
+  }
+}
+
 // Dentro del handler se usa `sock` (el socket vigente del módulo), no `s`:
-// si hubo una reconexión mientras se armaba la respuesta, se envía por la nueva.
+// si hubo una reconexión mientras tanto, se usa la nueva.
 function registrarMensajes(s) {
-
-  // ── Mensajes entrantes ────────────────────────────────────
   s.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
+    if (type !== 'notify' && type !== 'append') return;
     for (const msg of messages) {
-      try {
-        if (msg.key.fromMe) continue;
-        if (msg.key.remoteJid.endsWith('@g.us')) continue;
-        if (recentlyReplied.has(msg.key.id)) continue;
+      try { await alRecibirMensaje(msg, type); }
+      catch (err) { console.error('❌ [WhatsApp] Error guardando mensaje:', err.message); }
+    }
+  });
 
-        const jid      = msg.key.remoteJid;
-        const msgType  = Object.keys(msg.message || {})[0];
-
-        // ── Imagen recibida → posible comprobante de pago ──
-        const esImagen = ['imageMessage', 'stickerMessage'].includes(msgType);
-        if (esImagen && msgType === 'imageMessage') {
-          markReplied(msg.key.id);
-          console.log(`📸 [AutoReply] Imagen de ${jid} — procesando como comprobante`);
-
-          const base64    = await extractImageBase64(msg);
-          const respuesta = await procesarComprobante(jid, base64);
-
-          await sock.sendPresenceUpdate('composing', jid);
-          await sleep(1500);
-          await sock.sendPresenceUpdate('paused', jid);
-
-          await enqueue(async () => {
-            await sock.sendMessage(jid, { text: respuesta });
-            console.log(`🤖 [AutoReply] Respuesta comprobante → ${jid}`);
-            return { ok: true, to: jid };
-          });
-
-          waEvents.emit('comprobanteRecibido', { jid, base64 });
-          continue;
-        }
-
-        // ── Texto normal ───────────────────────────────────
-        const texto =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          '';
-
-        if (!texto) continue;
-
-        console.log(`📩 [AutoReply] De ${jid}: "${texto.substring(0, 50)}"`);
-        markReplied(msg.key.id);
-
-        // Acumular mensajes (debounce 4s) antes de responder
-        acumularMensaje(jid, texto, async (jidFinal, textoAcumulado) => {
-          try {
-            const respuesta = await getAutoReply(jidFinal, textoAcumulado);
-
-            await sock.sendPresenceUpdate('composing', jidFinal);
-            await sleep(1500);
-            await sock.sendPresenceUpdate('paused', jidFinal);
-
-            await enqueue(async () => {
-              await sock.sendMessage(jidFinal, { text: respuesta });
-              console.log(`🤖 [AutoReply] Respondido a ${jidFinal}`);
-              return { ok: true, to: jidFinal };
-            });
-
-            waEvents.emit('autoReply', { jid: jidFinal, incoming: textoAcumulado, response: respuesta });
-          } catch (err) {
-            console.error('❌ [AutoReply] Error enviando respuesta:', err.message);
-          }
-        });
-
-      } catch (err) {
-        console.error('❌ [AutoReply] Error procesando mensaje:', err.message);
-      }
+  // ✓ ✓✓ y azul: enviado / entregado / leído
+  s.ev.on('messages.update', async (updates) => {
+    for (const { key, update } of updates) {
+      if (!key?.fromMe || update?.status == null) continue;
+      const estado = ESTADOS_WA[update.status];
+      if (estado) chats.actualizarEstadoMensaje(key.id, estado).catch(() => {});
     }
   });
 }
 
-// ── Helpers ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// ENVÍO (todo pasa por aquí: bot, panel, tickets)
+// ─────────────────────────────────────────────────────────────
 function toJID(numero) {
-  let n = numero.replace(/\D/g, '');
+  const s = String(numero || '').trim();
+  if (s.includes('@')) return s;
+  let n = s.replace(/\D/g, '');
   if (n.startsWith('0')) n = '58' + n.slice(1);
-  if (!n.includes('@')) n = n + '@s.whatsapp.net';
-  return n;
+  return n + '@s.whatsapp.net';
 }
 
 function assertConnected() {
@@ -357,126 +401,113 @@ function assertConnected() {
   }
 }
 
-// ── API pública ────────────────────────────────────────────
-
-async function sendText(numero, mensaje) {
+/**
+ * Envía y registra un mensaje.
+ *  contenido: objeto de Baileys ({ text } | { image, caption } | { document, ... })
+ *  opts: { autor: 'bot'|'humano'|'sistema', tipo, texto, mediaUrl, mediaMime, prioridad }
+ */
+async function enviar(jid, contenido, opts = {}) {
   assertConnected();
-  const jid = toJID(numero);
-  return enqueue(async () => {
-    await sock.sendMessage(jid, { text: mensaje });
-    console.log(`📤 [WhatsApp] Texto → ${jid}`);
-    return { ok: true, to: jid };
+  await verificarChatNuevo(jid);
+  const waId = generateMessageIDV2(sock.user?.id);
+  await chats.guardarMensaje({
+    jid, waId, deMi: true, autor: opts.autor || 'humano', tipo: opts.tipo || 'texto',
+    texto: opts.texto ?? contenido.text ?? contenido.caption ?? null,
+    mediaUrl: opts.mediaUrl || null, mediaMime: opts.mediaMime || null, estado: 'pendiente',
   });
+  try {
+    await enqueue(() => {
+      assertConnected();
+      return sock.sendMessage(jid, contenido, { messageId: waId });
+    }, opts.prioridad || (opts.autor === 'humano' ? 'humano' : 'bot'));
+    await chats.actualizarEstadoMensaje(waId, 'enviado');
+  } catch (err) {
+    await chats.actualizarEstadoMensaje(waId, 'error').catch(() => {});
+    throw err;
+  }
+  return { ok: true, to: jid, waId };
 }
 
-async function sendImage(numero, imagen, caption = '') {
-  assertConnected();
-  const jid = toJID(numero);
+async function enviarTexto(jid, texto, opts = {}) {
+  return enviar(jid, { text: texto }, { ...opts, tipo: 'texto', texto });
+}
 
-  let imageSource;
+// imagen: URL https, Buffer o dataURL/base64
+async function enviarImagen(jid, imagen, caption = '', opts = {}) {
+  let fuente, mediaUrl = null;
   if (Buffer.isBuffer(imagen)) {
-    imageSource = imagen;
+    fuente = imagen;
+    mediaUrl = await subirACloudinary(imagen, { tipo: 'imagen' }).catch(() => null);
   } else if (typeof imagen === 'string' && imagen.startsWith('http')) {
-    imageSource = { url: imagen };
+    fuente = { url: imagen };
+    mediaUrl = imagen;
   } else if (typeof imagen === 'string') {
-    const base64 = imagen.includes(',') ? imagen.split(',')[1] : imagen;
-    imageSource  = Buffer.from(base64, 'base64');
+    fuente = Buffer.from(imagen.includes(',') ? imagen.split(',')[1] : imagen, 'base64');
+    mediaUrl = await subirACloudinary(fuente, { tipo: 'imagen' }).catch(() => null);
   } else {
     throw new Error('Formato de imagen no reconocido.');
   }
+  return enviar(jid, { image: fuente, caption }, { ...opts, tipo: 'imagen', texto: caption || null, mediaUrl, mediaMime: 'image/jpeg' });
+}
 
-  return enqueue(async () => {
-    await sock.sendMessage(jid, { image: imageSource, caption, mimetype: 'image/jpeg' });
-    console.log(`🖼️  [WhatsApp] Imagen → ${jid}`);
-    return { ok: true, to: jid };
-  });
+async function escribiendo(jid, ms) {
+  if (!sock || connectionStatus !== 'open') return;
+  try {
+    await sock.presenceSubscribe(jid).catch(() => {});
+    await sock.sendPresenceUpdate('composing', jid);
+    await sleep(ms);
+    await sock.sendPresenceUpdate('paused', jid);
+  } catch (_) {}
+}
+
+async function leer(jid, keys) {
+  if (!sock || connectionStatus !== 'open' || !keys?.length) return;
+  await sock.readMessages(keys);
+}
+
+// Marca el chat como leído en el panel y en el teléfono del cliente (✓✓ azul)
+async function marcarChatLeido(jid) {
+  const keys = await chats.marcarLeido(jid);
+  await leer(jid, keys).catch(() => {});
+}
+
+bot.init({ enviarTexto, escribiendo, leer, conectado: () => !!sock && connectionStatus === 'open' });
+
+// ── API usada por otras rutas ──────────────────────────────
+async function sendText(numero, mensaje) {
+  return enviarTexto(toJID(numero), mensaje, { autor: 'humano' });
+}
+
+async function sendImage(numero, imagen, caption = '') {
+  return enviarImagen(toJID(numero), imagen, caption, { autor: 'humano' });
 }
 
 /**
- * ✅ Envía el ticket de confirmación a un cliente.
- *
- * Flujo:
- *  1. Texto de confirmación
- *  2. Imágenes de ticket — acepta URLs de Cloudinary (preferido) O base64
- *  3. PDF adjunto (opcional)
- *
- * @param {string}   numero       — Teléfono del cliente (ej: "04241234567")
- * @param {string}   texto        — Mensaje de confirmación
- * @param {string[]} imagenes     — Array de URLs (https://...) O base64 (data:image/...)
- * @param {Buffer|null} pdfBuffer — PDF con todos los tickets (opcional)
+ * Ticket de confirmación al aprobar una reserva: texto + imágenes (URLs de
+ * Cloudinary o base64) + PDF opcional. `destino` puede ser teléfono o JID.
  */
-async function sendTicketConfirmacion(numero, texto, imagenes = [], pdfBuffer = null) {
+async function sendTicketConfirmacion(destino, texto, imagenes = [], pdfBuffer = null) {
   assertConnected();
-  const jid = toJID(numero);
-
-  // 1. ── Texto de confirmación ─────────────────────────────
-  await enqueue(async () => {
-    await sock.sendMessage(jid, { text: texto });
-    console.log(`📤 [Ticket] Texto → ${jid}`);
-    return { ok: true };
-  });
-
-  await sleep(1000);
-
-  // 2. ── Imágenes del ticket ────────────────────────────────
+  const jid = toJID(destino);
+  await enviarTexto(jid, texto, { autor: 'sistema', prioridad: 'humano' });
   for (let i = 0; i < imagenes.length; i++) {
-    const src     = imagenes[i];
-    const caption = imagenes.length > 1
-      ? `🎟️ Ticket ${i + 1} de ${imagenes.length}`
-      : '🎟️ Tu ticket — ¡guárdalo!';
-
-    // Detectar si es URL de Cloudinary/https o base64
-    const esUrl = typeof src === 'string' && src.startsWith('http');
-
-    await enqueue(async () => {
-      if (esUrl) {
-        // Enviar por URL directa — Baileys descarga la imagen por nosotros
-        await sock.sendMessage(jid, {
-          image: { url: src },
-          caption,
-          mimetype: 'image/png',
-        });
-        console.log(`🖼️  [Ticket] Imagen URL → ${jid} (${src.substring(0, 60)}…)`);
-      } else {
-        // Fallback: base64
-        const b64    = src.includes(',') ? src.split(',')[1] : src;
-        const buffer = Buffer.from(b64, 'base64');
-        await sock.sendMessage(jid, { image: buffer, caption, mimetype: 'image/png' });
-        console.log(`🖼️  [Ticket] Imagen base64 → ${jid}`);
-      }
-      return { ok: true };
-    });
-
-    if (i < imagenes.length - 1) await sleep(900);
+    const caption = imagenes.length > 1 ? `🎟️ Ticket ${i + 1} de ${imagenes.length}` : '🎟️ Tu ticket — ¡guárdalo!';
+    await enviarImagen(jid, imagenes[i], caption, { autor: 'sistema', prioridad: 'humano' });
   }
-
-  // 3. ── PDF adjunto ────────────────────────────────────────
   if (pdfBuffer && pdfBuffer.length > 0) {
-    await sleep(900);
-    await enqueue(async () => {
-      await sock.sendMessage(jid, {
-        document: pdfBuffer,
-        mimetype: 'application/pdf',
-        fileName: 'tickets-rifas-jordyn.pdf',
-        caption: '📄 Todos tus tickets en PDF 🎉',
-      });
-      console.log(`📄 [Ticket] PDF → ${jid}`);
-      return { ok: true };
-    });
+    await enviar(jid, {
+      document: pdfBuffer, mimetype: 'application/pdf', fileName: 'tickets-rifas-jordyn.pdf',
+      caption: '📄 Todos tus tickets en PDF 🎉',
+    }, { autor: 'sistema', tipo: 'documento', texto: '📄 tickets-rifas-jordyn.pdf', prioridad: 'humano' });
   }
-
-  console.log(`✅ [Ticket] Confirmación completa → ${jid} (${imagenes.length} imagen(es))`);
+  console.log(`✅ [Ticket] Confirmación enviada → ${jid} (${imagenes.length} imagen(es))`);
   return { ok: true, to: jid };
 }
 
 function getStatus() {
-  const now = Date.now();
-  if (now - rateLimit.windowStart > rateLimit.windowMs) {
-    rateLimit.sentInWindow = 0;
-    rateLimit.windowStart  = now;
-  }
+  resetCuotas();
   // El código de vinculación vence a los ~2 min (o antes si WhatsApp rota la conexión)
-  const codigoVigente = pairingCode && now - pairingCode.at < 2 * 60 * 1000 ? pairingCode : null;
+  const codigoVigente = pairingCode && Date.now() - pairingCode.at < 2 * 60 * 1000 ? pairingCode : null;
   return {
     status: connectionStatus,
     hasQR: !!currentQR,
@@ -487,11 +518,11 @@ function getStatus() {
     conectadoDesde,
     reintentos: reconnectAttempts,
     ultimoError,
-    queueLength: messageQueue.length,
+    queueLength: cola.length,
     rateLimitInfo: {
-      sentInLastMinute: rateLimit.sentInWindow,
-      maxPerMinute: rateLimit.maxPerWindow,
-      remaining: rateLimit.maxPerWindow - rateLimit.sentInWindow,
+      sentInLastMinute: cuota.minuto.n,
+      enviadosHoy: cuota.dia.n,
+      chatsNuevosHoy: cuota.dia.chatsNuevos.size,
     },
   };
 }
@@ -499,7 +530,7 @@ function getStatus() {
 async function getQRBase64() {
   if (!currentQR) return null;
   const QRCode = require('qrcode');
-  return await QRCode.toDataURL(currentQR);
+  return await QRCode.toDataURL(currentQR, { margin: 1, width: 320 });
 }
 
 // Vincular sin QR: WhatsApp → Dispositivos vinculados → Vincular con número de teléfono
@@ -560,9 +591,15 @@ async function resetAndReconnect() {
 
 module.exports = {
   startWhatsApp,
+  // envío
+  enviarTexto,
+  enviarImagen,
+  marcarChatLeido,
   sendText,
   sendImage,
-  sendTicketConfirmacion,   // ✅ nuevo
+  sendTicketConfirmacion,
+  toJID,
+  // conexión
   getStatus,
   getQRBase64,
   requestPairingCode,

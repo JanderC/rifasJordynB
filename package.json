@@ -9,6 +9,7 @@
     "seed": "node database/seed.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "bcryptjs": "^2.4.3",

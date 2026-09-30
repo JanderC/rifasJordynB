@@ -11,19 +11,11 @@ const pool   = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { subirSiEsBase64, CARPETAS } = require('../services/imagenes');
 const { eliminarImagen, extraerPublicId } = require('../config/cloudinary');
+const {
+  crearReservasTx, aprobarReservasTx, rechazarReservasTx,
+  avisarAprobadas, avisarRechazadas,
+} = require('../services/reservas');
 
-function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
-  if (!Array.isArray(ofertas) || ofertas.length === 0 || cantidad === 0)
-    return precioUnitario * cantidad;
-  let mejorTotal = precioUnitario * cantidad;
-  for (const o of ofertas) {
-    if (cantidad >= o.cantidad && cantidad % o.cantidad === 0) {
-      const total = o.precio_total * (cantidad / o.cantidad);
-      if (total < mejorTotal) mejorTotal = total;
-    }
-  }
-  return mejorTotal;
-}
 
 /* ─────────────────────────────────────────────────────────────
    CAMPOS DE FECHA PARA EL CLIENTE
@@ -438,108 +430,21 @@ router.post('/reservar', async (req, res) => {
 
   try {
     await client.query('BEGIN');
-
-    // ── Verificar que la compra esté activa ───────────
-    const rifaCheck = await client.query(
-      `SELECT COALESCE(tipo, 'sencilla') AS tipo,
-              COALESCE(cifras, 3) AS cifras,
-              fecha_desactivacion_compra
-       FROM rifas WHERE id=$1`,
-      [rifa_id]
-    );
-    if (!rifaCheck.rows[0]) {
+    const r = await crearReservasTx(client, {
+      rifa_id, numeros, nombre_cliente, cedula, correo, telefono, metodo_pago,
+      comprobanteUrl, comprobante_nombre, origen: 'web',
+    });
+    if (!r.ok) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Rifa no encontrada' });
-    }
-
-    const { fecha_desactivacion_compra, tipo: tipoRifa } = rifaCheck.rows[0];
-    const cifrasRifa = Number(rifaCheck.rows[0].cifras) || 3;
-
-    // Normalizamos cada número a la cantidad de cifras de la rifa (000 / 0000)
-    for (let i = 0; i < numeros.length; i++) {
-      const raw = String(numeros[i]).replace(/\D/g, '');
-      if (!raw || raw.length > cifrasRifa) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `Número fuera de rango para rifa de ${cifrasRifa} cifras: ${numeros[i]}` });
-      }
-      numeros[i] = raw.padStart(cifrasRifa, '0');
-    }
-    if (fecha_desactivacion_compra && new Date(fecha_desactivacion_compra) <= new Date()) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({
-        error: 'La compra de esta rifa está desactivada. El sorteo ya fue realizado.',
-        compra_desactivada: true,
-      });
-    }
-
-    const esSimultanea = tipoRifa === 'simultanea';
-    const numerosAProcesar = esSimultanea ? numeros : [...new Set(numeros)];
-
-    const reservasCreadas = [];
-    const conflictos      = [];
-
-    for (const numero of numerosAProcesar) {
-      const vendidos = await client.query(
-        `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
-        [rifa_id, numero]
-      );
-      const vecesVendidas = parseInt(vendidos.rows[0].count);
-
-      const reservasPendientes = await client.query(
-        `SELECT COUNT(*) FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND estado='pendiente'`,
-        [rifa_id, numero]
-      );
-      const vecesPendientes = parseInt(reservasPendientes.rows[0].count);
-
-      const seriesVendedor = await client.query(
-        `SELECT COUNT(*)::int AS cnt FROM (
-           SELECT COALESCE(serie,'A') AS serie FROM numeros_vendedor
-            WHERE rifa_id = $1 AND numero = $2
-           UNION
-           SELECT serie FROM boleteria_numeros_extra
-            WHERE rifa_id = $1 AND numero = $2
-         ) AS s`,
-        [rifa_id, numero]
-      );
-      const bloqueadasVendedor = seriesVendedor.rows[0].cnt;
-
-      const ocupadas   = vecesVendidas + vecesPendientes + bloqueadasVendedor;
-      const maxRanuras = esSimultanea ? 2 : 1;
-
-      if (ocupadas >= maxRanuras) {
-        let razon = 'agotado';
-        if (vecesVendidas >= maxRanuras) razon = 'agotado';
-        else if (bloqueadasVendedor > 0 && (vecesVendidas + bloqueadasVendedor) >= maxRanuras) razon = 'asignado_vendedor';
-        else if (vecesPendientes > 0) razon = 'reserva_pendiente';
-        conflictos.push({ numero, razon }); continue;
-      }
-
-      const r = await client.query(`
-        INSERT INTO reservas_cliente
-          (rifa_id, numero, nombre_cliente, cedula, correo,
-           telefono, metodo_pago, comprobante_base64, comprobante_nombre)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        RETURNING id, numero, nombre_cliente, cedula, correo, estado, created_at
-      `, [
-        rifa_id, numero,
-        nombre_cliente.trim(),
-        cedula.trim(),
-        correo?.trim() || null,
-        telefono       || null,
-        metodo_pago    || null,
-        comprobanteUrl,
-        comprobante_nombre || null,
-      ]);
-      reservasCreadas.push(r.rows[0]);
-    }
-
-    if (reservasCreadas.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Ningún número pudo reservarse', conflictos });
+      const body = { error: r.error };
+      if (r.conflictos?.length) body.conflictos = r.conflictos;
+      if (r.compra_desactivada) body.compra_desactivada = true;
+      return res.status(r.status || 400).json(body);
     }
 
     await client.query('COMMIT');
     reservaConfirmada = true;
+    const reservasCreadas = r.reservas;
 
     const respuesta = {
       ok: true, reservas: reservasCreadas,
@@ -548,7 +453,7 @@ router.post('/reservar', async (req, res) => {
         ? '¡Reserva enviada! El administrador verificará tu pago pronto.'
         : `¡${reservasCreadas.length} números reservados! El administrador verificará tu pago pronto.`,
     };
-    if (conflictos.length > 0) respuesta.conflictos = conflictos;
+    if (r.conflictos.length > 0) respuesta.conflictos = r.conflictos;
     if (reservasCreadas.length === 1) respuesta.reserva = reservasCreadas[0];
 
     res.status(201).json(respuesta);
@@ -631,7 +536,8 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
 });
 
 /* ── PUT /api/publico/admin/reservas/:id ──────────────────
-   Al aprobar: propaga cedula y correo de la reserva a la venta
+   Aprobar: crea la venta (con origen web/whatsapp) vía services/reservas
+   Rechazar: libera el número
 ────────────────────────────────────────────────────────── */
 router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) => {
   const { estado, nota_admin } = req.body;
@@ -642,77 +548,40 @@ router.put('/admin/reservas/:id', authMiddleware, soloDueno, async (req, res) =>
   try {
     await client.query('BEGIN');
 
-    const res_r = await client.query(
-      `UPDATE reservas_cliente SET estado=$1, nota_admin=$2, updated_at=NOW()
-       WHERE id=$3 RETURNING *`,
-      [estado, nota_admin || null, req.params.id]
-    );
-    if (!res_r.rows[0]) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'No encontrada' });
-    }
-
-    const reserva = res_r.rows[0];
-
-    if (estado === 'aprobado') {
-      const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
-      const vendedorId = dueno.rows[0]?.id;
-
-      const rifa = await client.query(
-        `SELECT precio, COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
-        [reserva.rifa_id]
-      );
-      const precioVenta  = rifa.rows[0]?.precio || 0;
-      const esSimultanea = rifa.rows[0]?.tipo === 'simultanea';
-      const maxVentas    = esSimultanea ? 2 : 1;
-
-      const ventasExistentes = await client.query(
-        `SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
-        [reserva.rifa_id, reserva.numero]
-      );
-      const ventasActuales = parseInt(ventasExistentes.rows[0].count);
-
-      if (ventasActuales >= maxVentas) {
-        await client.query(
-          `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
-          [`Auto-rechazado: el número ${reserva.numero} ya alcanzó el máximo de ventas permitidas`, reserva.id]
-        );
-        await client.query('COMMIT');
-        return res.status(409).json({
-          error: `El número ${reserva.numero} ya tiene ${ventasActuales} venta(s) registrada(s) y no puede aprobarse nuevamente.`,
-          auto_rechazado: true,
-        });
+    if (estado === 'rechazado') {
+      const rechazadas = await rechazarReservasTx(client, [req.params.id], nota_admin, { soloPendientes: false });
+      if (!rechazadas[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'No encontrada' });
       }
-
-      await client.query(`
-        INSERT INTO ventas
-          (rifa_id, numero, vendedor_id, nombre_comprador,
-           cedula, correo, telefono, precio_venta, observacion)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      `, [
-        reserva.rifa_id,
-        reserva.numero,
-        vendedorId,
-        reserva.nombre_cliente,
-        reserva.cedula  || null,
-        reserva.correo  || null,
-        reserva.telefono,
-        precioVenta,
-        `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
-      ]);
+      await client.query('COMMIT');
+      avisarRechazadas(rechazadas);
+      return res.json({ ok: true, reserva: rechazadas[0] });
     }
 
+    const { aprobadas, autoRechazadas } = await aprobarReservasTx(client, [req.params.id], nota_admin);
     await client.query('COMMIT');
-    res.json({ ok: true, reserva: res_r.rows[0] });
+    avisarAprobadas(aprobadas);
+
+    if (autoRechazadas[0]) {
+      return res.status(409).json({
+        error: `El número ${autoRechazadas[0].numero} ya alcanzó el máximo de ventas y no puede aprobarse nuevamente.`,
+        auto_rechazado: true,
+      });
+    }
+    if (!aprobadas[0]) {
+      const existe = await pool.query('SELECT * FROM reservas_cliente WHERE id=$1', [req.params.id]);
+      if (!existe.rows[0]) return res.status(404).json({ error: 'No encontrada' });
+      return res.json({ ok: true, reserva: existe.rows[0] });   // ya estaba procesada
+    }
+    res.json({ ok: true, reserva: aprobadas[0] });
   } catch (e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
   } finally { client.release(); }
 });
 
-/* ── PUT /api/publico/admin/reservas-bulk ─────────────────
-   Al aprobar en bloque: propaga cedula y correo a cada venta
-────────────────────────────────────────────────────────── */
+/* ── PUT /api/publico/admin/reservas-bulk ───────────────── */
 router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) => {
   const { ids, estado, nota_admin } = req.body;
   if (!Array.isArray(ids) || ids.length === 0)
@@ -723,98 +592,16 @@ router.put('/admin/reservas-bulk', authMiddleware, soloDueno, async (req, res) =
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    const dueno = await client.query(`SELECT id FROM users WHERE rol='dueno' LIMIT 1`);
-    const vendedorId = dueno.rows[0]?.id;
-
-    let preciosMap = {};
-    let extrasMap  = {};
-
-    if (estado === 'aprobado') {
-      const reservasQ = await client.query(
-        `SELECT rc.id, rc.rifa_id, rc.nombre_cliente, rc.cedula, rc.correo,
-                r.precio, COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
-         FROM reservas_cliente rc
-         JOIN rifas r ON r.id = rc.rifa_id
-         WHERE rc.id = ANY($1) AND rc.estado = 'pendiente'`,
-        [ids]
-      );
-
-      const grupos = {};
-      for (const row of reservasQ.rows) {
-        const key = `${row.nombre_cliente}||${row.rifa_id}`;
-        if (!grupos[key]) grupos[key] = { precio: row.precio, ofertas: row.ofertas, ids: [] };
-        grupos[key].ids.push(row.id);
-        extrasMap[row.id] = { cedula: row.cedula || null, correo: row.correo || null };
-      }
-      for (const [, g] of Object.entries(grupos)) {
-        const totalReal  = calcularPrecioReal(g.ids.length, g.ofertas, g.precio);
-        const precioUnit = totalReal / g.ids.length;
-        for (const id of g.ids) preciosMap[id] = precioUnit;
-      }
+    if (estado === 'rechazado') {
+      const rechazadas = await rechazarReservasTx(client, ids, nota_admin);
+      await client.query('COMMIT');
+      avisarRechazadas(rechazadas);
+      return res.json({ ok: true, procesadas: rechazadas.length });
     }
-
-    const ventasEnTransaccion = {};
-
-    let procesadas = 0;
-    for (const id of ids) {
-      const res_r = await client.query(
-        `UPDATE reservas_cliente SET estado=$1, nota_admin=$2, updated_at=NOW()
-         WHERE id=$3 AND estado='pendiente' RETURNING *`,
-        [estado, nota_admin || null, id]
-      );
-      if (!res_r.rows[0]) continue;
-      const reserva = res_r.rows[0];
-
-      if (estado === 'aprobado') {
-        const claveNum = `${reserva.rifa_id}|${reserva.numero}`;
-        const rifaInfo = (await client.query(
-          `SELECT precio, COALESCE(tipo, 'sencilla') AS tipo FROM rifas WHERE id=$1`,
-          [reserva.rifa_id]
-        )).rows[0];
-        const esSimultanea = rifaInfo?.tipo === 'simultanea';
-        const maxVentas    = esSimultanea ? 2 : 1;
-
-        const ventasEnBD = parseInt(
-          (await client.query(`SELECT COUNT(*) FROM ventas WHERE rifa_id=$1 AND numero=$2`,
-            [reserva.rifa_id, reserva.numero])).rows[0].count
-        );
-        const ventasTx   = ventasEnTransaccion[claveNum] || 0;
-        const totalOcupadas = ventasEnBD + ventasTx;
-
-        if (totalOcupadas >= maxVentas) {
-          await client.query(
-            `UPDATE reservas_cliente SET estado='rechazado', nota_admin=$1, updated_at=NOW() WHERE id=$2`,
-            [`Auto-rechazado: número ${reserva.numero} ya alcanzó el máximo de ventas`, id]
-          );
-          continue;
-        }
-
-        ventasEnTransaccion[claveNum] = ventasTx + 1;
-
-        const precioVenta = preciosMap[id] ?? (rifaInfo?.precio || 0);
-        const { cedula = null, correo = null } = extrasMap[id] || {};
-
-        await client.query(`
-          INSERT INTO ventas
-            (rifa_id, numero, vendedor_id, nombre_comprador,
-             cedula, correo, telefono, precio_venta, observacion)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-          ON CONFLICT DO NOTHING
-        `, [
-          reserva.rifa_id, reserva.numero, vendedorId,
-          reserva.nombre_cliente,
-          cedula, correo,
-          reserva.telefono,
-          precioVenta,
-          `Compra online - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
-        ]);
-      }
-      procesadas++;
-    }
-
+    const { aprobadas, autoRechazadas } = await aprobarReservasTx(client, ids, nota_admin);
     await client.query('COMMIT');
-    res.json({ ok: true, procesadas });
+    avisarAprobadas(aprobadas);
+    res.json({ ok: true, procesadas: aprobadas.length + autoRechazadas.length, aprobadas: aprobadas.length, auto_rechazadas: autoRechazadas.length });
   } catch (e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });

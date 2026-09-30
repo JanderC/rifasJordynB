@@ -313,6 +313,50 @@ router.get('/rifas/:rifaId/vendedores', async (req, res) => {
 });
 
 /* ══════════════════════════════════════════════════════════
+   GET /api/caja/rifas/:rifaId/ventas-online
+   Números vendidos por la página web y por WhatsApp (reservas aprobadas).
+   El pago ya se verificó al aprobar el comprobante, así que cuadran
+   aparte de los vendedores.
+══════════════════════════════════════════════════════════ */
+router.get('/rifas/:rifaId/ventas-online', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT v.id, TRIM(v.numero) AS numero, v.nombre_comprador, v.telefono, v.cedula,
+             v.precio_venta, v.created_at,
+             COALESCE(v.origen, rc.origen, 'web') AS origen,
+             rc.metodo_pago, rc.comprobante_base64 AS comprobante_url
+        FROM ventas v
+        LEFT JOIN reservas_cliente rc ON rc.id = v.reserva_id
+       WHERE v.rifa_id = $1
+         AND (v.origen IN ('web','whatsapp') OR v.observacion LIKE 'Compra online%' OR v.observacion LIKE 'Compra por WhatsApp%')
+       ORDER BY v.created_at DESC`, [req.params.rifaId]);
+
+    const porOrigen = { web: { numeros: 0, monto: 0 }, whatsapp: { numeros: 0, monto: 0 } };
+    const ventas = r.rows.map((x) => {
+      const origen = x.origen === 'whatsapp' ? 'whatsapp' : 'web';
+      porOrigen[origen].numeros += 1;
+      porOrigen[origen].monto += Number(x.precio_venta || 0);
+      return {
+        ...x, origen, precio_venta: Number(x.precio_venta || 0),
+        comprobante_url: /^https?:\/\//.test(x.comprobante_url || '') ? x.comprobante_url : null,
+      };
+    });
+    const redondear = (n) => +n.toFixed(2);
+    porOrigen.web.monto = redondear(porOrigen.web.monto);
+    porOrigen.whatsapp.monto = redondear(porOrigen.whatsapp.monto);
+    res.json({
+      total_numeros: ventas.length,
+      total_monto: redondear(porOrigen.web.monto + porOrigen.whatsapp.monto),
+      por_origen: porOrigen,
+      ventas,
+    });
+  } catch (e) {
+    console.error('[caja v5] /ventas-online:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════
    GET /api/caja/rifas/:rifaId/lotes-vendedores  ← ALIAS LEGACY
    Retorna el mismo shape que esperaba el frontend viejo.
 ══════════════════════════════════════════════════════════ */

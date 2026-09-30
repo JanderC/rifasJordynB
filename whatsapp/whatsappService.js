@@ -356,6 +356,14 @@ async function alRecibirMensaje(msg, tipoEvento) {
     fecha,
   });
 
+  // Chat "Tú" del propio número: si el dueño usa el mismo número del bot,
+  // lo que escribe ahí son órdenes para su asistente (no las respuestas del bot:
+  // esas ya estaban guardadas y no llegan aquí).
+  const propio = sock?.user?.id ? `${sock.user.id.split(':')[0].split('@')[0]}@s.whatsapp.net` : null;
+  if (guardado && deMi && tipoEvento === 'notify' && jid === propio) {
+    bot.alRecibirPropio(guardado.mensaje).catch((e) => console.error('❌ [Dueño]', e.message));
+  }
+
   // Solo mensajes nuevos de clientes van al bot (no el historial sincronizado)
   if (guardado && !deMi && tipoEvento === 'notify') {
     bot.alRecibir({ mensaje: guardado.mensaje, chat: guardado.chat }).catch((e) => console.error('❌ [Bot]', e.message));

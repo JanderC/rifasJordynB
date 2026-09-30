@@ -242,6 +242,27 @@ async function resumen() {
   return r.rows[0];
 }
 
+// Cola de atención: clientes que esperan a una persona (el bot se trabó o pidieron
+// una persona) y chats en modo humano con mensajes del cliente sin responder.
+// excluirTelefono: el chat del dueño no es un cliente.
+async function colaAtencion(excluirTelefono = null) {
+  await tablasListas;
+  const r = await pool.query(`
+    SELECT c.*,
+           (SELECT texto FROM wa_chat_mensajes m WHERE m.jid = c.jid AND m.de_mi = FALSE AND m.texto IS NOT NULL
+             ORDER BY m.id DESC LIMIT 1) AS ultimo_del_cliente,
+           (SELECT MIN(m.created_at) FROM wa_chat_mensajes m
+             WHERE m.jid = c.jid AND m.de_mi = FALSE
+               AND m.id > COALESCE((SELECT MAX(id) FROM wa_chat_mensajes x WHERE x.jid = c.jid AND x.de_mi = TRUE AND x.autor <> 'sistema'), 0)
+           ) AS esperando_desde
+      FROM wa_chats c
+     WHERE NOT c.archivado
+       AND ($1::text IS NULL OR c.telefono IS DISTINCT FROM $1)
+       AND (c.necesita_humano OR (NOT c.bot_activo AND NOT c.ultimo_de_mi AND c.no_leidos > 0))
+     ORDER BY COALESCE(c.necesita_humano, FALSE) DESC, c.ultimo_at ASC`, [excluirTelefono]);
+  return r.rows;
+}
+
 // Chat de un teléfono (para asociar la confirmación de una reserva a su chat)
 async function chatPorTelefono(telefono) {
   const t = String(telefono || '').replace(/\D/g, '');
@@ -265,5 +286,6 @@ module.exports = {
   historialReciente,
   marcarLeido,
   resumen,
+  colaAtencion,
   chatPorTelefono,
 };

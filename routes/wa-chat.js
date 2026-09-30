@@ -27,6 +27,7 @@ const bus    = require('../services/waBus');
 const chats  = require('../services/waChats');
 const wa     = require('../whatsapp/whatsappService');
 const bot    = require('../whatsapp/bot');
+const dueno  = require('../whatsapp/dueno');
 const ia     = require('../whatsapp/ia');
 const { configPublica, guardarConfig, obtenerConfig } = require('../whatsapp/botConfig');
 
@@ -149,6 +150,30 @@ router.patch('/chats/:jid', async (req, res) => {
     if (!chat) return res.status(404).json({ error: 'Chat no encontrado' });
     res.json(chat);
   } catch (e) { err500(res, e); }
+});
+
+// ── Cola de atención ─────────────────────────────────────────
+router.get('/cola', async (req, res) => {
+  try {
+    const cfg = await obtenerConfig();
+    res.json(await chats.colaAtencion(dueno.telefonoDueno(cfg)));
+  } catch (e) { err500(res, e); }
+});
+
+// "Que lo atienda el bot" — opcional { instruccion } con lo que debe decirle al cliente
+router.post('/chats/:jid/atender-bot', async (req, res) => {
+  try {
+    const enviados = await bot.atenderConBot(req.params.jid, String(req.body?.instruccion || '').trim() || null);
+    res.json({ ok: true, enviados });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Mensajes al dueño por WhatsApp
+router.post('/dueno/probar', async (req, res) => {
+  try { res.json(await dueno.probar()); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/dueno/resumen', async (req, res) => {
+  try { await dueno.enviarResumen({ forzar: true }); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 router.get('/buscar', async (req, res) => {

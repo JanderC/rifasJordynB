@@ -22,6 +22,17 @@ const DEFECTO = {
   nombre_asistente: '',
   personalidad: PERSONALIDAD_DEFECTO,
   apartado_minutos: 45,         // minutos que quedan bloqueados los números esperando el comprobante
+  // El dueño recibe por WhatsApp los clientes que necesitan una persona y puede
+  // responder desde ahí mismo (1 = lo atiende él, 2 = sigue el bot, o le dicta qué decir).
+  dueno: {
+    nombre: 'Jordyn',
+    telefono: '584129287210',
+    notificar: true,            // avisar apenas un cliente necesite atención
+    resumen_cada_min: 60,       // recordatorio de pendientes (0 = nunca)
+    silencio_desde: '22:00',    // sin avisos de noche (los pendientes llegan en el resumen de la mañana)
+    silencio_hasta: '07:00',
+    panel_url: 'https://rifas-jordyn-f.vercel.app/whatsapp',
+  },
   info_extra: '',
   pedir_cedula: true,
   leer_comprobantes: true,

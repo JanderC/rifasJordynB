@@ -21,6 +21,7 @@ const reservas = require('../services/reservas');
 const { obtenerConfig } = require('./botConfig');
 const ia = require('./ia');
 const metodosPago = require('../services/metodosPago');
+const dueno = require('./dueno');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -48,6 +49,15 @@ const respuestasRecientes = new Map(); // jid → [timestamps] (anti-bucle)
 const avisosEnviados = new Map();      // `${tipo}|${jid}` → timestamp (no repetir avisos)
 const procesando = new Set();          // jids con un turno en curso
 
+// Un cliente necesita a una persona: se marca en el panel y se le avisa al dueño
+async function marcarAtencion(jid, motivo, { pausarBot = false, notificar = true } = {}) {
+  await chats.actualizarChat(jid, {
+    necesita_humano: true, motivo_humano: String(motivo).slice(0, 200),
+    ...(pausarBot ? { bot_activo: false } : {}),
+  });
+  if (notificar) dueno.avisarAtencion(jid, motivo).catch((e) => console.error('❌ [Dueño] aviso:', e.message));
+}
+
 function yaAvisado(tipo, jid, horas) {
   const k = `${tipo}|${jid}`;
   const t = avisosEnviados.get(k);
@@ -63,13 +73,18 @@ function yaAvisado(tipo, jid, horas) {
 async function alRecibir(item) {
   const cfg = await obtenerConfig();
   const { mensaje, chat } = item;
+  if (dueno.esDueno(mensaje.jid, cfg)) {
+    if (mensaje.texto) dueno.alRecibirDueno(mensaje.texto).catch((e) => console.error('❌ [Dueño]', e.message));
+    return;
+  }
   if (!cfg.activo || !chat?.bot_activo) return;
 
   // Mensajes viejos (llegaron mientras estábamos desconectados): no contestar
   // en ráfaga —patrón típico de bot— sino dejarlos para una persona.
   const edadMin = (Date.now() - new Date(mensaje.created_at).getTime()) / 60000;
   if (edadMin > (cfg.antiban.ignorar_viejos_min || 10)) {
-    await chats.actualizarChat(mensaje.jid, { necesita_humano: true, motivo_humano: 'Escribió mientras WhatsApp estaba desconectado' });
+    // Sin aviso inmediato (pueden ser muchos al reconectar): van en el resumen al dueño
+    await marcarAtencion(mensaje.jid, 'Escribió mientras WhatsApp estaba desconectado', { notificar: false });
     return;
   }
 
@@ -112,7 +127,7 @@ async function procesar(jid, items) {
   // Anti-bucle (p. ej. otro bot contestándonos)
   const recientes = (respuestasRecientes.get(jid) || []).filter((t) => Date.now() - t < 5 * 60000);
   if (recientes.length >= (cfg.antiban.max_respuestas_5min || 8)) {
-    await chats.actualizarChat(jid, { bot_activo: false, necesita_humano: true, motivo_humano: 'Demasiados mensajes seguidos (posible bucle)' });
+    await marcarAtencion(jid, 'está mandando demasiados mensajes seguidos (parece otro bot o algo raro)', { pausarBot: true });
     return;
   }
 
@@ -250,7 +265,7 @@ const HERRAMIENTAS = [
     descripcion: 'Pasa la conversación a una persona del equipo. Úsala SOLO si: el cliente pide explícitamente hablar con una persona, quiere pagar en efectivo, reclama un pago o un premio que no puedes verificar, o pregunta algo que no puedes responder con tus herramientas ni con la información del negocio. No la uses por dudas normales ni porque el cliente esté impaciente.',
     parametros: {
       type: 'object',
-      properties: { motivo: { type: 'string' } },
+      properties: { motivo: { type: 'string', description: 'Qué quiere el cliente, en una frase y en tercera persona, ej. "quiere pagar en efectivo mañana en la tienda"' } },
       required: ['motivo'],
     },
   },
@@ -423,7 +438,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           return { compras: r.rows.map((x) => ({ ...x, numero: String(x.numero).trim() })) };
         }
         case 'pasar_a_humano': {
-          if (!prueba) await chats.actualizarChat(jid, { bot_activo: false, necesita_humano: true, motivo_humano: String(args.motivo || 'Pidió hablar con una persona').slice(0, 200) });
+          if (!prueba) await marcarAtencion(jid, args.motivo || 'pidió hablar con una persona', { pausarBot: true });
           efectos.pasadoAHumano = true;
           return { ok: true, instruccion: 'Dile en una frase corta que ya lo atiende una persona del equipo.' };
         }
@@ -453,7 +468,7 @@ function describirEstado(ec, cfg) {
   return 'Sin compra en curso.';
 }
 
-function construirSistema(cfg, chat) {
+function construirSistema(cfg, chat, notaDueno = null) {
   const nombreCliente = chat.nombre_guardado || chat.nombre;
   return `${cfg.personalidad}
 
@@ -479,7 +494,11 @@ ${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
 CONTEXTO DE ESTA CONVERSACIÓN
 - Fecha y hora en Venezuela: ${fmtFechaVE()}.
 - Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.
-- Estado: ${describirEstado(chat.estado_compra, cfg)}`;
+- Estado: ${describirEstado(chat.estado_compra, cfg)}${notaDueno ? `
+
+INSTRUCCIÓN DE ${String(cfg.dueno?.nombre || 'el dueño').toUpperCase()} (el dueño) PARA ESTE CLIENTE
+${notaDueno}
+Síguela y escríbele al cliente ahora, con tus palabras y natural, sin decir que te lo dijo el dueño salvo que haga falta. No uses pasar_a_humano.` : ''}`;
 }
 
 // Historial de la BD → mensajes para la IA (cliente=user; bot/humano/teléfono=assistant)
@@ -505,16 +524,20 @@ async function historialParaIA(jid, hastaId) {
   return out;
 }
 
-async function turnoIA(jid, chat, items, cfg) {
-  const hastaId = Math.max(...items.map((i) => Number(i.mensaje.id) || 0));
+async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
+  const hastaId = items.length ? Math.max(...items.map((i) => Number(i.mensaje.id) || 0)) : null;
   const mensajes = await historialParaIA(jid, hastaId || null);
-  if (!mensajes.length || mensajes[mensajes.length - 1].role !== 'user') return;
+  // Con instrucción del dueño se le escribe aunque el cliente no haya dicho nada nuevo
+  if (notaDueno && mensajes.length && mensajes[mensajes.length - 1].role !== 'user') {
+    mensajes.push({ role: 'user', content: '(sigue la conversación con el cliente según la instrucción del dueño)' });
+  }
+  if (!mensajes.length || mensajes[mensajes.length - 1].role !== 'user') return null;
 
   const efectos = {};
   let resultado;
   try {
     resultado = await ia.chatConHerramientas(cfg, {
-      system: construirSistema(cfg, chat),
+      system: construirSistema(cfg, chat, notaDueno),
       mensajes,
       herramientas: HERRAMIENTAS,
       ejecutar: crearEjecutor(jid, chat, cfg, efectos),
@@ -522,9 +545,9 @@ async function turnoIA(jid, chat, items, cfg) {
     });
   } catch (err) {
     console.error(`❌ [Bot] IA falló (${cfg.proveedor}):`, err.message);
-    await chats.actualizarChat(jid, { necesita_humano: true, motivo_humano: `La IA no respondió: ${err.message}`.slice(0, 200) });
+    await marcarAtencion(jid, `la IA no me está respondiendo (${err.message})`);
     if (cfg.mensaje_sin_ia && !yaAvisado('sin_ia', jid, 12)) await responder(jid, cfg.mensaje_sin_ia, cfg);
-    return;
+    return null;
   }
 
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
@@ -542,7 +565,50 @@ async function turnoIA(jid, chat, items, cfg) {
       mensaje: { media_url: efectos.comprobantePrevio.url, media_mime: efectos.comprobantePrevio.mime },
     }, cfg, { silencioso: true });
   }
+  return resultado.texto ? dividir(aFormatoWhatsApp(resultado.texto)) : [];
 }
+
+// ─────────────────────────────────────────────────────────────
+// "Que lo atienda el bot" (desde el panel o respondiéndole el dueño por
+// WhatsApp). Con instrucción, el bot le responde al cliente siguiendo lo
+// que dijo el dueño. Devuelve los mensajes que le envió al cliente.
+// ─────────────────────────────────────────────────────────────
+async function atenderConBot(jid, instruccion = null) {
+  await chats.actualizarChat(jid, { bot_activo: true, necesita_humano: false, motivo_humano: null });
+  // Esperar si justo hay un turno en curso en este chat
+  for (let i = 0; i < 120 && procesando.has(jid); i++) await sleep(500);
+  procesando.add(jid);
+  try {
+    const cfg = await obtenerConfig();
+    const chat = await chats.obtenerChat(jid);
+    if (!chat || !transporte?.conectado()) throw new Error('WhatsApp no está conectado.');
+    // Mensajes del cliente que quedaron sin respuesta
+    const hist = await chats.historialReciente(jid, 30);
+    let i = hist.length;
+    while (i > 0 && !hist[i - 1].de_mi) i--;
+    const items = hist.slice(i).map((m) => ({ mensaje: m }));
+    if (!items.length && !instruccion) return [];
+    return (await turnoIA(jid, chat, items, cfg, { notaDueno: instruccion })) || [];
+  } finally {
+    procesando.delete(jid);
+    despachar(jid);   // si el cliente escribió mientras tanto
+  }
+}
+
+// Mensaje escrito en el propio teléfono del bot a su chat "Tú" (cuando el
+// número del dueño es el mismo del bot): también son órdenes para el asistente.
+async function alRecibirPropio(mensaje) {
+  const cfg = await obtenerConfig();
+  if (mensaje.texto && dueno.esDueno(mensaje.jid, cfg)) {
+    dueno.alRecibirDueno(mensaje.texto).catch((e) => console.error('❌ [Dueño]', e.message));
+  }
+}
+
+dueno.init({
+  enviarBloque: async (jid, texto) => enviarBloque(jid, texto, await obtenerConfig()),
+  atenderConBot,
+  conectado: () => !!transporte?.conectado(),
+});
 
 // ─────────────────────────────────────────────────────────────
 // COMPROBANTE → reserva pendiente
@@ -603,7 +669,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('❌ [Bot] Error creando reserva:', e.message);
-    await chats.actualizarChat(jid, { necesita_humano: true, motivo_humano: 'Error registrando su comprobante' });
+    await marcarAtencion(jid, 'mandó su comprobante pero no pude registrarlo en el sistema');
     await responder(jid, 'Recibí tu comprobante 🙌 dame un momento que lo reviso y te confirmo.', cfg);
     return;
   } finally { client.release(); }
@@ -614,7 +680,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
     await responder(jid, tomados.length
       ? `Uy, justo mientras tanto se ocuparon ${tomados.length > 1 ? 'los números' : 'el número'} ${tomados.join(', ')} 😕\n\n¿Quieres que te busque otro${tomados.length > 1 ? 's' : ''}? Tu comprobante ya lo tengo guardado.`
       : 'Recibí tu comprobante, pero no pude apartar los números. Ya le aviso a alguien del equipo para que te ayude.', cfg);
-    if (!tomados.length) await chats.actualizarChat(jid, { necesita_humano: true, motivo_humano: r.error });
+    if (!tomados.length) await marcarAtencion(jid, `mandó su comprobante pero no pude apartar sus números (${r.error})`);
     return;
   }
 
@@ -743,4 +809,4 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { init, alRecibir, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };
+module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };

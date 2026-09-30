@@ -17,6 +17,7 @@ const DEFECTO = {
   modelo: '',
   api_keys: {},
   nombre_negocio: 'Rifas Jordyn',
+  moneda: 'pesos',              // moneda de los precios de las rifas (la IA no debe adivinarla)
   nombre_asistente: '',
   personalidad: PERSONALIDAD_DEFECTO,
   datos_pago: '',

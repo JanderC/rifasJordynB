@@ -38,6 +38,7 @@ function dentroDeHorario(h) {
   const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   return hhmm >= (h.desde || '00:00') && hhmm <= (h.hasta || '23:59');
 }
+const fmtMonto = (n, cfg) => `${Number(n || 0).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
 const fmtFechaVE = () => ahoraVE().toLocaleString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' });
 
 // ── Estado en memoria (se reconstruye solo) ──────────────────
@@ -248,8 +249,8 @@ function crearEjecutor(jid, chat, cfg, efectos) {
           if (!rifas.length) return { rifas: [], nota: 'No hay rifas en venta ahora mismo.' };
           return {
             rifas: rifas.map((r) => ({
-              rifa_id: r.id, nombre: r.nombre, premio: r.premio, precio_por_numero: Number(r.precio),
-              ofertas: (r.ofertas || []).map((o) => `${o.cantidad} números por ${o.precio_total}`),
+              rifa_id: r.id, nombre: r.nombre, premio: r.premio, precio_por_numero: fmtMonto(r.precio, cfg),
+              ofertas: (r.ofertas || []).map((o) => `${o.cantidad} números por ${fmtMonto(o.precio_total, cfg)}`),
               sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' ') || 'por anunciar',
               loteria: r.loteria_ref || null,
               numeros_van_de: `${'0'.repeat(r.cifras)} a ${'9'.repeat(r.cifras)}`,
@@ -309,12 +310,12 @@ function crearEjecutor(jid, chat, cfg, efectos) {
           if (previo && Date.now() - previo.at < 60 * 60000) {
             efectos.comprobantePrevio = previo;
             return {
-              ok: true, total, numeros: nums,
+              ok: true, total_a_pagar: fmtMonto(total, cfg), numeros: nums,
               comprobante: 'El cliente YA envió una imagen de comprobante antes; el sistema la registrará automáticamente. Solo confírmale en una frase que ya la recibiste y que apenas se verifique el pago le llega su ticket.',
             };
           }
           return {
-            ok: true, rifa: rifa.nombre, numeros: nums, total_a_pagar: total,
+            ok: true, rifa: rifa.nombre, numeros: nums, total_a_pagar: fmtMonto(total, cfg),
             datos_de_pago: cfg.datos_pago,
             siguiente_paso: 'Envíale el total y los datos de pago y pídele que mande la captura del comprobante por aquí.',
           };
@@ -348,10 +349,10 @@ function crearEjecutor(jid, chat, cfg, efectos) {
 }
 
 // ── Prompt del sistema ───────────────────────────────────────
-function describirEstado(ec) {
+function describirEstado(ec, cfg) {
   if (!ec?.paso) return 'Sin compra en curso.';
   if (ec.paso === 'esperando_comprobante')
-    return `Compra apartada esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${ec.total}. Si pregunta, recuérdale que mande la captura del pago.`;
+    return `Compra apartada esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}. Si pregunta, recuérdale que mande la captura del pago.`;
   if (ec.paso === 'esperando_confirmacion')
     return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
   if (ec.paso === 'comprobante_sin_compra')
@@ -363,7 +364,7 @@ function construirSistema(cfg, chat) {
   const nombreCliente = chat.nombre_guardado || chat.nombre;
   return `${cfg.personalidad}
 
-Trabajas para "${cfg.nombre_negocio}".${cfg.nombre_asistente ? ` Te llamas ${cfg.nombre_asistente}.` : ''}
+Trabajas para "${cfg.nombre_negocio}". Los precios de los números están en ${cfg.moneda || 'pesos'}: nunca digas otra moneda (ni Bs ni USD) para los precios; el premio dilo tal como viene.${cfg.nombre_asistente ? ` Te llamas ${cfg.nombre_asistente}.` : ''}
 
 CÓMO VENDER
 - Cuando el cliente pregunte por rifas o números, consulta con tus herramientas antes de responder. Si hay una sola rifa en venta, asume esa sin preguntar.
@@ -383,7 +384,7 @@ ${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
 CONTEXTO DE ESTA CONVERSACIÓN
 - Fecha y hora en Venezuela: ${fmtFechaVE()}.
 - Nombre del cliente en WhatsApp: ${nombreCliente || 'desconocido'}.
-- Estado: ${describirEstado(chat.estado_compra)}`;
+- Estado: ${describirEstado(chat.estado_compra, cfg)}`;
 }
 
 // Historial de la BD → mensajes para la IA (cliente=user; bot/humano/teléfono=assistant)
@@ -509,7 +510,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
   bus.emit('wa:reserva', { jid, numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: ec.total });
   await chats.guardarMensaje({
     jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-    texto: `🧾 Reserva creada: ${ec.rifa_nombre} · números ${numeros.join(', ')} · total ${ec.total}${datos?.referencia ? ` · ref ${datos.referencia}` : ''}. Pendiente de aprobar en Reservas.`,
+    texto: `🧾 Reserva creada: ${ec.rifa_nombre} · números ${numeros.join(', ')} · total ${fmtMonto(ec.total, cfg)}${datos?.referencia ? ` · ref ${datos.referencia}` : ''}. Pendiente de aprobar en Reservas.`,
   });
 
   if (!silencioso) {

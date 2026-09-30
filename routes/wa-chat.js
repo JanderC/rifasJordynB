@@ -168,6 +168,15 @@ router.post('/chats/:jid/atender-bot', async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// "Este es el comprobante": registra la reserva con esa foto (último paso de la compra)
+router.post('/chats/:jid/mensajes/:id/es-comprobante', async (req, res) => {
+  try {
+    const r = await bot.registrarComprobanteManual(req.params.jid, Number(req.params.id));
+    if (!r.ok) return res.status(409).json({ error: r.error || 'No se pudo registrar.' });
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // Mensajes al dueño por WhatsApp
 router.post('/dueno/probar', async (req, res) => {
   try { res.json(await dueno.probar()); } catch (e) { res.status(400).json({ error: e.message }); }

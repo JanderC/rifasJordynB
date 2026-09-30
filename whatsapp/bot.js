@@ -133,7 +133,7 @@ async function procesar(jid, items) {
 
   const imagen = [...items].reverse().find((i) => i.mensaje.tipo === 'imagen' && i.mensaje.media_url);
   const paso = chat.estado_compra?.paso;
-  if (imagen && paso === 'esperando_comprobante') {
+  if (imagen && (paso === 'esperando_comprobante' || paso === 'apartado_vencido')) {
     await procesarComprobante(jid, chat, imagen, cfg);
     return;
   }
@@ -463,6 +463,8 @@ function describirEstado(ec, cfg) {
   }
   if (ec.paso === 'esperando_confirmacion')
     return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
+  if (ec.paso === 'apartado_vencido')
+    return `Se le venció el apartado de ${ec.numeros.length > 1 ? 'los números' : 'el número'} ${ec.numeros.join(', ')} de "${ec.rifa_nombre}" porque no mandó la captura a tiempo. Si manda la captura ahora, el sistema la registra si siguen libres; si quiere, puedes apartarlos de nuevo con preparar_compra.`;
   if (ec.paso === 'comprobante_sin_compra')
     return 'Envió una foto (posible comprobante de pago) sin compra en curso. Pregúntale de forma natural para qué rifa y números es, y sus datos, para prepararle la compra.';
   return 'Sin compra en curso.';
@@ -607,6 +609,7 @@ async function alRecibirPropio(mensaje) {
 dueno.init({
   enviarBloque: async (jid, texto) => enviarBloque(jid, texto, await obtenerConfig()),
   atenderConBot,
+  registrarComprobante: (jid) => registrarComprobanteManual(jid, null),
   conectado: () => !!transporte?.conectado(),
 });
 
@@ -619,7 +622,7 @@ async function descargarBase64(url) {
   return Buffer.from(await r.arrayBuffer()).toString('base64');
 }
 
-async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false } = {}) {
+async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false, forzar = false } = {}) {
   const ec = chat.estado_compra;
   const url = imagen.mensaje.media_url;
   const mime = imagen.mensaje.media_mime || 'image/jpeg';
@@ -630,9 +633,11 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
     try { datos = await ia.leerComprobante(cfg, { base64: await descargarBase64(url), mime }); }
     catch (e) { console.warn('⚠️  [Bot] No se pudo leer el comprobante:', e.message); }
   }
-  if (datos && datos.es_comprobante === false && !silencioso) {
+  if (datos && datos.es_comprobante === false && !silencioso && !forzar) {
     await responder(jid, 'Mmm esa imagen no parece un comprobante de pago 🤔\n\n¿Me mandas la captura del pago cuando puedas?', cfg);
-    return;
+    // Por si la IA se equivocó: una persona la puede confirmar con "Este es el comprobante"
+    await marcarAtencion(jid, 'mandó una imagen que no parece un comprobante; si sí lo es, confírmala como comprobante');
+    return { ok: false, error: 'La imagen no parece un comprobante.' };
   }
   // Lo que el sistema le pidió pagar queda junto al comprobante para revisarlo en Reservas
   datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg) };
@@ -671,7 +676,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
     console.error('❌ [Bot] Error creando reserva:', e.message);
     await marcarAtencion(jid, 'mandó su comprobante pero no pude registrarlo en el sistema');
     await responder(jid, 'Recibí tu comprobante 🙌 dame un momento que lo reviso y te confirmo.', cfg);
-    return;
+    return { ok: false, error: 'No se pudo registrar en el sistema.' };
   } finally { client.release(); }
 
   if (!r.ok) {
@@ -681,7 +686,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
       ? `Uy, justo mientras tanto se ocuparon ${tomados.length > 1 ? 'los números' : 'el número'} ${tomados.join(', ')} 😕\n\n¿Quieres que te busque otro${tomados.length > 1 ? 's' : ''}? Tu comprobante ya lo tengo guardado.`
       : 'Recibí tu comprobante, pero no pude apartar los números. Ya le aviso a alguien del equipo para que te ayude.', cfg);
     if (!tomados.length) await marcarAtencion(jid, `mandó su comprobante pero no pude apartar sus números (${r.error})`);
-    return;
+    return { ok: false, error: tomados.length ? `Ya se ocuparon: ${tomados.join(', ')}` : (r.error || 'No se pudo apartar') };
   }
 
   const numeros = r.reservas.map((x) => String(x.numero).trim());
@@ -700,6 +705,44 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false 
   if (!silencioso) {
     const extra = r.conflictos?.length ? `\n\nOjo: ${r.conflictos.map((c) => c.numero).join(', ')} se ocupó mientras tanto, así que quedó solo con ${numeros.join(', ')}.` : '';
     await responder(jid, `Listo ${ec.nombre.split(' ')[0]}, recibí tu comprobante ✅\n\nApenas verifiquemos el pago te llega tu ticket por aquí.${extra}`, cfg);
+  }
+  return { ok: true, numeros, rifa: ec.rifa_nombre, conflictos: (r.conflictos || []).map((c) => c.numero) };
+}
+
+// ─────────────────────────────────────────────────────────────
+// "Este es el comprobante": una persona confirma que la foto es el pago
+// (el bot no lo detectó, la IA dudó, o llegó tarde). Es el último paso:
+// se registra la reserva pendiente con esa foto y se le avisa al cliente.
+// mensajeId null = la última foto que mandó el cliente.
+// ─────────────────────────────────────────────────────────────
+async function registrarComprobanteManual(jid, mensajeId = null) {
+  const r = await pool.query(
+    `SELECT * FROM wa_chat_mensajes
+      WHERE jid = $1 AND de_mi = FALSE AND tipo = 'imagen' AND media_url IS NOT NULL
+        ${mensajeId ? 'AND id = $2' : ''}
+      ORDER BY id DESC LIMIT 1`, mensajeId ? [jid, mensajeId] : [jid]);
+  const img = r.rows[0];
+  if (!img) throw new Error('No encontré la foto del cliente.');
+
+  const ya = await pool.query(`SELECT 1 FROM reservas_cliente WHERE comprobante_base64 = $1 LIMIT 1`, [img.media_url]);
+  if (ya.rows.length) throw new Error('Esa foto ya está registrada como comprobante.');
+
+  const chat = await chats.obtenerChat(jid);
+  const ec = chat?.estado_compra;
+  if (!ec?.numeros?.length || !['esperando_comprobante', 'apartado_vencido'].includes(ec.paso)) {
+    throw new Error('Este cliente todavía no tiene números elegidos. Pídele (o dile al bot) qué números quiere y vuelve a marcar la foto.');
+  }
+
+  for (let i = 0; i < 120 && procesando.has(jid); i++) await sleep(500);
+  procesando.add(jid);
+  try {
+    const cfg = await obtenerConfig();
+    const res = await procesarComprobante(jid, chat, { mensaje: img }, cfg, { forzar: true });
+    if (res?.ok) await chats.actualizarChat(jid, { necesita_humano: false, motivo_humano: null });
+    return res || { ok: false, error: 'No se pudo registrar.' };
+  } finally {
+    procesando.delete(jid);
+    despachar(jid);
   }
 }
 
@@ -771,7 +814,8 @@ async function revisarApartadosVencidos() {
     if (!chat) continue;
     const ec = chat.estado_compra;
     if (ec?.paso === 'esperando_comprobante' && (ec.reservas || []).some((id) => ids.includes(id))) {
-      await chats.actualizarChat(jid, { estado_compra: null });
+      // Se guarda la compra: si la captura llega tarde se registra igual (si siguen libres)
+      await chats.actualizarChat(jid, { estado_compra: { ...ec, paso: 'apartado_vencido', reservas: [], vencio: Date.now() } });
     }
     await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `⌛ Apartado vencido sin comprobante · números ${numeros.join(', ')} liberados` });
     if (cfg.activo && chat.bot_activo && transporte?.conectado()) {
@@ -809,4 +853,4 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };
+module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };

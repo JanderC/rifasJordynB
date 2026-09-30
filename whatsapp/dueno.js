@@ -187,7 +187,7 @@ async function alRecibirDueno(texto) {
   if (/^(cola|pendientes?|mensajes|que hay|lista|quien espera)\b/.test(t)) return enviarResumen({ forzar: true });
   if (/^(siguiente|proximo|otro)\b/.test(t)) return siguiente(f?.tipo === 'chat' ? f.jid : null);
   if (/^(ayuda|menu|comandos|\?)$/.test(t)) {
-    return enviarAlDueno('Así me puedes mandar 👇\n*cola* → quién está esperando\n*siguiente* → el próximo\n*1* → lo atiendes tú · *2* → lo atiendo yo\n*listo* → ya lo atendiste\no escríbeme qué le digo al cliente y se lo paso.');
+    return enviarAlDueno('Así me puedes mandar 👇\n*comprobante* → la última foto del cliente es su pago (se registra la reserva)\n*cola* → quién está esperando\n*siguiente* → el próximo\n*1* → lo atiendes tú · *2* → lo atiendo yo\n*listo* → ya lo atendiste\no escríbeme qué le digo al cliente y se lo paso.');
   }
 
   // Respuesta al resumen
@@ -229,6 +229,15 @@ async function alRecibirDueno(texto) {
       avisados.set(f.jid, Date.now());
       await enviarAlDueno(elegir([`Va, sigo yo con ${quien} 👌`, `Listo, me encargo de ${quien} 💪`]));
       await deps.atenderConBot(f.jid, null);
+      return siguienteSiHay(f.jid);
+    }
+    if (/^(es el |si es el |ese es el )?comprobante$|^registr(a|alo|ala)\b|^si es el pago/.test(t)) {
+      try {
+        const r = await deps.registrarComprobante(f.jid);
+        await enviarAlDueno(`Listo ✅ registré la foto de ${quien} como comprobante: ${r.rifa} · ${r.numeros.length > 1 ? 'números' : 'número'} ${r.numeros.join(', ')}. Ya está pendiente en Reservas para que lo apruebes.`);
+      } catch (e) {
+        await enviarAlDueno(`No pude registrarlo 😕 ${e.message}`);
+      }
       return siguienteSiHay(f.jid);
     }
     if (/^(listo|ya|ya esta|atendido|ya lo atendi|ok listo)$/.test(t)) {

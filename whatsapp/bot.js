@@ -23,6 +23,8 @@ const ia = require('./ia');
 const metodosPago = require('../services/metodosPago');
 const dueno = require('./dueno');
 const envios = require('./envios');
+const resultados = require('../services/resultados');
+const herramientasDueno = require('./herramientasDueno');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -262,6 +264,11 @@ const HERRAMIENTAS = [
     },
   },
   {
+    nombre: 'ver_resultados',
+    descripcion: 'Resultados de los sorteos recientes: qué número salió y quién ganó. Úsala SIEMPRE que pregunten por resultados, el número ganador o quién ganó. Nunca inventes un resultado.',
+    parametros: { type: 'object', properties: {}, required: [] },
+  },
+  {
     nombre: 'preparar_compra',
     descripcion: 'Aparta (bloquea) los números para el cliente cuando ya tienes rifa, números disponibles, nombre y cédula. Si ya sabes cómo va a pagar, pasa metodo_pago y el SISTEMA le envía solo los datos de pago y el monto exacto. Después el cliente manda la captura del comprobante.',
     parametros: {
@@ -328,7 +335,32 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
   const nombresMetodos = Object.keys(metodosPago.METODOS_PAGO);
   return async (nombre, args) => {
     try {
+      // Herramientas del dueño: solo si el mensaje viene de su número
+      if (nombre.startsWith('dueno_')) {
+        if (!dueno.esDueno(jid, cfg)) return { error: 'Esa información es solo para el dueño.' };
+        return (await herramientasDueno.ejecutar(nombre, { ...args, _telefonoDueno: dueno.telefonoDueno(cfg) })) || { error: `Herramienta desconocida: ${nombre}` };
+      }
       switch (nombre) {
+        case 'ver_resultados': {
+          const sorteos = await resultados.sorteosRecientes(21);
+          if (!sorteos.length) return { sorteos: [], nota: 'No hay sorteos recientes.' };
+          const sinCargar = sorteos.filter((s) => s.ya_sorteo && !s.resultados.length);
+          if (sinCargar.length) efectos.resultadoFaltante = sinCargar[0];
+          return {
+            sorteos: sorteos.slice(0, 6).map((s) => ({
+              rifa: s.nombre, fecha: s.fecha_sorteo, hora: s.hora_sorteo?.slice(0, 5) || null, loteria: s.loteria_ref || null,
+              ...(s.resultados.length
+                ? { resultados: s.resultados.map((x) => ({
+                    premio: x.premio, numero_ganador: x.numero, ...(x.serie ? { serie: x.serie } : {}),
+                    // Al cliente no se le dan nombres de vendedores ni datos de otros clientes
+                    ganador: x.ganador
+                      || (/^Nadie/i.test(x.detalle || '') ? 'nadie tenía ese número, esta vez no hubo ganador'
+                        : 'lo vendió uno de nuestros vendedores; el nombre del ganador se anuncia pronto'),
+                  })) }
+                : { resultados: s.ya_sorteo ? 'AÚN NO CARGADO: dile que todavía no tienes el resultado confirmado y que apenas lo tengan se lo dices. No lo inventes.' : 'El sorteo todavía no se ha hecho.' }),
+            })),
+          };
+        }
         case 'ver_rifas': {
           const rifas = await reservas.rifasEnVenta();
           if (!rifas.length) return { rifas: [], nota: 'No hay rifas en venta ahora mismo.' };
@@ -505,6 +537,35 @@ function describirEstado(ec, cfg) {
   return 'Sin compra en curso.';
 }
 
+// ── Modo dueño: trato especial y acceso a la información del negocio ──
+const HERRAMIENTAS_PARA_DUENO = () => [
+  ...HERRAMIENTAS.filter((h) => ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados'].includes(h.nombre)),
+  ...herramientasDueno.DEFINICIONES,
+];
+
+function construirSistemaDueno(cfg) {
+  const nombre = cfg.dueno?.nombre || 'jefe';
+  return `Eres el asistente de confianza de ${nombre}, el DUEÑO de "${cfg.nombre_negocio}". Le escribes por WhatsApp desde el sistema de ventas.
+Él no es un cliente: no le vendas ni le pidas datos. Ayúdalo a manejar el negocio.
+
+QUÉ PUEDES HACER POR ÉL
+- Decirle cómo van las rifas (dueno_resumen_rifa), las ventas en línea (dueno_ventas_en_linea) y los pagos que tiene por aprobar (dueno_pagos_por_aprobar).
+- Buscar un cliente y contarle qué ha comprado (dueno_buscar_cliente), o decirle quién tiene un número (dueno_quien_tiene_numero).
+- Decirle quién está esperando atención en WhatsApp (dueno_clientes_esperando).
+- Guardar el resultado de un sorteo cuando te lo diga (dueno_registrar_resultado) y decirle quién tenía ese número.
+- Consultar rifas, números disponibles y resultados.
+Para saber el rifa_id usa dueno_rifas. Si menciona una rifa por nombre o día ("la del miércoles"), búscala ahí; si hay duda entre dos, pregúntale cuál.
+
+CÓMO HABLARLE
+- Con confianza y directo, como un compañero de trabajo: "${nombre}, ...". Mensajes cortos, sin listas largas ni formalidades.
+- Dale los datos exactos que devuelvan las herramientas (nombres, teléfonos, montos): a él sí se le puede dar la información de los clientes.
+- Si hay varios datos, sepáralos en líneas cortas. Usa *un asterisco* para resaltar algo puntual.
+- Nunca inventes: si no está en el sistema, dilo. Los clientes que le compran a un vendedor no quedan registrados; de ellos solo sabes qué vendedor tiene el número.
+- Recuérdale cuando venga al caso que también puede escribirte *cola* para ver quién espera, o dictarte qué responderle a un cliente.
+
+Fecha y hora en Venezuela: ${fmtFechaVE()}.`;
+}
+
 function construirSistema(cfg, chat, notaDueno = null, compras = null) {
   const nombreCliente = chat.nombre_guardado || chat.nombre;
   return `${cfg.personalidad}
@@ -521,6 +582,14 @@ CÓMO VENDER
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
 - Nunca menciones "series" ni detalles internos del sistema.
+
+RESULTADOS DE LOS SORTEOS
+- Si preguntan qué número salió, los resultados o quién ganó, usa ver_resultados y responde con lo que devuelva: el número ganador y el ganador si ya se anunció.
+- Si el cliente compró, dile con tacto si su número salió o no (mira sus compras recientes en el contexto).
+- Si el resultado aún no está cargado, dilo con naturalidad ("todavía no lo tengo confirmado, apenas esté te aviso") y no lo inventes.
+
+ESTOS TEMAS LOS ATIENDE ${String(cfg.dueno?.nombre || 'el dueño').toUpperCase()} EN PERSONA (usa pasar_a_humano con el motivo y dile al cliente que ya le avisas para que le explique)
+${String(cfg.temas_dueno || '').trim() || '- Quiere ser vendedor o pregunta cómo puede vender números.'}
 
 FORMA DE ESCRIBIR
 - Mensajes cortos, máximo 2 o 3 frases. Si necesitas decir dos cosas distintas, sepáralas con una línea en blanco (cada párrafo se envía como un mensaje aparte).
@@ -571,13 +640,15 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   }
   if (!mensajes.length || mensajes[mensajes.length - 1].role !== 'user') return null;
 
+  const esDueno = !notaDueno && dueno.esDueno(jid, cfg);
   const efectos = {};
   let resultado;
   try {
     resultado = await ia.chatConHerramientas(cfg, {
-      system: construirSistema(cfg, chat, notaDueno, await reservasDelCliente(chat).catch(() => null)),
+      // El dueño tiene su propio modo (y herramientas); con instrucción suya se le escribe a un cliente
+      system: esDueno ? construirSistemaDueno(cfg) : construirSistema(cfg, chat, notaDueno, await reservasDelCliente(chat).catch(() => null)),
       mensajes,
-      herramientas: HERRAMIENTAS,
+      herramientas: esDueno ? HERRAMIENTAS_PARA_DUENO() : HERRAMIENTAS,
       ejecutar: crearEjecutor(jid, chat, cfg, efectos),
       maxPasos: 5,
     });
@@ -589,6 +660,11 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   }
 
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
+
+  // Preguntaron por un resultado que no está cargado: se le pide al dueño (una vez)
+  if (efectos.resultadoFaltante && !esDueno) {
+    dueno.pedirResultado(efectos.resultadoFaltante).catch((e) => console.error('❌ [Dueño] resultado:', e.message));
+  }
 
   // Datos de pago + monto exacto: los manda el sistema, en un solo mensaje
   if (efectos.mensajePago) {

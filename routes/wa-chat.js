@@ -28,6 +28,7 @@ const chats  = require('../services/waChats');
 const wa     = require('../whatsapp/whatsappService');
 const bot    = require('../whatsapp/bot');
 const dueno  = require('../whatsapp/dueno');
+const resultados = require('../services/resultados');
 const ia     = require('../whatsapp/ia');
 const { configPublica, guardarConfig, obtenerConfig } = require('../whatsapp/botConfig');
 
@@ -153,6 +154,25 @@ router.patch('/chats/:jid', async (req, res) => {
     if (!chat) return res.status(404).json({ error: 'Chat no encontrado' });
     res.json(chat);
   } catch (e) { err500(res, e); }
+});
+
+// ── Resultados de los sorteos (el bot los usa para responder) ─
+router.get('/resultados', async (req, res) => {
+  try { res.json(await resultados.sorteosRecientes(Number(req.query.dias) || 45)); } catch (e) { err500(res, e); }
+});
+// Vista previa: quién tiene ese número antes de guardar
+router.get('/resultados/quien', async (req, res) => {
+  try { res.json(await resultados.quienTiene(String(req.query.rifa_id), String(req.query.numero || '').trim())); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/resultados', async (req, res) => {
+  const { rifa_id, numero, premio, serie, ganador } = req.body || {};
+  if (!rifa_id || !numero) return res.status(400).json({ error: 'Faltan la rifa y el número.' });
+  try { res.json(await resultados.registrar({ rifaId: rifa_id, numero, premio: premio || 'Premio mayor', serie: serie || null, ganador: ganador || null })); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.delete('/resultados/:id', async (req, res) => {
+  try { await resultados.eliminar(Number(req.params.id)); res.json({ ok: true }); } catch (e) { err500(res, e); }
 });
 
 // ── Cola de atención ─────────────────────────────────────────

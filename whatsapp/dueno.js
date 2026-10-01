@@ -117,6 +117,23 @@ async function avisarAtencion(jid, motivo) {
   if (await enviarAlDueno(texto)) foco = { at: Date.now(), tipo: 'chat', jid };
 }
 
+// ── Un cliente preguntó por un resultado que aún no está cargado ──
+// Se le pide al dueño una sola vez por rifa (cada 3 h como mucho). Él responde
+// en lenguaje natural ("en la del miércoles cayó el 045") y el bot lo guarda.
+const resultadosPedidos = new Map();   // rifa_id → timestamp
+async function pedirResultado(sorteo) {
+  const cfg = await obtenerConfig();
+  if (!cfg.dueno?.notificar || !jidDueno(cfg) || enSilencio(cfg)) return;
+  const t = resultadosPedidos.get(sorteo.id);
+  if (t && Date.now() - t < 3 * 3600000) return;
+  resultadosPedidos.set(sorteo.id, Date.now());
+  const ok = await enviarAlDueno(
+    `${cfg.dueno.nombre || 'Jefe'}, me están preguntando por el resultado de *${sorteo.nombre}* (sorteo del ${sorteo.fecha_sorteo}) y todavía no lo tengo 🙈\n\n` +
+    `¿Qué número cayó? Dímelo por aquí, por ejemplo: "en ${sorteo.nombre} cayó el 045", y yo lo guardo y se lo digo a los que pregunten.`);
+  // Su respuesta es para el bot (no una instrucción para un cliente que estuviera en foco)
+  if (ok) foco = { at: Date.now(), tipo: 'resultado' };
+}
+
 // ── Resumen periódico de pendientes ──────────────────────────
 function lineaDe(c, i) {
   const motivo = c.necesita_humano && c.motivo_humano ? enMinuscula(c.motivo_humano) : `escribió "${recortar(c.ultimo_del_cliente || c.ultimo_mensaje, 60)}"`;
@@ -290,4 +307,4 @@ async function probar() {
   return { ok: true, pendientes: n };
 }
 
-module.exports = { init, esDueno, jidDueno, telefonoDueno, avisarAtencion, alRecibirDueno, enviarResumen, probar };
+module.exports = { init, esDueno, jidDueno, telefonoDueno, avisarAtencion, pedirResultado, alRecibirDueno, enviarResumen, probar };

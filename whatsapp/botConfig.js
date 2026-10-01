@@ -21,6 +21,8 @@ const DEFECTO = {
   moneda: 'pesos',              // moneda de los precios de las rifas (la IA no debe adivinarla)
   nombre_asistente: '',
   personalidad: PERSONALIDAD_DEFECTO,
+  // Temas que el bot NO resuelve: avisa al dueño para que él dé la información
+  temas_dueno: '- Quiere ser vendedor o pregunta cómo puede vender números.\n- Quiere cobrar un premio.',
   apartado_minutos: 45,         // minutos que quedan bloqueados los números esperando el comprobante
   // El dueño recibe por WhatsApp los clientes que necesitan una persona y puede
   // responder desde ahí mismo (1 = lo atiende él, 2 = sigue el bot, o le dicta qué decir).

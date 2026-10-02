@@ -10,6 +10,7 @@ const chats = require('../services/waChats');
 const reservas = require('../services/reservas');
 const resultados = require('../services/resultados');
 const envios = require('./envios');
+const vendedoresSvc = require('../services/vendedores');
 
 const DEFINICIONES = [
   {
@@ -75,6 +76,11 @@ const DEFINICIONES = [
       },
       required: [],
     },
+  },
+  {
+    nombre: 'dueno_vendedores',
+    descripcion: 'Directorio de vendedores. Sin "vendedor": la lista de todos con cuántos números fijos tienen, en qué rifas participan y cuánto han vendido. Con "vendedor" (nombre, usuario o cédula): su ficha completa con sus números fijos por categoría y los números que tiene en cada rifa. Úsala para "qué vendedores tengo", "qué números fijos tiene X", "en qué rifas está X".',
+    parametros: { type: 'object', properties: { vendedor: { type: 'string', description: 'Nombre, usuario o cédula (o parte), opcional' } }, required: [] },
   },
   {
     nombre: 'dueno_numeros_vendedores',
@@ -284,6 +290,43 @@ async function ejecutar(nombre, args, ctx = {}) {
         ticket: lista[0],
         imagen: fotos.length ? `El SISTEMA te manda ${fotos.length > 1 ? `las ${Math.min(fotos.length, 4)} imágenes` : 'la imagen'} justo después de tu mensaje.` : 'Esta compra no tiene imagen de ticket guardada (se aprobó sin generar la imagen).',
         ...(reenvio ? { reenvio_al_cliente: reenvio } : {}),
+      };
+    }
+    case 'dueno_vendedores': {
+      const filtro = String(args.vendedor || '').trim();
+      const lista = await vendedoresSvc.directorio({ texto: filtro });
+      if (!lista.length) return { encontrado: false, nota: filtro ? 'No hay ningún vendedor con ese nombre, usuario o cédula.' : 'No hay vendedores registrados.' };
+      const series = (s, tipo) => (tipo === 'simultanea'
+        ? Object.fromEntries(Object.entries(s).map(([serie, ns]) => [`serie ${serie}`, enRangos(ns)]))
+        : enRangos(Object.values(s).flat()));
+      // Ficha completa si se buscó a alguien (hasta 3 coincidencias); si no, resumen de todos
+      if (filtro && lista.length <= 3) {
+        return {
+          vendedores: lista.map((v) => ({
+            nombre: v.nombre, usuario: v.usuario, cedula: v.cedula || 'sin cédula', estado: v.activo ? 'activo' : 'inactivo',
+            ventas_registradas: v.total_ventas, total_vendido: pesos(v.total_ingresos),
+            ultima_venta: v.ultima_venta ? haceCuanto(v.ultima_venta) : 'nunca',
+            numeros_fijos: v.numeros_fijos.length
+              ? v.numeros_fijos.map((c) => ({ categoria: c.categoria, tipo: c.tipo, cantidad: c.cantidad, numeros: series(c.series, c.tipo) }))
+              : 'no tiene números fijos',
+            rifas: v.rifas.length
+              ? v.rifas.map((r) => ({
+                  rifa_id: r.rifa_id, rifa: r.rifa, estado: r.activa ? 'en venta' : 'ya sorteada', sorteo: r.fecha_sorteo, categoria: r.categoria,
+                  cantidad: r.cantidad, vendidos_registrados: r.vendidos, numeros: r.cantidad ? series(r.series, r.tipo) : 'sin números asignados',
+                }))
+              : 'no participa en rifas activas ni recientes',
+          })),
+        };
+      }
+      return {
+        total: lista.length, activos: lista.filter((v) => v.activo).length,
+        vendedores: lista.slice(0, 60).map((v) => ({
+          nombre: v.nombre, estado: v.activo ? 'activo' : 'inactivo', numeros_fijos: v.total_numeros_fijos,
+          categorias: v.numeros_fijos.map((c) => c.categoria),
+          rifas: v.rifas.map((r) => `${r.rifa} (${r.cantidad} números${r.activa ? '' : ', ya sorteada'})`),
+          ventas_registradas: v.total_ventas,
+        })),
+        nota: 'Para ver los números de uno, vuelve a llamar con su nombre en "vendedor".',
       };
     }
     case 'dueno_numeros_vendedores': {

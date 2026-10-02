@@ -12,6 +12,7 @@ const router  = express.Router();
 const bcrypt  = require('bcryptjs');
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
+const vendedoresSvc = require('../services/vendedores');
 
 /* ══════════════════════════════════════════════════════════════
    resolverSerie — fuente de verdad para decidir serie destino
@@ -170,6 +171,13 @@ router.get('/', authMiddleware, soloDueno, async (req, res) => {
       ORDER BY u.nombre`);
     res.json(r.rows);
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
+});
+
+// Directorio: cada vendedor con sus datos, sus números fijos por categoría y las
+// rifas donde participa. Debe ir ANTES de '/:id' para que no lo capture esa ruta.
+router.get('/directorio', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await vendedoresSvc.directorio({ texto: req.query.q })); }
+  catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
 });
 
 router.get('/:id', authMiddleware, soloDueno, async (req, res) => {

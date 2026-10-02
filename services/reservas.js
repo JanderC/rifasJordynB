@@ -29,6 +29,20 @@ const esquemaListo = (async () => {
      END $$`,
     `CREATE INDEX IF NOT EXISTS idx_ventas_rifa_origen ON ventas (rifa_id, origen)`,
     `CREATE INDEX IF NOT EXISTS idx_reservas_telefono ON reservas_cliente (telefono)`,
+    // max_dos_ventas era UNIQUE (rifa_id, numero, vendedor_id). Las ventas en línea se
+    // guardan a nombre del dueño, así que la 2da compra en línea del mismo número (serie
+    // B de una simultánea) chocaba y se perdía sin aviso. Ahora:
+    //  - venta en línea: una por reserva
+    //  - venta del panel (sin reserva): la regla de siempre por vendedor
+    // El tope de 2 ventas por número lo sigue poniendo el trigger check_max_ventas.
+    // Se crean los índices nuevos ANTES de quitar el viejo (nunca queda sin protección).
+    `DO $$ BEGIN
+       CREATE UNIQUE INDEX IF NOT EXISTS ventas_una_por_reserva
+         ON ventas (reserva_id) WHERE reserva_id IS NOT NULL;
+       CREATE UNIQUE INDEX IF NOT EXISTS ventas_vendedor_numero_unico
+         ON ventas (rifa_id, numero, vendedor_id) WHERE reserva_id IS NULL;
+       ALTER TABLE ventas DROP CONSTRAINT IF EXISTS max_dos_ventas;
+     END $$`,
   ];
   for (const sql of sqls) {
     try { await pool.query(sql); } catch (e) { console.error('[reservas] esquema:', e.message); }
@@ -258,7 +272,7 @@ async function aprobarReservasTx(client, ids, nota) {
     enTx[clave] = (enTx[clave] || 0) + 1;
 
     const origen = reserva.origen === 'whatsapp' ? 'whatsapp' : 'web';
-    await client.query(`
+    const ins = await client.query(`
       INSERT INTO ventas
         (rifa_id, numero, vendedor_id, nombre_comprador, cedula, correo, telefono,
          precio_venta, observacion, origen, reserva_id)
@@ -271,6 +285,12 @@ async function aprobarReservasTx(client, ids, nota) {
       `Compra ${origen === 'whatsapp' ? 'por WhatsApp' : 'online'} - Reserva #${reserva.id.slice(0, 8)} - ${reserva.metodo_pago || ''}`,
       origen, reserva.id,
     ]);
+    // Sin fila nueva = ya existía la venta de esta reserva (bien) o chocó con otra
+    // regla: entonces no se aprueba a medias (pago aprobado sin venta en Caja)
+    if (!ins.rowCount) {
+      const ya = await client.query(`SELECT 1 FROM ventas WHERE reserva_id = $1`, [reserva.id]);
+      if (!ya.rows.length) throw new Error(`No se pudo registrar la venta del número ${String(reserva.numero).trim()}. Intenta de nuevo.`);
+    }
     aprobadas.push(reserva);
   }
   return { aprobadas, autoRechazadas };

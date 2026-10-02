@@ -2,12 +2,14 @@
 //  herramientasDueno.js — Lo que el bot puede hacer SOLO para el dueño
 //  (se activan únicamente cuando el mensaje viene del número del dueño)
 //  Consultar clientes, quién tiene un número, cómo va una rifa, ventas,
-//  pagos por aprobar, quién espera atención y cargar resultados.
+//  pagos por aprobar, quién espera atención, cargar resultados, ver o
+//  reenviar la imagen de un ticket y ver el reparto de números por vendedor.
 // ============================================================
 const pool = require('../config/db');
 const chats = require('../services/waChats');
 const reservas = require('../services/reservas');
 const resultados = require('../services/resultados');
+const envios = require('./envios');
 
 const DEFINICIONES = [
   {
@@ -60,6 +62,29 @@ const DEFINICIONES = [
       required: ['rifa_id', 'numero'],
     },
   },
+  {
+    nombre: 'dueno_ticket',
+    descripcion: 'Busca la imagen del ticket de una compra en línea ya aprobada (por número, por cliente o ambos). Si encuentra una sola compra, el SISTEMA le manda la imagen del ticket a quien pregunta. Con reenviar_al_cliente=true además se la vuelve a enviar al cliente por WhatsApp (úsalo solo si lo pide expresamente: "reenvíale el ticket"). Los boletos que venden los vendedores no tienen imagen aquí.',
+    parametros: {
+      type: 'object',
+      properties: {
+        numero: { type: 'string', description: 'Número del ticket' },
+        cliente: { type: 'string', description: 'Nombre o teléfono del cliente (o parte)' },
+        rifa_id: { type: 'string', description: 'Opcional, para distinguir entre rifas' },
+        reenviar_al_cliente: { type: 'boolean', description: 'true = volver a enviarle el ticket al cliente' },
+      },
+      required: [],
+    },
+  },
+  {
+    nombre: 'dueno_numeros_vendedores',
+    descripcion: 'Cómo están repartidos los números de una rifa: qué números tiene cada vendedor (en rangos), cuántos son, cuántos lleva vendidos y cuántos quedan libres para la venta en línea. Con "vendedor" devuelve solo ese.',
+    parametros: {
+      type: 'object',
+      properties: { rifa_id: { type: 'string' }, vendedor: { type: 'string', description: 'Nombre del vendedor (o parte), opcional' } },
+      required: ['rifa_id'],
+    },
+  },
 ];
 
 const haceCuanto = (f) => {
@@ -93,7 +118,27 @@ async function resumenDe(rifa) {
   };
 }
 
-async function ejecutar(nombre, args) {
+// ["001","002","003","010"] → "001-003, 010"
+function enRangos(nums) {
+  const orden = [...new Set(nums)].sort((a, b) => Number(a) - Number(b) || a.localeCompare(b));
+  const out = [];
+  let ini = null, prev = null;
+  for (const n of orden) {
+    if (prev != null && Number(n) === Number(prev) + 1) { prev = n; continue; }
+    if (ini != null) out.push(ini === prev ? ini : `${ini}-${prev}`);
+    ini = prev = n;
+  }
+  if (ini != null) out.push(ini === prev ? ini : `${ini}-${prev}`);
+  return out.join(', ');
+}
+
+const ESTADOS_ENVIO = {
+  en_cola: 'en cola para enviarse', esperando_cliente: 'esperando a que el cliente escriba (contacto nuevo)',
+  enviando: 'enviándose', enviado: 'enviado al cliente', error: 'no se pudo enviar',
+};
+
+// ctx: { efectos, prueba } — efectos.fotos son imágenes que el sistema manda después del texto
+async function ejecutar(nombre, args, ctx = {}) {
   switch (nombre) {
     case 'dueno_rifas': {
       const enVenta = await reservas.rifasEnVenta();
@@ -190,6 +235,99 @@ async function ejecutar(nombre, args) {
       const r = await resultados.registrar({ rifaId: args.rifa_id, numero: args.numero, premio: args.premio || 'Premio mayor', serie: args.serie || null, ganador: args.ganador || null });
       return { ok: true, rifa: r.rifa, premio: r.premio, numero: r.numero, ganador_a_anunciar: r.ganador || 'no definido', quien_lo_tenia: r.detalle,
         nota: 'Guardado. Desde ya el bot se lo dice a los clientes que pregunten. Si el ganador a anunciar no es correcto, el dueño puede decir el nombre.' };
+    }
+    case 'dueno_ticket': {
+      const numero = String(args.numero || '').replace(/\D/g, '');
+      const cliente = String(args.cliente || '').trim();
+      if (!numero && cliente.length < 2) return { error: 'Dime el número del ticket o el nombre/teléfono del cliente.' };
+      let rifa = null;
+      if (args.rifa_id) {
+        rifa = await reservas.infoRifa(pool, args.rifa_id);
+        if (!rifa) return { error: 'No encontré esa rifa. Usa dueno_rifas.' };
+      }
+      await envios.tablaLista;
+      const dig = cliente.replace(/\D/g, '');
+      const r = await pool.query(`
+        SELECT e.* FROM wa_envios e
+         WHERE e.tipo = 'ticket'
+           AND ($1 = '' OR EXISTS (SELECT 1 FROM unnest(e.numeros) n WHERE ltrim(n, '0') = ltrim($1, '0')))
+           AND ($2::text IS NULL OR e.rifa = $2)
+           AND ($3 = '' OR e.nombre ILIKE '%' || $3 || '%' OR ($4 <> '' AND e.jid LIKE '%' || $4 || '%'))
+         ORDER BY e.id DESC LIMIT 6`,
+        [numero, rifa?.nombre || null, cliente, dig.length >= 4 ? dig.replace(/^0/, '') : '']);
+      if (!r.rows.length) {
+        return { encontrado: false, nota: 'No hay ticket con esos datos. Solo se guarda la imagen de las compras en línea (página o WhatsApp) ya aprobadas; los boletos de los vendedores no tienen imagen en el sistema.' };
+      }
+      const lista = r.rows.map((e) => ({
+        cliente: e.nombre, telefono: String(e.jid).split('@')[0], rifa: e.rifa, numeros: e.numeros,
+        envio_al_cliente: ESTADOS_ENVIO[e.estado] || e.estado, ...(e.error ? { detalle: e.error } : {}),
+        imagenes: e.imagenes.length, aprobado: haceCuanto(e.created_at),
+      }));
+      if (r.rows.length > 1) return { tickets: lista, nota: 'Hay varias compras que coinciden: pregúntale cuál (por cliente o por rifa) antes de mandar o reenviar nada.' };
+
+      const e = r.rows[0];
+      // La foto i corresponde al número i; si pidió un número, solo esa
+      const sinCeros = (n) => String(n).replace(/^0+(?=\d)/, '');
+      const fotos = e.imagenes
+        .map((url, i) => ({ url, numero: e.numeros[i] }))
+        .filter((f) => !numero || e.imagenes.length === 1 || sinCeros(f.numero) === sinCeros(numero));
+      if (ctx.efectos && fotos.length) {
+        ctx.efectos.fotos = [...(ctx.efectos.fotos || []), ...fotos.slice(0, 4).map((f) => ({ url: f.url, caption: `🎟️ ${e.nombre || 'Cliente'} · ${e.rifa}${f.numero ? ` · ${f.numero}` : ''}` }))];
+      }
+      let reenvio;
+      if (args.reenviar_al_cliente) {
+        if (['en_cola', 'enviando'].includes(e.estado)) reenvio = 'Ya estaba en cola para enviarse al cliente; sale en un momento.';
+        else if (ctx.prueba) reenvio = 'Modo prueba: no se reenvió.';
+        else { await envios.reintentar(e.id); reenvio = 'Listo: se puso en cola y le llega al cliente en un momento.'; }
+      }
+      return {
+        ticket: lista[0],
+        imagen: fotos.length ? `El SISTEMA te manda ${fotos.length > 1 ? `las ${Math.min(fotos.length, 4)} imágenes` : 'la imagen'} justo después de tu mensaje.` : 'Esta compra no tiene imagen de ticket guardada (se aprobó sin generar la imagen).',
+        ...(reenvio ? { reenvio_al_cliente: reenvio } : {}),
+      };
+    }
+    case 'dueno_numeros_vendedores': {
+      const rifa = await reservas.infoRifa(pool, args.rifa_id);
+      if (!rifa) return { error: 'No encontré esa rifa. Usa dueno_rifas.' };
+      const [nums, sel, vendidos, libres] = await Promise.all([
+        pool.query(`
+          SELECT x.vendedor_id, u.nombre, x.numero, x.serie FROM (
+            SELECT vendedor_id, TRIM(numero::text) AS numero, COALESCE(TRIM(serie), 'A') AS serie FROM numeros_vendedor WHERE rifa_id = $1
+            UNION ALL
+            SELECT vendedor_id, TRIM(numero), COALESCE(TRIM(serie), 'A') FROM boleteria_numeros_extra WHERE rifa_id = $1
+          ) x JOIN users u ON u.id = x.vendedor_id`, [rifa.id]),
+        pool.query(`SELECT s.vendedor_id, u.nombre FROM rifa_vendedores_sel s JOIN users u ON u.id = s.vendedor_id WHERE s.rifa_id = $1`, [rifa.id]).catch(() => ({ rows: [] })),
+        pool.query(`SELECT vendedor_id, COUNT(*)::int n FROM ventas WHERE rifa_id = $1 AND COALESCE(origen, 'vendedor') = 'vendedor' GROUP BY 1`, [rifa.id]),
+        reservas.numerosLibres(pool, rifa, { cantidad: 1 }),
+      ]);
+      const simultanea = rifa.tipo === 'simultanea';
+      const porVendedor = new Map();
+      for (const v of sel.rows) porVendedor.set(v.vendedor_id, { vendedor: v.nombre, series: {} });
+      for (const x of nums.rows) {
+        const v = porVendedor.get(x.vendedor_id) || { vendedor: x.nombre, series: {} };
+        (v.series[x.serie] = v.series[x.serie] || []).push(x.numero);
+        porVendedor.set(x.vendedor_id, v);
+      }
+      const ventasDe = Object.fromEntries(vendidos.rows.map((x) => [x.vendedor_id, x.n]));
+      const filtro = String(args.vendedor || '').trim().toLowerCase();
+      let lista = [...porVendedor.entries()].map(([id, v]) => {
+        const todos = Object.values(v.series).flat();
+        return {
+          vendedor: v.vendedor, cantidad: todos.length, vendidos_registrados: ventasDe[id] || 0,
+          numeros: !todos.length ? 'sin números asignados'
+            : simultanea ? Object.fromEntries(Object.entries(v.series).map(([serie, ns]) => [`serie ${serie}`, enRangos(ns)]))
+            : enRangos(todos),
+        };
+      }).sort((a, b) => b.cantidad - a.cantidad);
+      if (filtro) {
+        lista = lista.filter((v) => v.vendedor.toLowerCase().includes(filtro));
+        if (!lista.length) return { rifa: rifa.nombre, encontrado: false, nota: `Ningún vendedor con ese nombre tiene números en esta rifa.` };
+      }
+      return {
+        rifa: rifa.nombre, vendedores: lista.slice(0, 40),
+        ...(filtro ? {} : { total_con_vendedores: nums.rows.length, libres_para_venta_en_linea: libres.totalLibres }),
+        nota: 'vendidos_registrados son las ventas que el vendedor anotó en el sistema. Para asignar, quitar o mover números hay que hacerlo en el panel (Rifas / Números Fijos).',
+      };
     }
     default:
       return null;   // no es una herramienta del dueño

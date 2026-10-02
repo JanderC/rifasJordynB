@@ -9,27 +9,9 @@ const multer  = require('multer');
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { cloudinary, eliminarImagen, extraerPublicId } = require('../config/cloudinary');
+const { tablaLista } = require('../services/ganadores');
 
 const CARPETA = 'rifas-jordyn/ganadores';
-
-const tablaLista = (async () => {
-  try {
-    await pool.query(
-      `CREATE TABLE IF NOT EXISTS ganadores (
-         id          BIGSERIAL PRIMARY KEY,
-         nombre      TEXT NOT NULL,
-         premio      TEXT,
-         numero      VARCHAR(10),
-         rifa        TEXT,                              -- nombre del sorteo (texto libre)
-         ciudad      TEXT,
-         fecha       DATE,
-         imagen_url  TEXT NOT NULL,
-         visible     BOOLEAN NOT NULL DEFAULT TRUE,     -- oculto = no sale en la página pública
-         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-       )`
-    );
-  } catch (e) { console.error('[ganadores] esquema:', e.message); }
-})();
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -61,7 +43,7 @@ function subirACloudinary(buffer) {
   });
 }
 
-const COLUMNAS = `id, nombre, premio, numero, rifa, ciudad, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, visible, created_at`;
+const COLUMNAS = `id, nombre, premio, numero, rifa, rifa_id, ciudad, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, visible, created_at`;
 const ORDEN = `ORDER BY fecha DESC NULLS LAST, created_at DESC`;
 
 const limpio = (v, max = 200) => {
@@ -69,6 +51,7 @@ const limpio = (v, max = 200) => {
   return t || null;
 };
 const fechaValida = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : null);
+const uuidValido = (v) => (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || '')) ? v : null);
 const esVerdadero = (v) => v === true || v === 'true' || v === '1';
 
 // ── GET /api/ganadores ─────────────────────────────────────
@@ -98,7 +81,8 @@ router.get('/admin', authMiddleware, soloDueno, async (req, res) => {
 });
 
 // ── POST /api/ganadores ────────────────────────────────────
-// Form-data: imagen (archivo) + nombre, premio, numero, rifa, ciudad, fecha, visible
+// Form-data: imagen (archivo) + nombre, premio, numero, rifa, rifa_id, ciudad, fecha, visible
+// rifa_id (opcional): el sorteo al que pertenece; así el bot manda esta foto cuando preguntan por ese resultado
 router.post('/', authMiddleware, soloDueno, recibirImagen, async (req, res) => {
   const nombre = limpio(req.body.nombre);
   if (!nombre)   return res.status(400).json({ error: 'El nombre del ganador es obligatorio' });
@@ -109,11 +93,11 @@ router.post('/', authMiddleware, soloDueno, recibirImagen, async (req, res) => {
     await tablaLista;
     url = await subirACloudinary(req.file.buffer);
     const r = await pool.query(
-      `INSERT INTO ganadores (nombre, premio, numero, rifa, ciudad, fecha, imagen_url, visible)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO ganadores (nombre, premio, numero, rifa, ciudad, fecha, imagen_url, visible, rifa_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING ${COLUMNAS}`,
       [nombre, limpio(req.body.premio), limpio(req.body.numero, 10), limpio(req.body.rifa), limpio(req.body.ciudad),
-       fechaValida(req.body.fecha), url, req.body.visible === undefined ? true : esVerdadero(req.body.visible)]
+       fechaValida(req.body.fecha), url, req.body.visible === undefined ? true : esVerdadero(req.body.visible), uuidValido(req.body.rifa_id)]
     );
     res.status(201).json(r.rows[0]);
   } catch (err) {
@@ -139,11 +123,11 @@ router.put('/:id', authMiddleware, soloDueno, recibirImagen, async (req, res) =>
     const r = await pool.query(
       `UPDATE ganadores
           SET nombre = $1, premio = $2, numero = $3, rifa = $4, ciudad = $5, fecha = $6,
-              imagen_url = COALESCE($7, imagen_url), visible = $8
+              imagen_url = COALESCE($7, imagen_url), visible = $8, rifa_id = $10
         WHERE id = $9
         RETURNING ${COLUMNAS}`,
       [nombre, limpio(req.body.premio), limpio(req.body.numero, 10), limpio(req.body.rifa), limpio(req.body.ciudad),
-       fechaValida(req.body.fecha), urlNueva, esVerdadero(req.body.visible), req.params.id]
+       fechaValida(req.body.fecha), urlNueva, esVerdadero(req.body.visible), req.params.id, uuidValido(req.body.rifa_id)]
     );
     if (urlNueva) await eliminarImagen(extraerPublicId(actual.rows[0].imagen_url));
     res.json(r.rows[0]);

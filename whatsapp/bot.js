@@ -25,8 +25,9 @@ const dueno = require('./dueno');
 const envios = require('./envios');
 const resultados = require('../services/resultados');
 const herramientasDueno = require('./herramientasDueno');
+const ganadores = require('../services/ganadores');
 
-let transporte = null;   // lo inyecta whatsappService: { enviarTexto, escribiendo, leer, conectado }
+let transporte = null;   // lo inyecta whatsappService: { enviarTexto, enviarImagen, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -229,6 +230,20 @@ async function responder(jid, texto, cfg) {
   }
 }
 
+// Fotos que pidió enviar la IA (ganadores, tickets): salen después de su texto
+// fotos: [{ url, caption }]
+const MAX_FOTOS_TURNO = 4;
+async function enviarFotos(jid, fotos) {
+  for (const f of fotos.slice(0, MAX_FOTOS_TURNO)) {
+    await sleep(azar(900, 2000));
+    await transporte.escribiendo(jid, azar(900, 1800));
+    await transporte.enviarImagen(jid, f.url, f.caption || '', { autor: 'bot' });
+    const r = respuestasRecientes.get(jid) || [];
+    r.push(Date.now());
+    respuestasRecientes.set(jid, r.slice(-30));
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // HERRAMIENTAS que la IA puede usar
 // ─────────────────────────────────────────────────────────────
@@ -265,8 +280,17 @@ const HERRAMIENTAS = [
   },
   {
     nombre: 'ver_resultados',
-    descripcion: 'Resultados de los sorteos recientes: qué número salió y quién ganó. Úsala SIEMPRE que pregunten por resultados, el número ganador o quién ganó. Nunca inventes un resultado.',
+    descripcion: 'Resultados de los sorteos recientes: qué número salió y quién ganó. Úsala SIEMPRE que pregunten por resultados, el número ganador o quién ganó. Nunca inventes un resultado. Si un resultado trae foto_ganador_id, hay foto del ganador para enviar.',
     parametros: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    nombre: 'enviar_foto_ganador',
+    descripcion: 'Envía por WhatsApp la foto del ganador de un sorteo (la manda el SISTEMA después de tu mensaje). Úsala cuando respondas qué número cayó o quién ganó y ese resultado tenga foto_ganador_id en ver_resultados. Solo las fotos del sorteo por el que preguntan.',
+    parametros: {
+      type: 'object',
+      properties: { foto_ids: { type: 'array', items: { type: 'integer' }, description: 'Los foto_ganador_id de ver_resultados' } },
+      required: ['foto_ids'],
+    },
   },
   {
     nombre: 'preparar_compra',
@@ -338,7 +362,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
       // Herramientas del dueño: solo si el mensaje viene de su número o del de un administrador
       if (nombre.startsWith('dueno_')) {
         if (!dueno.adminDe(jid, cfg)) return { error: 'Esa información es solo para el dueño.' };
-        return (await herramientasDueno.ejecutar(nombre, { ...args, _telefonoDueno: dueno.telefonoDueno(cfg) })) || { error: `Herramienta desconocida: ${nombre}` };
+        return (await herramientasDueno.ejecutar(nombre, { ...args, _telefonoDueno: dueno.telefonoDueno(cfg) }, { efectos, prueba })) || { error: `Herramienta desconocida: ${nombre}` };
       }
       switch (nombre) {
         case 'ver_resultados': {
@@ -346,7 +370,9 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (!sorteos.length) return { sorteos: [], nota: 'No hay sorteos recientes.' };
           const sinCargar = sorteos.filter((s) => s.ya_sorteo && !s.resultados.length);
           if (sinCargar.length) efectos.resultadoFaltante = sinCargar[0];
+          const fotos = await ganadores.fotosDeResultados(sorteos.slice(0, 6)).catch(() => new Map());
           return {
+            ...(fotos.size ? { nota_fotos: 'Los resultados con foto_ganador_id tienen foto del ganador: si te preguntan por ese sorteo, envíala con enviar_foto_ganador.' } : {}),
             sorteos: sorteos.slice(0, 6).map((s) => ({
               rifa: s.nombre, fecha: s.fecha_sorteo, hora: s.hora_sorteo?.slice(0, 5) || null, loteria: s.loteria_ref || null,
               ...(s.resultados.length
@@ -356,10 +382,23 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
                     ganador: x.ganador
                       || (/^Nadie/i.test(x.detalle || '') ? 'nadie tenía ese número, esta vez no hubo ganador'
                         : 'lo vendió uno de nuestros vendedores; el nombre del ganador se anuncia pronto'),
+                    ...(fotos.has(x.id) ? { foto_ganador_id: fotos.get(x.id).id } : {}),
                   })) }
                 : { resultados: s.ya_sorteo ? 'AÚN NO CARGADO: dile que todavía no tienes el resultado confirmado y que apenas lo tengan se lo dices. No lo inventes.' : 'El sorteo todavía no se ha hecho.' }),
             })),
           };
+        }
+        case 'enviar_foto_ganador': {
+          const lista = await ganadores.porIds(args.foto_ids);
+          if (!lista.length) return { error: 'No hay foto cargada de ese ganador. No digas que la envías.' };
+          // No repetirle la misma foto al mismo chat
+          const nuevas = lista.filter((g) => prueba || !yaAvisado(`foto_ganador_${g.id}`, jid, 12));
+          if (!nuevas.length) return { ok: true, nota: 'Esa foto ya se la enviaste hace poco en este chat; no la repitas.' };
+          efectos.fotos = [...(efectos.fotos || []), ...nuevas.map((g) => ({
+            url: g.imagen_url,
+            caption: `🏆 ${g.nombre}${g.premio ? ` — ${g.premio}` : ''}${g.numero ? ` · número ${g.numero}` : ''}`,
+          }))];
+          return { ok: true, nota: `El SISTEMA envía ${nuevas.length > 1 ? 'las fotos' : 'la foto'} justo después de tu mensaje. Menciónalo en una frase corta y natural, sin enlaces.` };
         }
         case 'ver_rifas': {
           const rifas = await reservas.rifasEnVenta();
@@ -539,7 +578,7 @@ function describirEstado(ec, cfg) {
 
 // ── Modo dueño: trato especial y acceso a la información del negocio ──
 const HERRAMIENTAS_PARA_DUENO = () => [
-  ...HERRAMIENTAS.filter((h) => ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados'].includes(h.nombre)),
+  ...HERRAMIENTAS.filter((h) => ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_foto_ganador'].includes(h.nombre)),
   ...herramientasDueno.DEFINICIONES,
 ];
 
@@ -554,7 +593,10 @@ QUÉ PUEDES HACER
 - Buscar un cliente y contarle qué ha comprado (dueno_buscar_cliente), o decirle quién tiene un número (dueno_quien_tiene_numero).
 - Decirle quién está esperando atención en WhatsApp (dueno_clientes_esperando).
 - Guardar el resultado de un sorteo cuando te lo diga (dueno_registrar_resultado) y decirle quién tenía ese número.
-- Consultar rifas, números disponibles y resultados.
+- Mandarle la imagen del ticket de un cliente, o reenviársela al cliente si no le llegó o la perdió (dueno_ticket). Solo hay imagen de los tickets de compras en línea ya aprobadas.
+- Decirle cómo están repartidos los números de una rifa entre los vendedores y cuáles tiene cada uno (dueno_numeros_vendedores).
+- Consultar rifas, números disponibles y resultados, y mandarle la foto de un ganador (enviar_foto_ganador).
+Asignar, quitar o mover números entre vendedores todavía NO lo puedes hacer desde aquí: eso se hace en el panel (Rifas / Números Fijos). Dilo así si te lo pide, sin inventar que lo hiciste.
 Para saber el rifa_id usa dueno_rifas. Si menciona una rifa por nombre o día ("la del miércoles"), búscala ahí; si hay duda entre dos, pregúntale cuál.
 
 CÓMO HABLARLE
@@ -588,6 +630,7 @@ RESULTADOS DE LOS SORTEOS
 - Si preguntan qué número salió, los resultados o quién ganó, usa ver_resultados y responde con lo que devuelva: el número ganador y el ganador si ya se anunció.
 - Si el cliente compró, dile con tacto si su número salió o no (mira sus compras recientes en el contexto).
 - Si el resultado aún no está cargado, dilo con naturalidad ("todavía no lo tengo confirmado, apenas esté te aviso") y no lo inventes.
+- Si el resultado por el que preguntan trae foto_ganador_id, envía la foto del ganador con enviar_foto_ganador (la manda el sistema después de tu mensaje). Si no trae, no ofrezcas ni prometas foto.
 
 ESTOS TEMAS LOS ATIENDE ${String(cfg.dueno?.nombre || 'el dueño').toUpperCase()} EN PERSONA (usa pasar_a_humano con el motivo y dile al cliente que ya le avisas para que le explique)
 ${String(cfg.temas_dueno || '').trim() || '- Quiere ser vendedor o pregunta cómo puede vender números.'}
@@ -666,6 +709,11 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   // Preguntaron por un resultado que no está cargado: se le pide al dueño (una vez)
   if (efectos.resultadoFaltante && !esDueno) {
     dueno.pedirResultado(efectos.resultadoFaltante).catch((e) => console.error('❌ [Dueño] resultado:', e.message));
+  }
+
+  // Fotos pedidas por la IA (ganador, ticket): las manda el sistema
+  if (efectos.fotos?.length) {
+    await enviarFotos(jid, efectos.fotos).catch((e) => console.error('❌ [Bot] No se pudo enviar la foto:', e.message));
   }
 
   // Datos de pago + monto exacto: los manda el sistema, en un solo mensaje
@@ -963,6 +1011,7 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
     maxPasos: 5,
   });
   const partes = dividir(aFormatoWhatsApp(texto || ''));
+  for (const f of efectos.fotos || []) partes.push(`📷 [foto] ${f.caption || ''}\n${f.url}`);
   if (efectos.mensajePago) partes.push(efectos.mensajePago);
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }

@@ -482,7 +482,7 @@ async function marcarChatLeido(jid) {
   await leer(jid, keys).catch(() => {});
 }
 
-bot.init({ enviarTexto, escribiendo, leer, conectado: () => !!sock && connectionStatus === 'open' });
+bot.init({ enviarTexto, enviarImagen, escribiendo, leer, conectado: () => !!sock && connectionStatus === 'open' });
 
 // ¿El número tiene WhatsApp? (true/false; null si no se pudo saber)
 async function existeEnWhatsApp(jid) {

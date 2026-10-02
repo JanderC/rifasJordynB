@@ -35,6 +35,11 @@ const DEFECTO = {
     silencio_hasta: '07:00',
     panel_url: 'https://rifas-jordyn-f.vercel.app/whatsapp',
   },
+  // Administradores: además del dueño, pueden preguntarle al bot cosas del sistema
+  // (ventas, clientes, pagos por aprobar…). No reciben los avisos ni manejan la cola.
+  administradores: [
+    { nombre: 'Lorena Rangel', telefono: '584121015761' },
+  ],
   info_extra: '',
   pedir_cedula: true,
   leer_comprobantes: true,

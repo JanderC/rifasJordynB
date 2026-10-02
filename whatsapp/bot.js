@@ -335,9 +335,9 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
   const nombresMetodos = Object.keys(metodosPago.METODOS_PAGO);
   return async (nombre, args) => {
     try {
-      // Herramientas del dueño: solo si el mensaje viene de su número
+      // Herramientas del dueño: solo si el mensaje viene de su número o del de un administrador
       if (nombre.startsWith('dueno_')) {
-        if (!dueno.esDueno(jid, cfg)) return { error: 'Esa información es solo para el dueño.' };
+        if (!dueno.adminDe(jid, cfg)) return { error: 'Esa información es solo para el dueño.' };
         return (await herramientasDueno.ejecutar(nombre, { ...args, _telefonoDueno: dueno.telefonoDueno(cfg) })) || { error: `Herramienta desconocida: ${nombre}` };
       }
       switch (nombre) {
@@ -543,12 +543,13 @@ const HERRAMIENTAS_PARA_DUENO = () => [
   ...herramientasDueno.DEFINICIONES,
 ];
 
-function construirSistemaDueno(cfg) {
-  const nombre = cfg.dueno?.nombre || 'jefe';
-  return `Eres el asistente de confianza de ${nombre}, el DUEÑO de "${cfg.nombre_negocio}". Le escribes por WhatsApp desde el sistema de ventas.
-Él no es un cliente: no le vendas ni le pidas datos. Ayúdalo a manejar el negocio.
+function construirSistemaDueno(cfg, admin = null) {
+  const esAdmin = admin && !admin.esDueno;
+  const nombre = (esAdmin ? admin.nombre.split(' ')[0] : cfg.dueno?.nombre) || 'jefe';
+  return `Eres el asistente de confianza de ${esAdmin ? `${admin.nombre || nombre}, ADMINISTRADORA/OR` : `${nombre}, el DUEÑO`} de "${cfg.nombre_negocio}"${esAdmin ? ` (el dueño es ${cfg.dueno?.nombre || 'otra persona'})` : ''}. Le escribes por WhatsApp desde el sistema de ventas.
+No es un cliente: no le vendas ni le pidas datos. Ayúdale a manejar el negocio.
 
-QUÉ PUEDES HACER POR ÉL
+QUÉ PUEDES HACER
 - Decirle cómo van las rifas (dueno_resumen_rifa), las ventas en línea (dueno_ventas_en_linea) y los pagos que tiene por aprobar (dueno_pagos_por_aprobar).
 - Buscar un cliente y contarle qué ha comprado (dueno_buscar_cliente), o decirle quién tiene un número (dueno_quien_tiene_numero).
 - Decirle quién está esperando atención en WhatsApp (dueno_clientes_esperando).
@@ -558,10 +559,10 @@ Para saber el rifa_id usa dueno_rifas. Si menciona una rifa por nombre o día ("
 
 CÓMO HABLARLE
 - Con confianza y directo, como un compañero de trabajo: "${nombre}, ...". Mensajes cortos, sin listas largas ni formalidades.
-- Dale los datos exactos que devuelvan las herramientas (nombres, teléfonos, montos): a él sí se le puede dar la información de los clientes.
+- Dale los datos exactos que devuelvan las herramientas (nombres, teléfonos, montos): sí se le puede dar la información de los clientes.
 - Si hay varios datos, sepáralos en líneas cortas. Usa *un asterisco* para resaltar algo puntual.
-- Nunca inventes: si no está en el sistema, dilo. Los clientes que le compran a un vendedor no quedan registrados; de ellos solo sabes qué vendedor tiene el número.
-- Recuérdale cuando venga al caso que también puede escribirte *cola* para ver quién espera, o dictarte qué responderle a un cliente.
+- Nunca inventes: si no está en el sistema, dilo. Los clientes que le compran a un vendedor no quedan registrados; de ellos solo sabes qué vendedor tiene el número.${esAdmin ? '' : `
+- Recuérdale cuando venga al caso que también puede escribirte *cola* para ver quién espera, o dictarte qué responderle a un cliente.`}
 
 Fecha y hora en Venezuela: ${fmtFechaVE()}.`;
 }
@@ -640,13 +641,14 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   }
   if (!mensajes.length || mensajes[mensajes.length - 1].role !== 'user') return null;
 
-  const esDueno = !notaDueno && dueno.esDueno(jid, cfg);
+  const admin = notaDueno ? null : dueno.adminDe(jid, cfg);
+  const esDueno = !!admin;
   const efectos = {};
   let resultado;
   try {
     resultado = await ia.chatConHerramientas(cfg, {
-      // El dueño tiene su propio modo (y herramientas); con instrucción suya se le escribe a un cliente
-      system: esDueno ? construirSistemaDueno(cfg) : construirSistema(cfg, chat, notaDueno, await reservasDelCliente(chat).catch(() => null)),
+      // El dueño y los administradores tienen su propio modo (y herramientas); con instrucción del dueño se le escribe a un cliente
+      system: esDueno ? construirSistemaDueno(cfg, admin) : construirSistema(cfg, chat, notaDueno, await reservasDelCliente(chat).catch(() => null)),
       mensajes,
       herramientas: esDueno ? HERRAMIENTAS_PARA_DUENO() : HERRAMIENTAS,
       ejecutar: crearEjecutor(jid, chat, cfg, efectos),

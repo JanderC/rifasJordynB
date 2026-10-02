@@ -70,6 +70,7 @@ app.use("/api/ticket-templates",   require("./routes/ticketTemplates"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);
 app.use("api/ticket-templates", require("./routes/ticketTemplates"));
 app.use("/api/upload", require("./routes/upload"));
+app.use("/api/ganadores", require("./routes/ganadores"));   // galería de ganadores (pública + configuración)
 app.use("/api/baileys", require("./routes/wa-baileys"));
 app.use("/api/wa-chat", require("./routes/wa-chat"));      // panel de chats en tiempo real + bot/IA
 

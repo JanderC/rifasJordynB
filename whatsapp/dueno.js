@@ -26,10 +26,13 @@ const soloDigitos = (t) => String(t || '').replace(/\D/g, '');
 const normalizar = (t) => String(t || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 
 // ── Quién es el dueño ────────────────────────────────────────
-function telefonoDueno(cfg) {
-  let t = soloDigitos(cfg.dueno?.telefono);
+function normalizarTelefono(tel) {
+  let t = soloDigitos(tel);
   if (t.startsWith('0')) t = '58' + t.slice(1);
   return t || null;
+}
+function telefonoDueno(cfg) {
+  return normalizarTelefono(cfg.dueno?.telefono);
 }
 function jidDueno(cfg) {
   const t = telefonoDueno(cfg);
@@ -38,6 +41,14 @@ function jidDueno(cfg) {
 function esDueno(jid, cfg) {
   const t = telefonoDueno(cfg);
   return !!t && String(jid || '').split('@')[0].split(':')[0] === t;
+}
+// Administrador que escribe (el dueño o alguien de cfg.administradores), o null.
+// Pueden consultar el sistema; las órdenes (cola, 1, 2…) siguen siendo solo del dueño.
+function adminDe(jid, cfg) {
+  if (esDueno(jid, cfg)) return { nombre: cfg.dueno?.nombre || '', telefono: telefonoDueno(cfg), esDueno: true };
+  const t = String(jid || '').split('@')[0].split(':')[0];
+  const a = (cfg.administradores || []).find((x) => normalizarTelefono(x?.telefono) === t);
+  return a ? { nombre: a.nombre || '', telefono: t, esDueno: false } : null;
 }
 
 function enSilencio(cfg) {
@@ -307,4 +318,4 @@ async function probar() {
   return { ok: true, pendientes: n };
 }
 
-module.exports = { init, esDueno, jidDueno, telefonoDueno, avisarAtencion, pedirResultado, alRecibirDueno, enviarResumen, probar };
+module.exports = { init, esDueno, adminDe, jidDueno, telefonoDueno, avisarAtencion, pedirResultado, alRecibirDueno, enviarResumen, probar };

@@ -31,26 +31,45 @@ function nombreCorto(nombre) {
   return p.length === 1 ? p[0] : `${p[0]} ${p[p.length > 2 ? 2 : 1][0].toUpperCase()}.`;
 }
 
-// Quién tiene un número en una rifa: comprador en línea, vendedor que lo tenía, reserva en curso o nadie
+// Quién tiene un número en una rifa: comprador en línea (página o WhatsApp), venta
+// registrada en el panel, vendedor que lo tenía, reserva en curso o nadie
 async function quienTiene(rifaId, numero) {
   const [ventas, fijos, extras, reservas] = await Promise.all([
-    pool.query(`SELECT v.nombre_comprador, v.telefono, v.cedula, COALESCE(v.origen, 'vendedor') AS origen, u.nombre AS vendedor
+    // El canal sale de `origen`; las ventas en línea viejas (sin origen) se reconocen por la observación
+    pool.query(`SELECT v.nombre_comprador, v.telefono, v.cedula, v.created_at, v.reserva_id, u.nombre AS vendedor,
+                       CASE WHEN v.origen IN ('web', 'whatsapp') THEN v.origen
+                            WHEN v.observacion LIKE 'Compra online%' THEN 'web'
+                            WHEN v.observacion LIKE 'Compra por WhatsApp%' THEN 'whatsapp'
+                            ELSE 'vendedor' END AS origen
                   FROM ventas v LEFT JOIN users u ON u.id = v.vendedor_id
-                 WHERE v.rifa_id = $1 AND TRIM(v.numero) = $2`, [rifaId, numero]),
+                 WHERE v.rifa_id = $1 AND TRIM(v.numero) = $2
+                 ORDER BY v.created_at`, [rifaId, numero]),
     pool.query(`SELECT COALESCE(nv.serie, 'A') AS serie, u.nombre AS vendedor
                   FROM numeros_vendedor nv JOIN users u ON u.id = nv.vendedor_id
                  WHERE nv.rifa_id = $1 AND TRIM(nv.numero::text) = $2`, [rifaId, numero]),
     pool.query(`SELECT bx.serie, u.nombre AS vendedor
                   FROM boleteria_numeros_extra bx JOIN users u ON u.id = bx.vendedor_id
                  WHERE bx.rifa_id = $1 AND TRIM(bx.numero) = $2`, [rifaId, numero]),
-    pool.query(`SELECT nombre_cliente, telefono, estado FROM reservas_cliente
-                 WHERE rifa_id = $1 AND TRIM(numero) = $2 AND estado IN ('pendiente', 'apartado')`, [rifaId, numero]),
+    pool.query(`SELECT id, nombre_cliente, telefono, cedula, estado, COALESCE(origen, 'web') AS origen, updated_at
+                  FROM reservas_cliente
+                 WHERE rifa_id = $1 AND TRIM(numero) = $2
+                   AND (estado IN ('pendiente', 'aprobado') OR (estado = 'apartado' AND apartado_hasta > NOW()))
+                 ORDER BY updated_at`, [rifaId, numero]),
   ]);
+  // Una reserva aprobada ES una venta en línea aunque no tenga su fila en ventas
+  // (venta anulada en Historial, o no se pudo insertar): el número no está libre.
+  const conVenta = new Set(ventas.rows.map((v) => v.reserva_id).filter(Boolean));
+  const aprobadasSinVenta = reservas.rows.filter((r) => r.estado === 'aprobado' && !conVenta.has(r.id));
   return {
     numero,
-    compradores_en_linea: ventas.rows.filter((v) => v.origen !== 'vendedor').map((v) => ({ nombre: v.nombre_comprador, telefono: v.telefono, cedula: v.cedula, canal: v.origen })),
+    compradores_en_linea: [
+      ...ventas.rows.filter((v) => v.origen !== 'vendedor').map((v) => ({ nombre: v.nombre_comprador, telefono: v.telefono, cedula: v.cedula, canal: v.origen, fecha: v.created_at })),
+      ...aprobadasSinVenta.map((r) => ({ nombre: r.nombre_cliente, telefono: r.telefono, cedula: r.cedula, canal: r.origen === 'whatsapp' ? 'whatsapp' : 'web', fecha: r.updated_at, sin_venta_registrada: true })),
+    ],
+    // Ventas anotadas en el panel (por un vendedor o venta directa del dueño), con su comprador
+    ventas_registradas: ventas.rows.filter((v) => v.origen === 'vendedor').map((v) => ({ nombre: v.nombre_comprador, telefono: v.telefono, cedula: v.cedula, vendedor: v.vendedor, fecha: v.created_at })),
     vendedores: [...fijos.rows, ...extras.rows].map((x) => ({ vendedor: x.vendedor, serie: String(x.serie || '').trim() || null })),
-    reservas_en_curso: reservas.rows.map((r) => ({ nombre: r.nombre_cliente, telefono: r.telefono, estado: r.estado })),
+    reservas_en_curso: reservas.rows.filter((r) => r.estado !== 'aprobado').map((r) => ({ nombre: r.nombre_cliente, telefono: r.telefono, estado: r.estado })),
   };
 }
 

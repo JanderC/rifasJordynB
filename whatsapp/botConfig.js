@@ -23,7 +23,7 @@ const DEFECTO = {
   personalidad: PERSONALIDAD_DEFECTO,
   // Temas que el bot NO resuelve: avisa al dueño para que él dé la información
   temas_dueno: '- Quiere ser vendedor o pregunta cómo puede vender números.\n- Quiere cobrar un premio.',
-  apartado_minutos: 45,         // minutos que quedan bloqueados los números esperando el comprobante
+  apartado_minutos: 45,         // minutos que quedan bloqueados los números esperando el comprobante (en el panel se escribe en horas)
   // El dueño recibe por WhatsApp los clientes que necesitan una persona y puede
   // responder desde ahí mismo (1 = lo atiende él, 2 = sigue el bot, o le dicta qué decir).
   dueno: {

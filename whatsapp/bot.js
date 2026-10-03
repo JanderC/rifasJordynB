@@ -351,8 +351,18 @@ async function prepararPago(metodo, ec, efectos) {
   return monto;
 }
 
+// El apartado se configura en horas: al cliente se le dice "3 horas", "1 hora y 30 minutos" o "45 minutos"
+function duracionTexto(min) {
+  const total = Math.max(0, Math.round(min));
+  const horas = Math.floor(total / 60);
+  const resto = total % 60;
+  const h = horas ? `${horas} ${horas === 1 ? 'hora' : 'horas'}` : '';
+  const m = resto || !horas ? `${resto} ${resto === 1 ? 'minuto' : 'minutos'}` : '';
+  return h && m ? `${h} y ${m}` : h || m;
+}
+
 const NOTA_PAGO_ENVIADO = (min) =>
-  `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${min} minutos mientras paga.`;
+  `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${duracionTexto(min)} mientras paga.`;
 
 // prueba=true: modo simulador del panel (no escribe nada en la BD)
 function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
@@ -502,10 +512,10 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             };
           }
           if (metodo) {
-            return { ok: true, numeros: nums, apartados_por_minutos: minutos, total: fmtMonto(total, cfg), monto_en_su_metodo: estado.monto.texto, nota: NOTA_PAGO_ENVIADO(minutos) };
+            return { ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg), monto_en_su_metodo: estado.monto.texto, nota: NOTA_PAGO_ENVIADO(minutos) };
           }
           return {
-            ok: true, numeros: nums, apartados_por_minutos: minutos, total: fmtMonto(total, cfg),
+            ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg),
             metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial),
             instruccion: 'Ya quedaron apartados. Pregúntale con qué método va a pagar y luego usa elegir_metodo_pago.',
           };
@@ -566,7 +576,7 @@ function describirEstado(ec, cfg) {
     const quedan = ec.apartado_hasta ? Math.max(0, Math.round((ec.apartado_hasta - Date.now()) / 60000)) : null;
     return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
       (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron` : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
-      (quedan != null ? `. Le quedan ${quedan} minutos de apartado` : '') + '. Si pregunta, recuérdale que mande la captura del pago.';
+      (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '') + '. Si pregunta, recuérdale que mande la captura del pago.';
   }
   if (ec.paso === 'esperando_confirmacion')
     return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
@@ -621,7 +631,7 @@ CÓMO VENDER
 - Cuando el cliente pregunte por rifas o números, consulta con tus herramientas antes de responder. Si hay una sola rifa en venta, asume esa sin preguntar.
 - Si un número no está disponible, dilo sin rodeos y ofrece alternativas parecidas (numeros_disponibles, por ejemplo con la misma terminación).
 - Para apartar necesitas: la rifa, los números, nombre y apellido${cfg.pedir_cedula ? ' y cédula' : ''}. Pídelos conversando, no como formulario, y solo lo que falte.
-- Con todo listo usa preparar_compra: los números quedan bloqueados ${cfg.apartado_minutos || 45} minutos para el cliente. Si ya dijo cómo paga, pásalo en metodo_pago; si no, pregúntale y usa elegir_metodo_pago.
+- Con todo listo usa preparar_compra: los números quedan bloqueados ${duracionTexto(cfg.apartado_minutos || 45)} para el cliente. Si ya dijo cómo paga, pásalo en metodo_pago; si no, pregúntale y usa elegir_metodo_pago.
 - Métodos de pago: ${Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial).join(', ')} (efectivo lo coordina una persona).
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.

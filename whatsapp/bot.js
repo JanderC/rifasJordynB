@@ -302,7 +302,7 @@ const HERRAMIENTAS = [
         numeros: { type: 'array', items: { type: 'string' } },
         nombre: { type: 'string', description: 'Nombre y apellido del cliente' },
         cedula: { type: 'string', description: 'Cédula de identidad del cliente' },
-        metodo_pago: { type: 'string', description: 'Pago Móvil, Nequi, Bancolombia o Zelle (opcional si aún no lo dijo)' },
+        metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle (opcional si aún no lo dijo)' },
       },
       required: ['rifa_id', 'numeros', 'nombre'],
     },
@@ -312,7 +312,7 @@ const HERRAMIENTAS = [
     descripcion: 'Cuando el cliente dice con qué va a pagar (o cambia de método) en una compra ya apartada: el SISTEMA le envía los datos de pago y el monto exacto en la moneda de ese método.',
     parametros: {
       type: 'object',
-      properties: { metodo_pago: { type: 'string', description: 'Pago Móvil, Nequi, Bancolombia o Zelle' } },
+      properties: { metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle' } },
       required: ['metodo_pago'],
     },
   },
@@ -344,6 +344,7 @@ async function rifaValida(rifaId) {
 
 // Envía los datos de pago y el monto EXACTOS (no los redacta la IA)
 async function prepararPago(metodo, ec, efectos) {
+  if (!metodosPago.METODOS_PAGO[metodo]) throw new Error(`El método de pago "${metodo}" ya no está disponible`);
   const tasas = await metodosPago.obtenerTasas();
   const monto = metodosPago.montoEnMetodo(ec.total, metodo, tasas);
   efectos.mensajePago = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });

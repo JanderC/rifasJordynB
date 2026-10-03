@@ -2,12 +2,16 @@
 //  metodosPago.js — Fuente única de los datos de pago
 //  La usan la pantalla del cliente (GET /api/publico/metodos-pago)
 //  y el bot de WhatsApp, para que siempre digan exactamente lo mismo.
+//  Las cuentas se guardan en la BD (tabla metodos_pago) y el dueño las
+//  edita en el panel (Cuentas bancarias). METODOS_PAGO es la copia en
+//  memoria de las cuentas ACTIVAS: se recarga al guardar y cada minuto.
 //  Montos: los precios de las rifas están en pesos (COP); Pago Móvil
 //  se cobra en Bs y Zelle en USD con las tasas de config_tasas.
 // ============================================================
 const pool = require('../config/db');
 
-const METODOS_PAGO = {
+// Cuentas iniciales: con ellas se llena la tabla la primera vez
+const INICIALES = {
   'Pago Móvil': {
     icono: '📱', moneda: 'VES', pais: '🇻🇪 Venezuela · Bolívares',
     campos: [
@@ -51,6 +55,70 @@ const METODOS_PAGO = {
   },
 };
 
+const MONEDAS = ['COP', 'VES', 'USD'];
+
+// Cuentas activas, en el orden del panel. El objeto NO se reemplaza (otros módulos
+// guardan la referencia): se vacía y se vuelve a llenar.
+const METODOS_PAGO = { ...INICIALES };
+
+const tablaLista = (async () => {
+  try {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS metodos_pago (
+         id          BIGSERIAL PRIMARY KEY,
+         nombre      TEXT NOT NULL UNIQUE,
+         icono       TEXT,
+         color       VARCHAR(9),                          -- #rrggbb para la tarjeta del cliente (opcional)
+         moneda      VARCHAR(3) NOT NULL DEFAULT 'COP',   -- COP | VES | USD: en qué se cobra
+         pais        TEXT,
+         campos      JSONB NOT NULL DEFAULT '[]'::jsonb,  -- [{ label, valor }]
+         nota        TEXT,
+         presencial  BOOLEAN NOT NULL DEFAULT FALSE,      -- lo coordina una persona (el bot no cierra la venta)
+         activo      BOOLEAN NOT NULL DEFAULT TRUE,
+         orden       INTEGER NOT NULL DEFAULT 0,
+         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`);
+    const hay = await pool.query(`SELECT 1 FROM metodos_pago LIMIT 1`);
+    if (!hay.rows.length) {
+      let orden = 0;
+      for (const [nombre, m] of Object.entries(INICIALES)) {
+        await pool.query(
+          `INSERT INTO metodos_pago (nombre, icono, moneda, pais, campos, nota, presencial, orden)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (nombre) DO NOTHING`,
+          [nombre, m.icono, m.moneda, m.pais, JSON.stringify(m.campos), m.nota || null, !!m.presencial, orden++]);
+      }
+    }
+  } catch (e) { console.error('[metodosPago] esquema:', e.message); }
+})();
+
+let cargadoAt = 0;
+// Recarga METODOS_PAGO desde la BD. Si falla, se queda con lo último que tenía.
+async function recargar() {
+  await tablaLista;
+  try {
+    const r = await pool.query(`SELECT * FROM metodos_pago WHERE activo ORDER BY orden, id`);
+    for (const k of Object.keys(METODOS_PAGO)) delete METODOS_PAGO[k];
+    for (const m of r.rows) {
+      METODOS_PAGO[m.nombre] = {
+        icono: m.icono || '💳', moneda: m.moneda, pais: m.pais || '',
+        campos: Array.isArray(m.campos) ? m.campos : [],
+        ...(m.nota ? { nota: m.nota } : {}),
+        ...(m.color ? { color: m.color } : {}),
+        ...(m.presencial ? { presencial: true } : {}),
+      };
+    }
+    cargadoAt = Date.now();
+  } catch (e) { console.error('[metodosPago] recargar:', e.message); }
+  return METODOS_PAGO;
+}
+// Para las rutas: datos frescos sin consultar la BD en cada petición
+async function metodosActivos() {
+  if (Date.now() - cargadoAt > 30000) await recargar();
+  return METODOS_PAGO;
+}
+recargar();
+setInterval(() => recargar(), 60 * 1000).unref();
+
 async function obtenerTasas() {
   const r = await pool.query(`SELECT clave, valor FROM config_tasas WHERE clave IN ('COP_POR_USD','BSD_POR_USD')`);
   const t = Object.fromEntries(r.rows.map((x) => [x.clave, parseFloat(x.valor)]));
@@ -73,13 +141,29 @@ function montoEnMetodo(totalCOP, metodo, tasas) {
 }
 
 // Normaliza lo que diga el cliente o la IA ("pago movil", "zelle"…) al nombre oficial
+const plano = (txt) => String(txt || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim();
+// Formas comunes de decir cada moneda, por si no nombran la cuenta
+const ALIAS = [
+  [/movil|pagomovil|bolivar|\bbs\b|venezuela/, (n, m) => /movil/.test(n) || m.moneda === 'VES'],
+  [/zelle|dolar|usd/, (n, m) => /zelle/.test(n) || m.moneda === 'USD'],
+  [/efectivo|cash|presencial/, (n, m) => /efectivo/.test(n) || m.presencial],
+];
 function normalizarMetodo(txt) {
-  const t = String(txt || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
-  if (/movil|pagomovil|bolivar|\bbs\b|venezuela/.test(t)) return 'Pago Móvil';
-  if (/nequi/.test(t)) return 'Nequi';
-  if (/bancolombia/.test(t)) return 'Bancolombia';
-  if (/zelle|dolar|usd/.test(t)) return 'Zelle';
-  if (/efectivo|cash|presencial/.test(t)) return 'Efectivo';
+  const t = plano(txt);
+  if (!t) return null;
+  const nombres = Object.keys(METODOS_PAGO);
+  // 1) Por el nombre de la cuenta (exacto o contenido), el más largo primero
+  const exacto = nombres.find((n) => plano(n) === t);
+  if (exacto) return exacto;
+  const contenido = [...nombres].sort((a, b) => b.length - a.length)
+    .find((n) => t.includes(plano(n)) || t.replace(/ /g, '').includes(plano(n).replace(/ /g, '')));
+  if (contenido) return contenido;
+  // 2) Por alias, solo si esa cuenta existe y está activa
+  for (const [re, coincide] of ALIAS) {
+    if (!re.test(t)) continue;
+    const n = nombres.find((x) => coincide(plano(x), METODOS_PAGO[x]));
+    if (n) return n;
+  }
   return null;
 }
 
@@ -92,4 +176,4 @@ function mensajeDePago(metodo, monto, { numeros, rifa }) {
     '📸 Cuando pagues, envíame la captura del comprobante por aquí.';
 }
 
-module.exports = { METODOS_PAGO, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago };
+module.exports = { METODOS_PAGO, MONEDAS, tablaLista, recargar, metodosActivos, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago };

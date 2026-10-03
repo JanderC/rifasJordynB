@@ -15,7 +15,7 @@ const {
   crearReservasTx, aprobarReservasTx, rechazarReservasTx,
   avisarAprobadas, avisarRechazadas,
 } = require('../services/reservas');
-const { METODOS_PAGO, obtenerTasas } = require('../services/metodosPago');
+const { metodosActivos, obtenerTasas } = require('../services/metodosPago');
 
 
 /* ─────────────────────────────────────────────────────────────
@@ -486,7 +486,7 @@ router.get('/whatsapp-negocio', (req, res) => {
 
 router.get('/metodos-pago', async (req, res) => {
   try {
-    res.json({ metodos: METODOS_PAGO, tasas: await obtenerTasas() });
+    res.json({ metodos: await metodosActivos(), tasas: await obtenerTasas() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

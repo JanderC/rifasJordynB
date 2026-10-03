@@ -5,9 +5,39 @@
 // entrega solo las activas).
 const express = require('express');
 const router  = express.Router();
+const multer  = require('multer');
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { MONEDAS, tablaLista, recargar } = require('../services/metodosPago');
+const { cloudinary, eliminarImagen, extraerPublicId } = require('../config/cloudinary');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },   // 5MB máx
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) cb(null, true);
+    else cb(new Error('Solo se permiten imágenes'), false);
+  },
+});
+const recibirImagen = (req, res, next) => upload.single('imagen')(req, res, (err) => {
+  if (!err) return next();
+  res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'La imagen pesa más de 5MB' : err.message });
+});
+
+// Los logos se guardan pequeños (se muestran a ~50px); png conserva la transparencia
+function subirLogo(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'rifas-jordyn/metodos-pago',
+        tags: ['metodo-pago', 'rifas-jordyn'],
+        transformation: [{ width: 400, height: 400, crop: 'limit', quality: 'auto' }],
+      },
+      (error, result) => (error ? reject(error) : resolve(result.secure_url))
+    );
+    stream.end(buffer);
+  });
+}
 
 router.use(authMiddleware, soloDueno);
 
@@ -116,6 +146,48 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// ── POST /api/metodos-pago/:id/imagen ──────────────────────
+// Sube o reemplaza el logo de la cuenta. Form-data: campo "imagen".
+router.post('/:id/imagen', recibirImagen, async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No se recibió ninguna imagen' });
+  let url = null;
+  try {
+    await tablaLista;
+    const actual = await pool.query(`SELECT imagen_url FROM metodos_pago WHERE id = $1`, [req.params.id]);
+    if (!actual.rows[0]) return res.status(404).json({ error: 'Cuenta no encontrada' });
+    url = await subirLogo(req.file.buffer);
+    const r = await pool.query(
+      `UPDATE metodos_pago SET imagen_url = $1, updated_at = NOW() WHERE id = $2 RETURNING *`, [url, req.params.id]);
+    const anterior = extraerPublicId(actual.rows[0].imagen_url);
+    if (anterior) await eliminarImagen(anterior);
+    await recargar();
+    res.json(r.rows[0]);
+  } catch (err) {
+    console.error('[MetodosPago] Error subiendo imagen:', err);
+    if (url) await eliminarImagen(extraerPublicId(url));
+    res.status(500).json({ error: 'No se pudo subir la imagen' });
+  }
+});
+
+// ── DELETE /api/metodos-pago/:id/imagen ────────────────────
+// Quita el logo: la cuenta vuelve a mostrar su ícono
+router.delete('/:id/imagen', async (req, res) => {
+  try {
+    await tablaLista;
+    const actual = await pool.query(`SELECT imagen_url FROM metodos_pago WHERE id = $1`, [req.params.id]);
+    if (!actual.rows[0]) return res.status(404).json({ error: 'Cuenta no encontrada' });
+    const r = await pool.query(
+      `UPDATE metodos_pago SET imagen_url = NULL, updated_at = NOW() WHERE id = $1 RETURNING *`, [req.params.id]);
+    const publicId = extraerPublicId(actual.rows[0].imagen_url);
+    if (publicId) await eliminarImagen(publicId);
+    await recargar();
+    res.json(r.rows[0]);
+  } catch (err) {
+    console.error('[MetodosPago] Error quitando imagen:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
 // ── PATCH /api/metodos-pago/:id/activo ─────────────────────
 // Mostrar / ocultar sin borrar. Body: { activo: true|false }
 router.patch('/:id/activo', async (req, res) => {
@@ -137,8 +209,10 @@ router.patch('/:id/activo', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     await tablaLista;
-    const r = await pool.query(`DELETE FROM metodos_pago WHERE id = $1 RETURNING id`, [req.params.id]);
+    const r = await pool.query(`DELETE FROM metodos_pago WHERE id = $1 RETURNING id, imagen_url`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Cuenta no encontrada' });
+    const publicId = extraerPublicId(r.rows[0].imagen_url);
+    if (publicId) await eliminarImagen(publicId);
     await recargar();
     res.json({ ok: true });
   } catch (err) {

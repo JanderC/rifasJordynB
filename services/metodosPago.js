@@ -78,6 +78,8 @@ const tablaLista = (async () => {
          orden       INTEGER NOT NULL DEFAULT 0,
          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )`);
+    // Logo de la cuenta (opcional): si no hay, se muestra el ícono
+    await pool.query(`ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS imagen_url TEXT`);
     const hay = await pool.query(`SELECT 1 FROM metodos_pago LIMIT 1`);
     if (!hay.rows.length) {
       let orden = 0;
@@ -104,6 +106,7 @@ async function recargar() {
         campos: Array.isArray(m.campos) ? m.campos : [],
         ...(m.nota ? { nota: m.nota } : {}),
         ...(m.color ? { color: m.color } : {}),
+        ...(m.imagen_url ? { imagen: m.imagen_url } : {}),
         ...(m.presencial ? { presencial: true } : {}),
       };
     }

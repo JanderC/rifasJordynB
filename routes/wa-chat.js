@@ -29,6 +29,7 @@ const wa     = require('../whatsapp/whatsappService');
 const bot    = require('../whatsapp/bot');
 const dueno  = require('../whatsapp/dueno');
 const resultados = require('../services/resultados');
+const grupo  = require('../whatsapp/grupo');
 const ia     = require('../whatsapp/ia');
 const { configPublica, guardarConfig, obtenerConfig } = require('../whatsapp/botConfig');
 
@@ -219,6 +220,27 @@ router.get('/bot/config', async (req, res) => {
 
 router.put('/bot/config', async (req, res) => {
   try { res.json(await guardarConfig(req.body || {})); } catch (e) { err500(res, e); }
+});
+
+// ── Grupo de WhatsApp del negocio ────────────────────────────
+// GET  /grupo           estado: configuración, grupos donde está el bot e historial de avisos
+// PUT  /grupo           { activo, avisar_*, horas_antes, responder_menciones, url_pagina, jid, nombre }
+// POST /grupo/enviar    multipart: texto + imagen (opcional) → mensaje manual al grupo
+router.get('/grupo', async (req, res) => {
+  try { res.json(await grupo.estado()); } catch (e) { err500(res, e); }
+});
+router.put('/grupo', async (req, res) => {
+  try { await grupo.guardar(req.body || {}); res.json(await grupo.estado()); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/grupo/enviar', upload.single('imagen'), async (req, res) => {
+  const texto = String(req.body?.texto || '').trim();
+  if (!texto && !req.file) return res.status(400).json({ error: 'Escribe el mensaje o adjunta una imagen.' });
+  if (texto.length > 3000) return res.status(400).json({ error: 'El mensaje es demasiado largo.' });
+  try {
+    await grupo.enviarManual({ texto, imagen: req.file?.buffer || null });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 router.get('/bot/proveedores', (req, res) => res.json(ia.catalogo()));

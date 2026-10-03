@@ -29,6 +29,7 @@ const { cloudinary } = require('../config/cloudinary');
 const chats        = require('../services/waChats');
 const bot          = require('./bot');
 const envios       = require('./envios');
+const grupo        = require('./grupo');
 const { obtenerConfig } = require('./botConfig');
 
 // La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
@@ -328,6 +329,16 @@ async function jidCanonico(key) {
 }
 
 async function alRecibirMensaje(msg, tipoEvento) {
+  // Grupos: no se guardan ni van al bot vendedor. Solo se mira si mencionan al bot
+  // en el grupo del negocio (lo decide grupo.js).
+  if (msg?.key?.remoteJid?.endsWith('@g.us')) {
+    if (tipoEvento === 'notify' && !msg.key.fromMe) {
+      const m = contenidoReal(msg.message);
+      const texto = clasificar(m)?.texto;
+      if (texto) grupo.alRecibir(msg, m, texto).catch((e) => console.error('❌ [Grupo]', e.message));
+    }
+    return;
+  }
   if (!msg?.key?.remoteJid || IGNORAR_JID.test(msg.key.remoteJid)) return;
   const m = contenidoReal(msg.message);
   const info = clasificar(m);
@@ -492,6 +503,38 @@ async function existeEnWhatsApp(jid) {
 }
 
 envios.init({ enviarImagen, enviarTexto, escribiendo, existeEnWhatsApp, toJID, conectado: () => !!sock && connectionStatus === 'open' });
+
+// ── Grupo del negocio ──────────────────────────────────────
+// Pasa por la misma cola anti-bloqueo, pero no se guarda en Chats.
+async function enviarAGrupo(jid, contenido, opts = {}) {
+  assertConnected();
+  return enqueue(() => {
+    assertConnected();
+    return sock.sendMessage(jid, contenido, opts.quoted ? { quoted: opts.quoted } : {});
+  }, 'bot');
+}
+const soloId = (j) => String(j || '').split('@')[0].split(':')[0];
+async function listarGrupos() {
+  assertConnected();
+  const yo = [sock.user?.id, sock.user?.lid].map(soloId).filter(Boolean);
+  const grupos = Object.values(await sock.groupFetchAllParticipating());
+  return grupos.map((g) => {
+    const mio = (g.participants || []).find((p) => yo.includes(soloId(p.id)) || yo.includes(soloId(p.phoneNumber)) || yo.includes(soloId(p.lid)));
+    return {
+      jid: g.id, nombre: g.subject || '(sin nombre)', participantes: g.size || g.participants?.length || 0,
+      // En un grupo donde solo escriben los administradores, el bot debe serlo
+      puede_escribir: !g.announce || !!mio?.admin,
+    };
+  }).sort((a, b) => a.nombre.localeCompare(b.nombre));
+}
+grupo.init({
+  conectado: () => !!sock && connectionStatus === 'open',
+  enviarAGrupo,
+  listarGrupos,
+  infoInvitacion: (codigo) => { assertConnected(); return sock.groupGetInviteInfo(codigo); },
+  idsBot: () => [sock?.user?.id, sock?.user?.lid],
+  numeroBot: () => soloId(sock?.user?.id) || null,
+});
 
 // ── API usada por otras rutas ──────────────────────────────
 async function sendText(numero, mensaje) {

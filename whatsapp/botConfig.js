@@ -40,6 +40,20 @@ const DEFECTO = {
   administradores: [
     { nombre: 'Lorena Rangel', telefono: '584121015761' },
   ],
+  // El bot en el grupo de WhatsApp del negocio (avisos automáticos y respuestas si lo mencionan)
+  grupo: {
+    activo: true,
+    jid: '',                    // id del grupo; vacío = se deduce del enlace de invitación de la página
+    nombre: '',
+    avisar_resultado: true,     // publica el número ganador al cargarlo
+    avisar_ganador: true,       // publica la foto del ganador al subirla
+    avisar_antes_sorteo: true,  // recordatorio antes del sorteo
+    horas_antes: 2,
+    avisar_rifa_nueva: true,
+    responder_menciones: true,  // responde en el grupo solo si lo mencionan o le responden
+    max_respuestas_10min: 6,
+    url_pagina: 'https://www.resuelvetusemana.com',
+  },
   info_extra: '',
   pedir_cedula: true,
   leer_comprobantes: true,

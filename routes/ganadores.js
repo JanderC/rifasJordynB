@@ -10,6 +10,7 @@ const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { cloudinary, eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 const { tablaLista } = require('../services/ganadores');
+const bus = require('../services/waBus');
 
 const CARPETA = 'rifas-jordyn/ganadores';
 
@@ -99,6 +100,7 @@ router.post('/', authMiddleware, soloDueno, recibirImagen, async (req, res) => {
       [nombre, limpio(req.body.premio), limpio(req.body.numero, 10), limpio(req.body.rifa), limpio(req.body.ciudad),
        fechaValida(req.body.fecha), url, req.body.visible === undefined ? true : esVerdadero(req.body.visible), uuidValido(req.body.rifa_id)]
     );
+    bus.emit('ganador:publicado', r.rows[0]);   // el bot publica la foto en el grupo de WhatsApp (una sola vez)
     res.status(201).json(r.rows[0]);
   } catch (err) {
     console.error('[Ganadores] Error creando:', err);
@@ -130,6 +132,7 @@ router.put('/:id', authMiddleware, soloDueno, recibirImagen, async (req, res) =>
        fechaValida(req.body.fecha), urlNueva, esVerdadero(req.body.visible), req.params.id, uuidValido(req.body.rifa_id)]
     );
     if (urlNueva) await eliminarImagen(extraerPublicId(actual.rows[0].imagen_url));
+    bus.emit('ganador:publicado', r.rows[0]);
     res.json(r.rows[0]);
   } catch (err) {
     console.error('[Ganadores] Error actualizando:', err);

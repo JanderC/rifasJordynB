@@ -26,6 +26,7 @@ const envios = require('./envios');
 const resultados = require('../services/resultados');
 const herramientasDueno = require('./herramientasDueno');
 const ganadores = require('../services/ganadores');
+const grupo = require('./grupo');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, enviarImagen, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -1002,6 +1003,45 @@ Si todavía lo quieres, avísame y lo reviso de nuevo.`, cfg).catch(() => {});
 }
 setInterval(() => revisarApartadosVencidos().catch((e) => console.error('❌ [Bot] Apartados vencidos:', e.message)), 60 * 1000).unref();
 
+// ─────────────────────────────────────────────────────────────
+// GRUPO DE WHATSAPP: alguien mencionó al bot. Respuesta corta y pública.
+// Solo herramientas de consulta y en modo prueba (no escribe nada en la BD):
+// en el grupo no se aparta, no se cobra ni se piden datos.
+// ─────────────────────────────────────────────────────────────
+const HERRAMIENTAS_GRUPO = ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_foto_ganador'];
+
+async function responderEnGrupo(pregunta, nombre) {
+  const cfg = await obtenerConfig();
+  if (!dentroDeHorario(cfg.horario)) return null;
+  const chatFalso = { jid: 'grupo@whatsapp', nombre, telefono: null, estado_compra: null };
+  const efectos = {};
+  const system = `Eres del equipo de "${cfg.nombre_negocio}" y estás en el GRUPO de WhatsApp del negocio, donde hay muchos clientes leyendo.${cfg.nombre_asistente ? ` Te llamas ${cfg.nombre_asistente}.` : ''}
+Te mencionaron en el grupo${nombre ? ` (${nombre})` : ''}. Responde SOLO a lo que preguntaron.
+
+REGLAS DEL GRUPO
+- Máximo 2 o 3 frases, en un solo mensaje, tono cercano. Sin listas ni títulos. Usa *un asterisco* para resaltar algo.
+- Solo información pública: rifas en venta, premios, precios, fechas de sorteo, si un número está libre, resultados y ganadores. Consúltala SIEMPRE con tus herramientas; nunca la inventes.
+- Los precios están en ${cfg.moneda || 'pesos'}.
+- En el grupo NO se compra: no apartes números, no pidas nombre ni cédula y no des datos de pago ni cuentas. Si quiere comprar o apartar, dile que te escriba por privado y con gusto lo atiendes.
+- Nunca des datos de otros clientes (teléfonos, cédulas, nombres completos) ni información interna (vendedores, ventas, montos recaudados).
+- Reclamos, pagos o premios: dile que te escriba por privado.
+- Si no es una pregunta sobre el negocio (saludos, bromas, discusiones), responde con una sola frase amable y corta, sin inventar nada.
+- Si el resultado por el que preguntan trae foto_ganador_id, envía la foto con enviar_foto_ganador.
+${cfg.info_extra ? `\nINFORMACIÓN DEL NEGOCIO\n${cfg.info_extra}\n` : ''}
+Fecha y hora en Venezuela: ${fmtFechaVE()}.`;
+  const { texto } = await ia.chatConHerramientas(cfg, {
+    system,
+    mensajes: [{ role: 'user', content: pregunta }],
+    herramientas: HERRAMIENTAS.filter((h) => HERRAMIENTAS_GRUPO.includes(h.nombre)),
+    ejecutar: crearEjecutor(chatFalso.jid, chatFalso, cfg, efectos, { prueba: true }),
+    maxPasos: 4,
+  });
+  // Preguntaron por un resultado que no está cargado: se le pide al dueño (una vez)
+  if (efectos.resultadoFaltante) dueno.pedirResultado(efectos.resultadoFaltante).catch(() => {});
+  return { texto: texto ? aFormatoWhatsApp(texto).replace(/\n{3,}/g, '\n\n') : null, fotos: efectos.fotos || [] };
+}
+grupo.usarBot({ responderEnGrupo });
+
 // ── Probar el bot desde el panel (no envía nada ni escribe en la BD) ─
 // estadoPrevio: el estado de compra de la simulación anterior (lo guarda el panel)
 async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
@@ -1028,4 +1068,4 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, revisarApartadosVencidos, HERRAMIENTAS };
+module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };

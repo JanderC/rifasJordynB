@@ -4,6 +4,7 @@
 //  El bot los usa para responder "¿qué cayó?" y "¿quién ganó?".
 // ============================================================
 const pool = require('../config/db');
+const bus  = require('./waBus');
 
 const tablaLista = (async () => {
   const sqls = [
@@ -103,6 +104,7 @@ async function registrar({ rifaId, numero, premio = 'Premio mayor', serie = null
     ON CONFLICT (rifa_id, premio) DO UPDATE
       SET numero = EXCLUDED.numero, serie = EXCLUDED.serie, ganador = EXCLUDED.ganador, detalle = EXCLUDED.detalle, created_at = NOW()
     RETURNING *`, [rifaId, String(premio).trim() || 'Premio mayor', num, serie ? serie.toUpperCase() : null, ganador || null, detalle]);
+  bus.emit('resultado:registrado', { rifaId });   // el bot lo anuncia en el grupo de WhatsApp
   return { ...ins.rows[0], rifa: rifa.nombre, tenencia: t };
 }
 

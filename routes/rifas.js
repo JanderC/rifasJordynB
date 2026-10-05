@@ -973,6 +973,67 @@ router.post('/:id/boleteria-vendedores/:vendedorId', authMiddleware, soloDueno, 
 });
 
 // ── DELETE /api/rifas/:id/boleteria-vendedores/:vendedorId/numero ──
+// ── DELETE /api/rifas/:id/boleteria-vendedores/:vendedorId/numeros ──
+// Quita VARIOS números de un vendedor en la rifa, todo o nada.
+// Body: { numeros: [{ numero, serie, origen }] }
+// Misma regla que al quitar uno: el extra sale solo de esta rifa; el fijo sale
+// de la rifa y de los números fijos del vendedor en la categoría de la rifa.
+router.delete('/:id/boleteria-vendedores/:vendedorId/numeros', authMiddleware, soloDueno, async (req, res) => {
+  const lista = Array.isArray(req.body?.numeros) ? req.body.numeros.filter((n) => n?.numero) : [];
+  if (!lista.length) return res.status(400).json({ error: 'numeros[] es requerido' });
+  if (lista.length > 2000) return res.status(400).json({ error: 'Demasiados números en una sola operación' });
+  const rifa_id     = req.params.id;
+  const vendedor_id = req.params.vendedorId;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rifaR = await client.query(`SELECT categoria_seleccionada_id FROM rifas WHERE id = $1`, [rifa_id]);
+    if (!rifaR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Rifa no encontrada' }); }
+    const cat_id = rifaR.rows[0].categoria_seleccionada_id;
+
+    let extras = 0, fijos = 0;
+    const noEncontrados = [];
+    for (const { numero, serie, origen } of lista) {
+      const s = serie || 'A';
+      let borrado = false;
+      if (origen === 'extra' || !origen) {
+        const d = await client.query(
+          `DELETE FROM boleteria_numeros_extra WHERE rifa_id = $1 AND vendedor_id = $2 AND numero = $3 AND serie = $4`,
+          [rifa_id, vendedor_id, numero, s]);
+        if (d.rowCount > 0) { borrado = true; extras += d.rowCount; }
+      }
+      if (!borrado && (origen === 'fijo' || !origen)) {
+        const d = await client.query(
+          `DELETE FROM numeros_vendedor WHERE vendedor_id = $1 AND rifa_id = $2 AND numero = $3 AND COALESCE(serie, 'A') = $4`,
+          [vendedor_id, rifa_id, numero, s]);
+        if (d.rowCount > 0) {
+          borrado = true; fijos += d.rowCount;
+          if (cat_id) {
+            await client.query(
+              `DELETE FROM cat_global_asignaciones WHERE categoria_id = $1 AND vendedor_id = $2 AND numero = $3 AND serie = $4`,
+              [cat_id, vendedor_id, numero, s]);
+          }
+        }
+      }
+      if (!borrado) noEncontrados.push(`${numero}${serie ? ` ${serie}` : ''}`);
+    }
+
+    if (!extras && !fijos) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Esos números ya no estaban asignados al vendedor en esta rifa' });
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, quitados: extras + fijos, extras, fijos, no_encontrados: noEncontrados });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error quitando numeros boleteria:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 router.delete('/:id/boleteria-vendedores/:vendedorId/numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero, serie, origen } = req.body;
   const rifa_id     = req.params.id;

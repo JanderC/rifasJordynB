@@ -30,6 +30,7 @@ const chats        = require('../services/waChats');
 const bot          = require('./bot');
 const envios       = require('./envios');
 const grupo        = require('./grupo');
+const ia           = require('./ia');
 const { obtenerConfig } = require('./botConfig');
 
 // La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
@@ -353,6 +354,15 @@ async function alRecibirMensaje(msg, tipoEvento) {
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
       if (buffer && buffer.length < 15 * 1024 * 1024) mediaUrl = await subirACloudinary(buffer, info);
+      // Nota de voz de un cliente: se transcribe y el texto queda en el mensaje
+      // (lo ve el panel y lo lee el bot para responder). Solo audios nuevos y de hasta 5 min.
+      if (buffer && info.tipo === 'audio' && !deMi && tipoEvento === 'notify' && Number(m.audioMessage?.seconds || 0) <= 300) {
+        const cfg = await obtenerConfig();
+        if (cfg.transcribir_audios !== false) {
+          info.texto = await ia.transcribirAudio(cfg, buffer, info.mime)
+            .catch((e) => { console.error('❌ [WhatsApp] No se pudo transcribir la nota de voz:', e.message); return null; });
+        }
+      }
     } catch (err) {
       console.error('❌ [WhatsApp] No se pudo guardar el adjunto:', err.message);
     }

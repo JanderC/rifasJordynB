@@ -681,6 +681,7 @@ CÓMO VENDER
 - Métodos de pago: ${Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial).join(', ')} (efectivo lo coordina una persona).
 - Algunas rifas permiten APARTAR SIN PAGAR (ver_rifas lo dice en apartar_sin_pagar): el cliente aparta ahora y paga después, hasta la fecha límite. Ofrécelo con naturalidad si duda por el pago. Igual necesitas su nombre${cfg.pedir_cedula ? ' y cédula' : ''} y usas preparar_compra; ahí el apartado dura hasta esa fecha, no solo un rato.
 - Si la rifa tiene premios_adicionales, menciónalos al presentarla: es parte de lo que se gana.
+- Las notas de voz te llegan transcritas ("[nota de voz, transcrita automáticamente] …"): respóndelas como cualquier mensaje, sin mencionar la transcripción. Puede traer errores: si un dato clave (número, cédula, nombre) no quedó claro, confírmalo con el cliente antes de usarlo.
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
@@ -724,7 +725,12 @@ async function historialParaIA(jid, hastaId) {
     const role = m.de_mi ? 'assistant' : 'user';
     let texto = m.texto || '';
     if (m.tipo === 'imagen') texto = `[envió una foto]${texto ? ' ' + texto : ''}`;
-    else if (m.tipo === 'audio') texto = '[envió una nota de voz que no puedes escuchar; pídele que lo escriba]';
+    else if (m.tipo === 'audio') {
+      // Con transcripción el bot la responde como un mensaje más; sin ella, pide que lo escriba
+      texto = texto
+        ? `[nota de voz, transcrita automáticamente] ${texto}`
+        : '[envió una nota de voz que no se pudo transcribir; pídele con amabilidad que lo escriba]';
+    }
     else if (m.tipo !== 'texto') texto = `[envió un ${m.tipo}]${texto ? ' ' + texto : ''}`;
     // Respuestas degeneradas que el bot llegó a enviar: fuera del historial (el modelo las imita)
     if (m.de_mi) texto = ia.limpiarTexto(texto);

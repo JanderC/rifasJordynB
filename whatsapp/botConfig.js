@@ -63,6 +63,7 @@ const DEFECTO = {
   info_extra: '',
   pedir_cedula: true,
   leer_comprobantes: true,
+  transcribir_audios: true,     // notas de voz → texto (con la clave de Groq u OpenAI), y el bot las responde
   avisar_rechazo: true,
   mensaje_sin_ia: 'Hola 👋 dame un momentico y ya te atiendo.',
   horario: {

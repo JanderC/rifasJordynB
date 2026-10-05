@@ -276,6 +276,47 @@ async function chatConHerramientas(cfg, opciones) {
   return { ...r, texto: basura ? '' : limpiarTexto(r.texto) };
 }
 
+// ── Transcribir notas de voz ─────────────────────────────────
+// La transcripción va aparte del proveedor con el que conversa el bot (DeepSeek o
+// Claude, por ejemplo, no transcriben audio): se usa la clave de Groq (Whisper,
+// gratis) o la de OpenAI, la que esté guardada.
+const TRANSCRIPCION = [
+  { proveedor: 'groq',   modelo: 'whisper-large-v3-turbo' },
+  { proveedor: 'openai', modelo: 'whisper-1' },
+];
+// Frases que Whisper "inventa" cuando el audio es silencio o ruido
+const ALUCINACIONES = /amara\.org|subt[ií]tulos (realizados|por|creados)|gracias por ver( el video)?\.?$|suscr[ií]bete al canal|^\s*(m[uú]sica|aplausos|silencio)\s*$/i;
+
+function proveedorTranscripcion(cfg) {
+  return TRANSCRIPCION.find((t) => claveDe(cfg, t.proveedor)) || null;
+}
+
+// Devuelve el texto de la nota de voz, o null si no hay con qué transcribir o no se entendió
+async function transcribirAudio(cfg, buffer, mime = 'audio/ogg') {
+  const t = proveedorTranscripcion(cfg);
+  if (!t || !buffer?.length) return null;
+  const tipo = String(mime).split(';')[0].trim() || 'audio/ogg';
+  const ext = { 'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav', 'audio/webm': 'webm' }[tipo] || 'ogg';
+  const form = new FormData();
+  form.append('file', new Blob([buffer], { type: tipo }), `nota-de-voz.${ext}`);
+  form.append('model', t.modelo);
+  form.append('language', 'es');
+  form.append('response_format', 'json');
+  form.append('temperature', '0');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 45000);
+  try {
+    const r = await fetch(`${PROVEEDORES[t.proveedor].base}/audio/transcriptions`, {
+      method: 'POST', headers: { Authorization: `Bearer ${claveDe(cfg, t.proveedor)}` }, body: form, signal: ctrl.signal,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new ErrorIA(`${PROVEEDORES[t.proveedor].nombre}: ${d?.error?.message || `HTTP ${r.status}`}`, { status: r.status });
+    const texto = String(d.text || '').replace(/\s+/g, ' ').trim();
+    if (texto.length < 2 || ALUCINACIONES.test(texto)) return null;
+    return texto.slice(0, 2000);
+  } finally { clearTimeout(timer); }
+}
+
 // ── Leer un comprobante de pago con visión ───────────────────
 async function leerComprobante(cfg, { base64, mime }) {
   const system = 'Extraes datos de comprobantes de pago (pago móvil, transferencias, Zelle, Binance) de Venezuela. Respondes SOLO con JSON válido, sin texto adicional.';
@@ -334,4 +375,4 @@ function catalogo() {
   }));
 }
 
-module.exports = { PROVEEDORES, ErrorIA, limpiarTexto, esBasura, chatConHerramientas, leerComprobante, probar, listarModelos, catalogo, claveDe, modeloDe };
+module.exports = { PROVEEDORES, ErrorIA, limpiarTexto, esBasura, transcribirAudio, proveedorTranscripcion, chatConHerramientas, leerComprobante, probar, listarModelos, catalogo, claveDe, modeloDe };

@@ -108,6 +108,7 @@ router.get('/rifas', async (req, res) => {
       return {
         ...rifa,
         compra_activa,
+        rifa_con_apartado: !!rifa.pago_diferido,   // la rifa trabaja con apartados (aunque ya no se pueda apartar)
         pago_diferido: !!limite,
         pago_hasta: limite ? limite.toISOString() : null,
         pago_hasta_texto: limite ? opciones.fmtLimite(limite) : null,

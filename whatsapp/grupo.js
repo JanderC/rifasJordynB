@@ -183,7 +183,7 @@ async function revisarProgramados() {
     const horas = Math.min(24, Math.max(1, Number(cfg.grupo.horas_antes) || 2));
     const r = await pool.query(`
       SELECT id FROM rifas
-       WHERE activa AND COALESCE(estado, 'activa') = 'activa' AND fecha_sorteo IS NOT NULL AND hora_sorteo IS NOT NULL
+       WHERE activa AND publicada AND COALESCE(estado, 'activa') = 'activa' AND fecha_sorteo IS NOT NULL AND hora_sorteo IS NOT NULL
          AND (fecha_sorteo + hora_sorteo) > (NOW() AT TIME ZONE 'America/Caracas')
          AND (fecha_sorteo + hora_sorteo) <= (NOW() AT TIME ZONE 'America/Caracas') + $1 * INTERVAL '1 hour'
          AND NOT EXISTS (SELECT 1 FROM wa_grupo_envios e WHERE e.clave = 'previo:' || rifas.id::text || ':' || rifas.fecha_sorteo::text)`, [horas]);
@@ -206,7 +206,7 @@ async function revisarProgramados() {
     // Se espera unos minutos tras crearla, por si el dueño todavía la está ajustando
     const r = await pool.query(`
       SELECT id, imagen_url FROM rifas
-       WHERE activa AND COALESCE(estado, 'activa') = 'activa'
+       WHERE activa AND publicada AND COALESCE(estado, 'activa') = 'activa'
          AND created_at <= NOW() - INTERVAL '10 minutes' AND created_at >= NOW() - INTERVAL '24 hours'
          AND created_at > (SELECT created_at FROM wa_grupo_envios WHERE clave = 'instalado')
          AND (fecha_sorteo IS NULL OR fecha_sorteo >= (NOW() AT TIME ZONE 'America/Caracas')::date)
@@ -217,6 +217,7 @@ async function revisarProgramados() {
       const texto =
         `🚨 *¡Nueva rifa!* ${rifa.nombre}\n\n` +
         `🏆 Premio: ${rifa.premio}\n` +
+        ((rifa.premios_extra || []).length ? `🎁 Además: ${rifa.premios_extra.map((p) => p.nombre).join(' · ')}\n` : '') +
         `💰 ${fmtMonto(rifa.precio, cfg)} por número${ofertas.length ? `\n🔥 Ofertas: ${ofertas.join(' · ')}` : ''}\n` +
         (rifa.fecha_sorteo ? `📅 Sorteo: ${fmtFecha(rifa.fecha_sorteo)}${fmtHora(rifa.hora_sorteo) ? ` a las ${fmtHora(rifa.hora_sorteo)}` : ''}\n` : '') +
         `\nAparta tu número 👇\n${comoComprar(cfg)}`;

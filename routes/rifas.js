@@ -9,6 +9,7 @@ const router  = express.Router();
 const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { subirSiEsBase64, reemplazarBase64EnJson, CARPETAS, TRANSFORM_RIFA } = require('../services/imagenes');
+const opciones = require('../services/rifaOpciones');
 
 /* ── Helper: valida array de ofertas ─────────────────────── */
 function validarOfertas(ofertas) {
@@ -234,6 +235,7 @@ router.get('/', authMiddleware, async (req, res) => {
         r.desactivar_en,
         r.ticket_template_id,
         r.premio_secundario,
+        ${opciones.COLUMNAS('r')},
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
         COALESCE(r.cifras,  3)          AS cifras,
@@ -315,6 +317,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
         r.imagen_url,
         r.ticket_template_id,
         r.premio_secundario,
+        ${opciones.COLUMNAS('r')},
         COALESCE(r.tipo,    'sencilla') AS tipo,
         COALESCE(r.estado,  'activa')   AS estado,
         COALESCE(r.cifras,  3)          AS cifras,
@@ -427,6 +430,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     );
 
     const rifa = result.rows[0];
+    // Publicación, premios adicionales y pago diferido
+    Object.assign(rifa, await opciones.guardar(client, rifa.id, req.body));
 
     if (vids.length > 0) {
       await sincronizarVendedoresRifa(client, rifa.id, vids, vendedores_categorias);
@@ -546,6 +551,8 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Rifa no encontrada' });
     }
+    // Publicación, premios adicionales y pago diferido (solo lo que venga en el body)
+    Object.assign(result.rows[0], await opciones.guardar(client, req.params.id, req.body));
 
     const vids = Array.isArray(vendedores_ids) && vendedores_ids.length > 0
       ? vendedores_ids

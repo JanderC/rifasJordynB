@@ -40,6 +40,12 @@ const DEFECTO = {
   administradores: [
     { nombre: 'Lorena Rangel', telefono: '584121015761' },
   ],
+  // Recordatorios de pago a quienes apartaron sin pagar (rifas con pago diferido):
+  // víspera del sorteo, día del sorteo y aviso final antes de que venza el plazo
+  recordatorios_apartado: {
+    activo: true,
+    final_horas: 2,             // el aviso final sale estas horas antes del límite de pago
+  },
   // El bot en el grupo de WhatsApp del negocio (avisos automáticos y respuestas si lo mencionan)
   grupo: {
     activo: true,

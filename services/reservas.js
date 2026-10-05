@@ -8,6 +8,7 @@
 // ============================================================
 const pool = require('../config/db');
 const bus  = require('./waBus');
+const opciones = require('./rifaOpciones');
 
 // ── Esquema: columnas nuevas (idempotente) ───────────────────
 const esquemaListo = (async () => {
@@ -76,13 +77,17 @@ async function infoRifa(db, rifaId) {
            COALESCE(ofertas, '[]'::jsonb) AS ofertas,
            fecha_sorteo::text             AS fecha_sorteo,
            hora_sorteo::text              AS hora_sorteo,
-           loteria_ref, fecha_desactivacion_compra
+           loteria_ref, fecha_desactivacion_compra,
+           ${opciones.COLUMNAS('rifas')}
       FROM rifas WHERE id = $1`, [rifaId]);
   return r.rows[0] || null;
 }
 
-// Rifas donde un cliente puede comprar ahora mismo
-async function rifasEnVenta(db = pool) {
+// Rifas donde un cliente puede comprar ahora mismo.
+// Por defecto solo las publicadas (lo que ofrece el bot); todas=true incluye
+// las que están en venta pero ocultas de la página (para el dueño).
+async function rifasEnVenta(db = pool, { todas = false } = {}) {
+  await opciones.esquemaListo;
   const r = await db.query(`
     SELECT id, nombre, premio, precio, descripcion,
            COALESCE(tipo, 'sencilla')     AS tipo,
@@ -90,14 +95,16 @@ async function rifasEnVenta(db = pool) {
            COALESCE(ofertas, '[]'::jsonb) AS ofertas,
            fecha_sorteo::text             AS fecha_sorteo,
            hora_sorteo::text              AS hora_sorteo,
-           loteria_ref
+           loteria_ref,
+           ${opciones.COLUMNAS('rifas')}
       FROM rifas
      WHERE activa = true
+       AND (publicada OR $1::boolean)
        AND COALESCE(estado, 'activa') = 'activa'
        AND (fecha_desactivacion_compra IS NULL OR fecha_desactivacion_compra > NOW())
        -- el bot no ofrece rifas cuyo sorteo ya pasó aunque sigan marcadas activas
        AND (fecha_sorteo IS NULL OR fecha_sorteo >= (NOW() AT TIME ZONE 'America/Caracas')::date)
-     ORDER BY fecha_sorteo NULLS LAST, created_at DESC`);
+     ORDER BY fecha_sorteo NULLS LAST, created_at DESC`, [todas]);
   return r.rows;
 }
 
@@ -169,8 +176,9 @@ async function crearReservasTx(client, datos) {
     rifa_id, nombre_cliente, cedula, correo, telefono, metodo_pago,
     comprobanteUrl, comprobante_nombre, comprobante_datos, wa_jid,
     origen = 'web',
-    estado = 'pendiente',        // 'apartado' = bloqueado por el bot hasta que llegue el comprobante
+    estado = 'pendiente',        // 'apartado' = bloqueado hasta que llegue el comprobante
     apartadoHasta = null,
+    pagoDiferido = false,        // apartado para pagar después (rifas con pago diferido)
   } = datos;
   const numeros = [...datos.numeros];
 
@@ -204,8 +212,8 @@ async function crearReservasTx(client, datos) {
       INSERT INTO reservas_cliente
         (rifa_id, numero, nombre_cliente, cedula, correo, telefono, metodo_pago,
          comprobante_base64, comprobante_nombre, origen, comprobante_datos, wa_jid,
-         estado, apartado_hasta)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         estado, apartado_hasta, pago_diferido)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING id, numero, nombre_cliente, cedula, correo, estado, created_at`,
     [
       rifa_id, numero, String(nombre_cliente).trim(), String(cedula || '').trim() || null,
@@ -213,6 +221,7 @@ async function crearReservasTx(client, datos) {
       comprobanteUrl, comprobante_nombre || null, origen,
       comprobante_datos ? JSON.stringify(comprobante_datos) : null, wa_jid || null,
       estado, estado === 'apartado' ? apartadoHasta : null,
+      estado === 'apartado' && !!pagoDiferido,
     ]);
     reservas.push(r.rows[0]);
   }
@@ -297,15 +306,59 @@ async function aprobarReservasTx(client, ids, nota) {
 }
 
 // El comprobante llegó: los números apartados pasan a "pendiente" (aparecen en Reservas)
-async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_datos, metodo_pago }) {
+async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_datos, metodo_pago, comprobante_nombre = 'comprobante-whatsapp' }) {
   const r = await client.query(`
     UPDATE reservas_cliente
        SET estado = 'pendiente', apartado_hasta = NULL, comprobante_base64 = $2,
-           comprobante_nombre = 'comprobante-whatsapp', comprobante_datos = $3,
+           comprobante_nombre = $5, comprobante_datos = $3,
            metodo_pago = COALESCE($4, metodo_pago), updated_at = NOW()
      WHERE id = ANY($1) AND estado = 'apartado'
      RETURNING id, numero, nombre_cliente, estado`,
-  [ids, comprobanteUrl, comprobante_datos ? JSON.stringify(comprobante_datos) : null, metodo_pago || null]);
+  [ids, comprobanteUrl, comprobante_datos ? JSON.stringify(comprobante_datos) : null, metodo_pago || null, comprobante_nombre]);
+  return r.rows;
+}
+
+// ── Apartados para pagar después (rifas con pago diferido) ───
+const soloDigitos = (t) => String(t || '').replace(/\D/g, '');
+
+// Apartados sin pagar de una persona (por su WhatsApp o su teléfono), agrupados por rifa:
+// [{ rifa (infoRifa), ids, numeros, nombre, cedula, telefono, total, limite (Date) }]
+async function apartadosDe({ jid = null, telefono = null, rifaId = null } = {}) {
+  const tel = soloDigitos(telefono);
+  if (!jid && tel.length < 7) return [];
+  const r = await pool.query(`
+    SELECT id, rifa_id, TRIM(numero) AS numero, nombre_cliente, cedula, telefono, apartado_hasta
+      FROM reservas_cliente
+     WHERE estado = 'apartado' AND pago_diferido AND apartado_hasta > NOW()
+       AND ($1::text IS NOT NULL AND wa_jid = $1
+            OR $2 <> '' AND RIGHT(regexp_replace(COALESCE(telefono, ''), '\\D', '', 'g'), 10) = RIGHT($2, 10))
+       AND ($3::uuid IS NULL OR rifa_id = $3)
+     ORDER BY created_at`, [jid, tel, rifaId]);
+  const porRifa = new Map();
+  for (const x of r.rows) {
+    const g = porRifa.get(x.rifa_id) || { ids: [], numeros: [], nombre: x.nombre_cliente, cedula: x.cedula, telefono: x.telefono, limite: x.apartado_hasta };
+    g.ids.push(x.id); g.numeros.push(x.numero);
+    if (new Date(x.apartado_hasta) < new Date(g.limite)) g.limite = x.apartado_hasta;
+    porRifa.set(x.rifa_id, g);
+  }
+  const out = [];
+  for (const [id, g] of porRifa) {
+    const rifa = await infoRifa(pool, id);
+    if (!rifa) continue;
+    out.push({ rifa, ...g, limite: new Date(g.limite), total: calcularPrecioReal(g.numeros.length, rifa.ofertas, Number(rifa.precio)) });
+  }
+  return out;
+}
+
+// El dueño recibió el pago por fuera (efectivo, en persona): el apartado pasa a
+// "pendiente" para aprobarlo en Reservas como cualquier otro (ahí sale el ticket).
+async function marcarApartadosPagados(ids, nota) {
+  const r = await pool.query(`
+    UPDATE reservas_cliente
+       SET estado = 'pendiente', apartado_hasta = NULL, metodo_pago = COALESCE(NULLIF(metodo_pago, ''), 'Efectivo'),
+           nota_admin = COALESCE($2, nota_admin), updated_at = NOW()
+     WHERE id = ANY($1) AND estado = 'apartado'
+     RETURNING *`, [ids, nota || null]);
   return r.rows;
 }
 
@@ -336,6 +389,8 @@ module.exports = {
   esquemaListo,
   SQL_RESERVA_OCUPA,
   confirmarApartadoTx,
+  apartadosDe,
+  marcarApartadosPagados,
   liberarApartados,
   liberarApartadosVencidos,
   calcularPrecioReal,

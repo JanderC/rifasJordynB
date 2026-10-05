@@ -16,6 +16,8 @@ const {
   avisarAprobadas, avisarRechazadas,
 } = require('../services/reservas');
 const { metodosActivos, obtenerTasas } = require('../services/metodosPago');
+const opciones = require('../services/rifaOpciones');
+const reservasSvc = require('../services/reservas');
 
 
 /* ─────────────────────────────────────────────────────────────
@@ -62,6 +64,7 @@ router.get('/rifas', async (req, res) => {
         COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
         r.fecha_desactivacion_compra,
         r.fecha_eliminacion_pantalla,
+        ${opciones.COLUMNAS('r')},
         COALESCE(COUNT(DISTINCT v.numero), 0)::int AS numeros_vendidos,
         COALESCE(SUM(v.precio_venta), 0)           AS recaudado,
         -- Porcentaje de números NO disponibles (vendidos + asignados a vendedor).
@@ -85,6 +88,7 @@ router.get('/rifas', async (req, res) => {
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id
       WHERE r.activa = TRUE
+        AND r.publicada                              -- el dueño decide cuáles salen en la página
         AND COALESCE(r.estado, 'activa') != 'archivada'
         -- Ocultar completamente si ya pasó la fecha de eliminación
         AND (
@@ -96,11 +100,19 @@ router.get('/rifas', async (req, res) => {
     `, [ahora]);
 
     // Enriquecer cada rifa con el flag compra_activa
-    const rifas = r.rows.map(rifa => ({
-      ...rifa,
-      compra_activa: !rifa.fecha_desactivacion_compra
-        || new Date(rifa.fecha_desactivacion_compra) > new Date(ahora),
-    }));
+    const rifas = r.rows.map(rifa => {
+      const compra_activa = !rifa.fecha_desactivacion_compra
+        || new Date(rifa.fecha_desactivacion_compra) > new Date(ahora);
+      // Apartar sin pagar: solo si la rifa lo permite y todavía hay tiempo para pagar
+      const limite = compra_activa && opciones.puedeApartarse(rifa) ? opciones.limiteDePago(rifa) : null;
+      return {
+        ...rifa,
+        compra_activa,
+        pago_diferido: !!limite,
+        pago_hasta: limite ? limite.toISOString() : null,
+        pago_hasta_texto: limite ? opciones.fmtLimite(limite) : null,
+      };
+    });
 
     res.json(rifas);
   } catch (e) {
@@ -369,6 +381,127 @@ router.get('/rifas/:id/progreso', async (req, res) => {
 
 
 /* ──────────────────────────────────────────────────────────
+   APARTAR SIN PAGAR (rifas con pago diferido)
+   El número queda bloqueado para el cliente hasta la fecha límite
+   de pago de la rifa. Si no paga, se libera solo. El bot le
+   recuerda por WhatsApp, así que el teléfono es obligatorio.
+────────────────────────────────────────────────────────── */
+const digitos = (t) => String(t || '').replace(/\D/g, '');
+
+async function apartarSinPago(req, res, numeros) {
+  const { rifa_id, nombre_cliente, cedula, correo, telefono, metodo_pago } = req.body;
+  if (digitos(telefono).length < 10)
+    return res.status(400).json({ error: 'Para apartar necesitamos tu WhatsApp: por ahí te recordamos el pago y te llega tu ticket' });
+
+  const client = await pool.connect();
+  try {
+    const rifa = await reservasSvc.infoRifa(pool, rifa_id);
+    if (!rifa) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (!opciones.puedeApartarse(rifa))
+      return res.status(403).json({ error: 'Esta rifa ya no permite apartar sin pagar. Puedes comprar enviando tu comprobante.', sin_apartado: true });
+    const limite = opciones.limiteDePago(rifa);
+
+    // Tope de números apartados sin pagar por persona
+    const yaTiene = (await reservasSvc.apartadosDe({ telefono, rifaId: rifa.id }))[0]?.numeros.length || 0;
+    const max = Number(rifa.diferido_max_numeros) || 10;
+    if (yaTiene + numeros.length > max) {
+      return res.status(400).json({
+        error: yaTiene
+          ? `Ya tienes ${yaTiene} número${yaTiene === 1 ? '' : 's'} apartado${yaTiene === 1 ? '' : 's'} sin pagar. El máximo es ${max}: paga los que tienes o aparta menos.`
+          : `Puedes apartar máximo ${max} números sin pagar. Para llevar más, paga de una vez con tu comprobante.`,
+      });
+    }
+
+    await client.query('BEGIN');
+    const r = await crearReservasTx(client, {
+      rifa_id, numeros, nombre_cliente, cedula, correo, telefono, metodo_pago: metodo_pago || null,
+      comprobanteUrl: null, origen: 'web', estado: 'apartado', apartadoHasta: limite, pagoDiferido: true,
+    });
+    if (!r.ok) {
+      await client.query('ROLLBACK');
+      const body = { error: r.error };
+      if (r.conflictos?.length) body.conflictos = r.conflictos;
+      if (r.compra_desactivada) body.compra_desactivada = true;
+      return res.status(r.status || 400).json(body);
+    }
+    await client.query('COMMIT');
+
+    const respuesta = {
+      ok: true, apartado: true, reservas: r.reservas, total_reservados: r.reservas.length,
+      pago_hasta: limite.toISOString(), pago_hasta_texto: opciones.fmtLimite(limite),
+      mensaje: `¡${r.reservas.length === 1 ? 'Número apartado' : `${r.reservas.length} números apartados`}! Tienes hasta el ${opciones.fmtLimite(limite)} para pagar.`,
+    };
+    if (r.conflictos.length > 0) respuesta.conflictos = r.conflictos;
+    if (r.reservas.length === 1) respuesta.reserva = r.reservas[0];
+    res.status(201).json(respuesta);
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+}
+
+/* ── GET /api/publico/apartados?telefono=&cedula= ──────────
+   Números que una persona tiene apartados sin pagar. Pide teléfono
+   Y cédula (los dos con los que apartó) para que nadie consulte
+   los apartados de otro.
+────────────────────────────────────────────────────────── */
+const mismaCedula = (a, b) => digitos(a) !== '' && digitos(a) === digitos(b);
+
+router.get('/apartados', async (req, res) => {
+  const { telefono, cedula } = req.query;
+  if (digitos(telefono).length < 10 || digitos(cedula).length < 5)
+    return res.status(400).json({ error: 'Escribe el WhatsApp y la cédula con los que apartaste' });
+  try {
+    const grupos = (await reservasSvc.apartadosDe({ telefono })).filter((g) => mismaCedula(g.cedula, cedula));
+    res.json(grupos.map((g) => ({
+      rifa_id: g.rifa.id, rifa: g.rifa.nombre, premio: g.rifa.premio, numeros: g.numeros, nombre: g.nombre,
+      total: g.total, pago_hasta: g.limite.toISOString(), pago_hasta_texto: opciones.fmtLimite(g.limite),
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ── POST /api/publico/apartados/pagar ─────────────────────
+   El cliente sube el comprobante de sus números apartados:
+   pasan a "pendiente" y el dueño los aprueba en Reservas.
+   Body: { rifa_id, telefono, cedula, metodo_pago, comprobante_base64 }
+────────────────────────────────────────────────────────── */
+router.post('/apartados/pagar', async (req, res) => {
+  const { rifa_id, telefono, cedula, metodo_pago, comprobante_base64 } = req.body;
+  if (!rifa_id || digitos(telefono).length < 10 || digitos(cedula).length < 5)
+    return res.status(400).json({ error: 'Faltan datos para identificar tus números apartados' });
+  if (!comprobante_base64)
+    return res.status(400).json({ error: 'Adjunta el comprobante de pago' });
+
+  let url = null, confirmado = false;
+  const client = await pool.connect();
+  try {
+    const grupo = (await reservasSvc.apartadosDe({ telefono, rifaId: rifa_id })).find((g) => mismaCedula(g.cedula, cedula));
+    if (!grupo) return res.status(404).json({ error: 'No encontramos números apartados con esos datos. Puede que ya se hayan pagado o que se venció el plazo.' });
+
+    url = await subirSiEsBase64(comprobante_base64, { folder: CARPETAS.comprobantes });
+    await client.query('BEGIN');
+    const filas = await reservasSvc.confirmarApartadoTx(client, grupo.ids, {
+      comprobanteUrl: url, metodo_pago: metodo_pago || null, comprobante_nombre: 'comprobante-web',
+      comprobante_datos: { metodo: metodo_pago || null, monto_esperado: `${Math.round(grupo.total).toLocaleString('es-CO')} pesos` },
+    });
+    if (!filas.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Esos números ya no están apartados.' }); }
+    await client.query('COMMIT');
+    confirmado = true;
+    res.json({
+      ok: true, numeros: filas.map((f) => String(f.numero).trim()), reservas: filas,
+      mensaje: '¡Comprobante recibido! Apenas verifiquemos el pago te llega tu ticket por WhatsApp.',
+    });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[apartados/pagar]', e);
+    res.status(500).json({ error: 'No se pudo registrar el pago, intenta de nuevo' });
+  } finally {
+    client.release();
+    if (url && url !== comprobante_base64 && !confirmado) eliminarImagen(extraerPublicId(url));
+  }
+});
+
+/* ──────────────────────────────────────────────────────────
    POST /api/publico/reservar
    Bloquea reservas si fecha_desactivacion_compra ya pasó
    Body:
@@ -388,6 +521,8 @@ router.post('/reservar', async (req, res) => {
     telefono, metodo_pago,
     comprobante_base64, comprobante_nombre,
   } = req.body;
+  // apartar=true: reservar sin pagar todavía (solo en rifas con pago diferido)
+  const apartar = req.body.apartar === true;
 
   let numeros = req.body.numeros;
   if (!numeros && req.body.numero) numeros = [req.body.numero];
@@ -411,6 +546,8 @@ router.post('/reservar', async (req, res) => {
 
   if (correo && correo.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo.trim()))
     return res.status(400).json({ error: 'El correo electrónico no tiene un formato válido' });
+
+  if (apartar) return apartarSinPago(req, res, numeros);
 
   if (!comprobante_base64)
     return res.status(400).json({ error: 'El comprobante de pago es obligatorio para reservar' });
@@ -562,6 +699,32 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
       ORDER BY rc.created_at DESC
     `, estado && estado !== 'todos' ? [estado] : []);
     res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ── PUT /api/publico/admin/apartados/pagado ──────────────
+   El dueño recibió el pago por fuera (efectivo, en persona).
+   Body: { ids: [], nota? } → pasan a "pendiente" para aprobarlos
+   como cualquier reserva (ahí se genera y envía el ticket).
+────────────────────────────────────────────────────────── */
+router.put('/admin/apartados/pagado', authMiddleware, soloDueno, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids[] es requerido' });
+  try {
+    const filas = await reservasSvc.marcarApartadosPagados(ids, req.body.nota || 'Pago recibido directamente');
+    res.json({ ok: true, procesadas: filas.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ── DELETE /api/publico/admin/apartados ──────────────────
+   Libera números apartados sin pagar. Body: { ids: [] }
+────────────────────────────────────────────────────────── */
+router.delete('/admin/apartados', authMiddleware, soloDueno, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids[] es requerido' });
+  try {
+    const filas = await reservasSvc.liberarApartados(ids);
+    res.json({ ok: true, liberados: filas.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -27,6 +27,8 @@ const resultados = require('../services/resultados');
 const herramientasDueno = require('./herramientasDueno');
 const ganadores = require('../services/ganadores');
 const grupo = require('./grupo');
+const opciones = require('../services/rifaOpciones');
+const recordatorios = require('./recordatorios');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, enviarImagen, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -169,6 +171,10 @@ async function procesar(jid, items) {
     await marcarAtencion(jid, 'está mandando demasiados mensajes seguidos (parece otro bot o algo raro)', { pausarBot: true });
     return;
   }
+
+  // Si tiene números apartados para pagar después (por la página o por aquí), el chat
+  // queda apuntando a ellos: así puede pagarlos por WhatsApp aunque escriba él primero.
+  await recordatorios.vincularApartados(jid, chat).catch((e) => console.error('❌ [Bot] vincular apartados:', e.message));
 
   const imagen = [...items].reverse().find((i) => i.mensaje.tipo === 'imagen' && i.mensaje.media_url);
   const paso = chat.estado_compra?.paso;
@@ -365,6 +371,11 @@ function duracionTexto(min) {
 const NOTA_PAGO_ENVIADO = (min) =>
   `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${duracionTexto(min)} mientras paga.`;
 
+// Lo que la IA debe decir tras enviarse los datos de pago: cuánto dura el apartado
+const notaPago = (ec, minutos) => (ec?.diferido
+  ? `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que sus números están apartados y que puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.`
+  : NOTA_PAGO_ENVIADO(minutos));
+
 // prueba=true: modo simulador del panel (no escribe nada en la BD)
 function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
   const minutos = cfg.apartado_minutos || 45;
@@ -422,6 +433,8 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
               sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' ') || 'por anunciar',
               loteria: r.loteria_ref || null,
               numeros_van_de: `${'0'.repeat(r.cifras)} a ${'9'.repeat(r.cifras)}`,
+              ...((r.premios_extra || []).length ? { premios_adicionales: r.premios_extra.map((p) => (p.detalle ? `${p.nombre} (${p.detalle})` : p.nombre)) } : {}),
+              ...(opciones.puedeApartarse(r) ? { apartar_sin_pagar: `Sí: puede apartar ahora y pagar después, hasta el ${opciones.fmtLimite(opciones.limiteDePago(r))} (máximo ${r.diferido_max_numeros} números sin pagar). Si no paga a tiempo se liberan.` } : {}),
             })),
           };
         }
@@ -465,14 +478,25 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
 
           // Si ya tenía números apartados (cambió de idea), se liberan primero
           const ecPrevio = chat.estado_compra;
-          const apartadoHasta = new Date(Date.now() + minutos * 60000);
+          // Rifa con pago diferido: quedan apartados hasta el límite de pago de la rifa, no solo un rato
+          const diferido = opciones.puedeApartarse(rifa);
+          const apartadoHasta = diferido ? opciones.limiteDePago(rifa) : new Date(Date.now() + minutos * 60000);
+          let yaApartados = [];
+          if (diferido && !prueba) {
+            yaApartados = (await reservas.apartadosDe({ jid, telefono: chat.telefono, rifaId: rifa.id }))[0]?.numeros || [];
+            const max = Number(rifa.diferido_max_numeros) || 10;
+            if (yaApartados.length + nums.length > max) {
+              return { error: `Sin pagar se pueden apartar máximo ${max} números por persona${yaApartados.length ? ` y ya tiene ${yaApartados.length} (${yaApartados.join(', ')})` : ''}. Dile que pague los que tiene, que aparte menos, o que pague de una vez.` };
+            }
+          }
           let idsApartados = [];
           if (prueba) {
             const occ = await reservas.ocupacionNumeros(pool, rifa, nums);
             const ocupados = nums.filter((n) => !occ[n].disponible);
             if (ocupados.length) return { error: 'Algunos números ya no están disponibles.', no_disponibles: ocupados };
           } else {
-            if (ecPrevio?.paso === 'esperando_comprobante' && ecPrevio.reservas?.length) await reservas.liberarApartados(ecPrevio.reservas);
+            // (los apartados para pagar después NO se liberan: los números nuevos se suman)
+            if (ecPrevio?.paso === 'esperando_comprobante' && !ecPrevio.diferido && ecPrevio.reservas?.length) await reservas.liberarApartados(ecPrevio.reservas);
             // Apartar = BLOQUEAR: desde ya nadie más puede tomarlos (ni por la página ni por WhatsApp)
             const client = await pool.connect();
             try {
@@ -480,7 +504,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
               const r = await reservas.crearReservasTx(client, {
                 rifa_id: rifa.id, numeros: nums, nombre_cliente: nombreCli, cedula, telefono: chat.telefono,
                 metodo_pago: metodo, comprobanteUrl: null, origen: 'whatsapp', wa_jid: jid,
-                estado: 'apartado', apartadoHasta,
+                estado: 'apartado', apartadoHasta, pagoDiferido: diferido,
               });
               if (!r.ok || r.conflictos.length) {
                 await client.query('ROLLBACK');
@@ -491,14 +515,20 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
           }
 
-          const total = reservas.calcularPrecioReal(nums.length, rifa.ofertas, Number(rifa.precio));
+          let total = reservas.calcularPrecioReal(nums.length, rifa.ofertas, Number(rifa.precio));
           const previo = ecPrevio?.paso === 'comprobante_sin_compra' ? ecPrevio.comprobante : null;
-          const estado = {
+          let estado = {
             paso: 'esperando_comprobante',
             rifa_id: rifa.id, rifa_nombre: rifa.nombre, numeros: nums,
             nombre: nombreCli, cedula: cedula || null, total, metodo,
             reservas: idsApartados, apartado_hasta: apartadoHasta.getTime(), desde: Date.now(),
+            ...(diferido ? { diferido: true } : {}),
           };
+          // Con pago diferido la compra son TODOS sus apartados de la rifa (los de antes + estos)
+          if (diferido && !prueba) {
+            const todos = (await reservas.apartadosDe({ jid, telefono: chat.telefono, rifaId: rifa.id }))[0];
+            if (todos) { estado = { ...recordatorios.estadoDeApartado(todos), metodo }; total = estado.total; }
+          }
           if (metodo) estado.monto = await prepararPago(metodo, estado, efectos);
           if (!prueba) await chats.actualizarChat(jid, { estado_compra: estado });
           chat.estado_compra = estado;
@@ -510,6 +540,18 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             return {
               ok: true, total_a_pagar: fmtMonto(total, cfg), numeros: nums,
               comprobante: 'El cliente YA envió una imagen de comprobante antes; el sistema la registrará automáticamente. Solo confírmale en una frase que ya la recibiste y que apenas se verifique el pago le llega su ticket.',
+            };
+          }
+          if (diferido) {
+            const hasta = opciones.fmtLimite(apartadoHasta);
+            return {
+              ok: true, numeros_apartados_ahora: nums, todos_sus_apartados: estado.numeros, total: fmtMonto(total, cfg), puede_pagar_hasta: hasta,
+              ...(metodo
+                ? { monto_en_su_metodo: estado.monto.texto, nota: notaPago(estado, minutos) }
+                : {
+                  metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial),
+                  instruccion: `Quedaron APARTADOS sin pagar y puede pagar hasta el ${hasta}; si no paga a tiempo se liberan. Díselo en una o dos frases y pregúntale si quiere pagar de una vez (que te diga con qué método → elegir_metodo_pago) o después. Si paga después, dile que te escriba cuando vaya a pagar y que tú le recuerdas antes del sorteo.`,
+                }),
             };
           }
           if (metodo) {
@@ -537,7 +579,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           }
           chat.estado_compra = nuevo;
           const quedan = Math.max(1, Math.round((ec.apartado_hasta - Date.now()) / 60000));
-          return { ok: true, metodo, monto: monto.texto, nota: NOTA_PAGO_ENVIADO(quedan) };
+          return { ok: true, metodo, monto: monto.texto, nota: notaPago(nuevo, quedan) };
         }
         case 'cancelar_compra': {
           if (!prueba) {
@@ -577,7 +619,9 @@ function describirEstado(ec, cfg) {
     const quedan = ec.apartado_hasta ? Math.max(0, Math.round((ec.apartado_hasta - Date.now()) / 60000)) : null;
     return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
       (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron` : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
-      (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '') + '. Si pregunta, recuérdale que mande la captura del pago.';
+      (ec.diferido
+        ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
+        : (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '')) + '. Si pregunta, recuérdale que mande la captura del pago.';
   }
   if (ec.paso === 'esperando_confirmacion')
     return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
@@ -634,6 +678,8 @@ CÓMO VENDER
 - Para apartar necesitas: la rifa, los números, nombre y apellido${cfg.pedir_cedula ? ' y cédula' : ''}. Pídelos conversando, no como formulario, y solo lo que falte.
 - Con todo listo usa preparar_compra: los números quedan bloqueados ${duracionTexto(cfg.apartado_minutos || 45)} para el cliente. Si ya dijo cómo paga, pásalo en metodo_pago; si no, pregúntale y usa elegir_metodo_pago.
 - Métodos de pago: ${Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial).join(', ')} (efectivo lo coordina una persona).
+- Algunas rifas permiten APARTAR SIN PAGAR (ver_rifas lo dice en apartar_sin_pagar): el cliente aparta ahora y paga después, hasta la fecha límite. Ofrécelo con naturalidad si duda por el pago. Igual necesitas su nombre${cfg.pedir_cedula ? ' y cédula' : ''} y usas preparar_compra; ahí el apartado dura hasta esa fecha, no solo un rato.
+- Si la rifa tiene premios_adicionales, menciónalos al presentarla: es parte de lo que se gana.
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
@@ -780,6 +826,11 @@ async function alRecibirPropio(mensaje) {
     dueno.alRecibirDueno(mensaje.texto).catch((e) => console.error('❌ [Dueño]', e.message));
   }
 }
+
+recordatorios.init({
+  enviar: async (jid, texto) => enviarBloque(jid, texto, await obtenerConfig()),
+  conectado: () => !!transporte?.conectado(),
+});
 
 dueno.init({
   enviarBloque: async (jid, texto) => enviarBloque(jid, texto, await obtenerConfig()),

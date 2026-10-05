@@ -147,7 +147,7 @@ const ESTADOS_ENVIO = {
 async function ejecutar(nombre, args, ctx = {}) {
   switch (nombre) {
     case 'dueno_rifas': {
-      const enVenta = await reservas.rifasEnVenta();
+      const enVenta = await reservas.rifasEnVenta(pool, { todas: true });
       const sorteadas = await resultados.sorteosRecientes(21);
       const ids = new Set(enVenta.map((r) => r.id));
       return {
@@ -203,7 +203,7 @@ async function ejecutar(nombre, args, ctx = {}) {
         if (!rifa) return { error: 'No encontré esa rifa. Usa dueno_rifas.' };
         return resumenDe(rifa);
       }
-      const enVenta = await reservas.rifasEnVenta();
+      const enVenta = await reservas.rifasEnVenta(pool, { todas: true });
       const out = [];
       for (const r of enVenta) out.push(await resumenDe(r));
       return { rifas: out };

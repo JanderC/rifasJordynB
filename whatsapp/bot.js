@@ -224,7 +224,8 @@ async function enviarBloque(jid, texto, cfg) {
 
 async function responder(jid, texto, cfg) {
   const cps = cfg.antiban.escribiendo_cps || 28;
-  const partes = dividir(aFormatoWhatsApp(texto));
+  // Última barrera: lo ilegible (puntos sueltos, caracteres invisibles) no se envía
+  const partes = dividir(aFormatoWhatsApp(ia.limpiarTexto(texto)));
   for (let i = 0; i < partes.length; i++) {
     const p = partes[i];
     const ms = Math.min(7000, Math.max(900, (p.length / cps) * 1000)) + azar(0, 600);
@@ -725,7 +726,9 @@ async function historialParaIA(jid, hastaId) {
     if (m.tipo === 'imagen') texto = `[envió una foto]${texto ? ' ' + texto : ''}`;
     else if (m.tipo === 'audio') texto = '[envió una nota de voz que no puedes escuchar; pídele que lo escriba]';
     else if (m.tipo !== 'texto') texto = `[envió un ${m.tipo}]${texto ? ' ' + texto : ''}`;
-    if (!texto) continue;
+    // Respuestas degeneradas que el bot llegó a enviar: fuera del historial (el modelo las imita)
+    if (m.de_mi) texto = ia.limpiarTexto(texto);
+    if (!texto || (m.de_mi && ia.esBasura(texto))) continue;
     const ultimo = out[out.length - 1];
     if (ultimo && ultimo.role === role) ultimo.content += `\n${texto}`;
     else out.push({ role, content: texto });
@@ -764,6 +767,15 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   }
 
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
+  else if (efectos.pasadoAHumano) {
+    // La IA pasó el chat a una persona pero no redactó el aviso: se lo dice el sistema
+    await responder(jid, 'Listo, ya le aviso a alguien del equipo para que te atienda 🙌', cfg);
+  } else if (!efectos.mensajePago && !efectos.fotos?.length && !efectos.comprobantePrevio && !notaDueno) {
+    // La IA no devolvió nada legible: que no quede en silencio y que lo vea una persona
+    console.warn(`⚠️  [Bot] La IA no devolvió una respuesta legible para ${jid}`);
+    await marcarAtencion(jid, 'la IA no pudo redactar una respuesta; revisa qué preguntó');
+    if (cfg.mensaje_sin_ia && !yaAvisado('sin_respuesta', jid, 2)) await responder(jid, cfg.mensaje_sin_ia, cfg);
+  }
 
   // Preguntaron por un resultado que no está cargado: se le pide al dueño (una vez)
   if (efectos.resultadoFaltante && !esDueno) {

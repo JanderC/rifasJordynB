@@ -74,6 +74,36 @@ class ErrorIA extends Error {
   }
 }
 
+// ── Respuestas degeneradas ───────────────────────────────────
+// Algunos modelos a veces devuelven "basura": párrafos de puros puntos suspensivos,
+// caracteres invisibles o fragmentos sueltos ("Te ​", "Un * *"). Eso nunca debe
+// llegarle al cliente ni volver al modelo como historial (lo imita).
+const INVISIBLES = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+const tieneContenido = (t) => /[\p{L}\p{N}]/u.test(t) || /\p{Extended_Pictographic}/u.test(t);
+
+// Quita lo inservible y deja el texto útil ('' si no queda nada)
+function limpiarTexto(texto) {
+  const parrafos = String(texto || '').replace(INVISIBLES, '').split(/\n\s*\n/)
+    .map((p) => p
+      .replace(/\*\s+\*/g, ' ')                               // negritas vacías ("*   *")
+      .replace(/(?:\.{3,}|…)(?:\s*(?:\.{2,}|…))+/g, '…')        // "... ... …" → "…"
+      .replace(/^[\s.…·•]+(?=[\p{L}\p{N}¡¿*_])/u, '')         // puntos sueltos al empezar
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim())
+    .filter(tieneContenido);
+  return parrafos.join('\n\n').trim();
+}
+
+// ¿La respuesta es basura? Vacía tras limpiarla, o venía "sucia" y solo quedó un fragmento
+function esBasura(texto) {
+  const original = String(texto || '');
+  const limpio = limpiarTexto(original);
+  if (!limpio) return true;
+  const sucio = INVISIBLES.test(original) || /(^|\n)\s*(?:\.{3,}|…)[\s.…]*(\n|$)/.test(original) || /\*\s+\*/.test(original.replace(INVISIBLES, ''));
+  INVISIBLES.lastIndex = 0;
+  return sucio && limpio.split(/\s+/).length <= 2;
+}
+
 // ── Formato OpenAI ───────────────────────────────────────────
 function aOpenAI(m) {
   if (typeof m.content === 'string') return { role: m.role, content: m.content };
@@ -136,13 +166,25 @@ async function chatOpenAI(cfg, { system, mensajes, herramientas, ejecutar, maxPa
   const msgs = [{ role: 'system', content: system }, ...mensajes.map(aOpenAI)];
   const llamadas = [];
   const limite = cfg.proveedor === 'openai' ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens };
+  // En Groq los modelos abiertos se desbocan menos con algo menos de temperatura
+  const extra = cfg.proveedor === 'groq' ? { temperature: 0.6 } : {};
+  let reintentoBasura = false;
 
   for (let paso = 0; paso <= maxPasos; paso++) {
-    const d = await llamarOpenAI(cfg, { model: modeloDe(cfg), messages: msgs, ...(tools ? { tools } : {}), ...limite });
+    const d = await llamarOpenAI(cfg, { model: modeloDe(cfg), messages: msgs, ...(tools ? { tools } : {}), ...limite, ...extra });
     const msg = d.choices?.[0]?.message;
     if (!msg) throw new ErrorIA('La IA no devolvió respuesta.');
     const calls = msg.tool_calls || [];
-    if (!calls.length || paso === maxPasos) return { texto: (msg.content || '').trim(), llamadas };
+    if (!calls.length || paso === maxPasos) {
+      // Respuesta final degenerada: se le pide una vez más (las herramientas ya corrieron, no se repiten)
+      if (esBasura(msg.content) && !reintentoBasura && paso < maxPasos) {
+        reintentoBasura = true;
+        console.warn(`⚠️  [IA] Respuesta degenerada de ${modeloDe(cfg)}, reintentando:`, JSON.stringify(String(msg.content || '').slice(0, 80)));
+        msgs.push({ role: 'system', content: 'Tu última respuesta salió vacía o ilegible. Responde ahora al cliente con una o dos frases claras en español, sin puntos suspensivos sueltos.' });
+        continue;
+      }
+      return { texto: (msg.content || '').trim(), llamadas };
+    }
 
     msgs.push({ role: 'assistant', content: msg.content || null, tool_calls: calls });
     for (const c of calls) {
@@ -227,7 +269,11 @@ async function chatConHerramientas(cfg, opciones) {
   if (!PROVEEDORES[cfg.proveedor]) throw new ErrorIA(`Proveedor desconocido: ${cfg.proveedor}`);
   if (!modeloDe(cfg)) throw new ErrorIA('Elige un modelo en la configuración del bot.');
   const o = { maxPasos: 5, maxTokens: 4096, ...opciones };
-  return cfg.proveedor === 'anthropic' ? chatAnthropic(cfg, o) : chatOpenAI(cfg, o);
+  const r = await (cfg.proveedor === 'anthropic' ? chatAnthropic(cfg, o) : chatOpenAI(cfg, o));
+  // Nunca se devuelve basura: lo inservible se quita y, si no queda nada, el texto va vacío
+  const basura = esBasura(r.texto);
+  if (basura && r.texto) console.warn(`⚠️  [IA] Respuesta descartada (${modeloDe(cfg)}):`, JSON.stringify(String(r.texto).slice(0, 120)));
+  return { ...r, texto: basura ? '' : limpiarTexto(r.texto) };
 }
 
 // ── Leer un comprobante de pago con visión ───────────────────
@@ -288,4 +334,4 @@ function catalogo() {
   }));
 }
 
-module.exports = { PROVEEDORES, ErrorIA, chatConHerramientas, leerComprobante, probar, listarModelos, catalogo, claveDe, modeloDe };
+module.exports = { PROVEEDORES, ErrorIA, limpiarTexto, esBasura, chatConHerramientas, leerComprobante, probar, listarModelos, catalogo, claveDe, modeloDe };

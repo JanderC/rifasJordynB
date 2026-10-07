@@ -72,6 +72,7 @@ app.use("api/ticket-templates", require("./routes/ticketTemplates"));
 app.use("/api/upload", require("./routes/upload"));
 app.use("/api/metodos-pago", require("./routes/metodosPago"));   // cuentas bancarias (las ve el cliente y las usa el bot)
 app.use("/api/sitio", require("./routes/sitio"));             // grupo de WhatsApp y top de compradores (página del cliente)
+app.use("/api/resultados", require("./routes/resultadosPublicados"));   // imágenes de resultados (página del cliente y grupo)
 app.use("/api/ganadores", require("./routes/ganadores"));   // galería de ganadores (pública + configuración)
 app.use("/api/baileys", require("./routes/wa-baileys"));
 app.use("/api/wa-chat", require("./routes/wa-chat"));      // panel de chats en tiempo real + bot/IA

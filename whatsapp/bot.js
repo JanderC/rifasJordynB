@@ -434,7 +434,9 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
               sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' ') || 'por anunciar',
               loteria: r.loteria_ref || null,
               numeros_van_de: `${'0'.repeat(r.cifras)} a ${'9'.repeat(r.cifras)}`,
-              ...((r.premios_extra || []).length ? { premios_adicionales: r.premios_extra.map((p) => (p.detalle ? `${p.nombre} (${p.detalle})` : p.nombre)) } : {}),
+              ...(r.premio_segundo ? { segundo_premio: r.premio_segundo } : {}),
+              ...(r.premio_tercero ? { tercer_premio: r.premio_tercero } : {}),
+              ...(opciones.especialesVigentes(r).length ? { premios_especiales: opciones.especialesVigentes(r).map(opciones.describirEspecial) } : {}),
               ...(opciones.puedeApartarse(r) ? { apartar_sin_pagar: `Sí: puede apartar ahora y pagar después, hasta el ${opciones.fmtLimite(opciones.limiteDePago(r))} (máximo ${r.diferido_max_numeros} números sin pagar). Si no paga a tiempo se liberan.` } : {}),
             })),
           };
@@ -680,7 +682,8 @@ CÓMO VENDER
 - Con todo listo usa preparar_compra: los números quedan bloqueados ${duracionTexto(cfg.apartado_minutos || 45)} para el cliente. Si ya dijo cómo paga, pásalo en metodo_pago; si no, pregúntale y usa elegir_metodo_pago.
 - Métodos de pago: ${Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial).join(', ')} (efectivo lo coordina una persona).
 - Algunas rifas permiten APARTAR SIN PAGAR (ver_rifas lo dice en apartar_sin_pagar): el cliente aparta ahora y paga después, hasta la fecha límite. Ofrécelo con naturalidad si duda por el pago. Igual necesitas su nombre${cfg.pedir_cedula ? ' y cédula' : ''} y usas preparar_compra; ahí el apartado dura hasta esa fecha, no solo un rato.
-- Si la rifa tiene premios_adicionales, menciónalos al presentarla: es parte de lo que se gana.
+- Si la rifa tiene segundo_premio o tercer_premio, menciónalos al presentarla: es parte de lo que se gana.
+- Los premios_especiales son premios aparte que se ganan cumpliendo su requisito antes de su fecha tope: cuéntalos cuando venga al caso y di siempre el requisito y la fecha tal como vienen, sin inventar condiciones.
 - Las notas de voz te llegan transcritas ("[nota de voz, transcrita automáticamente] …"): respóndelas como cualquier mensaje, sin mencionar la transcripción. Puede traer errores: si un dato clave (número, cédula, nombre) no quedó claro, confírmalo con el cliente antes de usarlo.
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.

@@ -1,7 +1,9 @@
 // ============================================================
 //  rifaOpciones.js — Opciones de cada rifa para la venta en línea
 //   • publicada: si sale en la página del cliente (y la ofrece el bot)
-//   • premios_extra: premios adicionales al premio mayor [{ nombre, detalle }]
+//   • premio_segundo / premio_tercero: 2.º y 3.er premio de la rifa (texto, opcionales)
+//   • premios_extra: PREMIOS ESPECIALES de la rifa, cada uno con su requisito para
+//     participar y su fecha tope: [{ nombre, detalle, requisito, fecha_tope }]
 //   • pago_diferido: el cliente puede APARTAR sin pagar y pagar después,
 //     hasta `diferido_limite_horas` antes del sorteo. Si no paga, el número
 //     se libera. El bot le va recordando por WhatsApp.
@@ -12,6 +14,8 @@ const esquemaListo = (async () => {
   const sqls = [
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS publicada BOOLEAN NOT NULL DEFAULT TRUE`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premios_extra JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premio_segundo TEXT`,
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premio_tercero TEXT`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS pago_diferido BOOLEAN NOT NULL DEFAULT FALSE`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS diferido_limite_horas SMALLINT NOT NULL DEFAULT 3`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS diferido_max_numeros SMALLINT NOT NULL DEFAULT 10`,
@@ -28,11 +32,17 @@ const esquemaListo = (async () => {
 // Columnas para los SELECT de rifas (alias de la tabla)
 const COLUMNAS = (a = 'r') => `
   ${a}.publicada, COALESCE(${a}.premios_extra, '[]'::jsonb) AS premios_extra,
+  ${a}.premio_segundo, ${a}.premio_tercero,
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros`;
 
 function limpiarPremios(lista) {
   return (Array.isArray(lista) ? lista : [])
-    .map((p) => ({ nombre: String(p?.nombre ?? '').trim().slice(0, 120), detalle: String(p?.detalle ?? '').trim().slice(0, 200) }))
+    .map((p) => ({
+      nombre: String(p?.nombre ?? '').trim().slice(0, 120),
+      detalle: String(p?.detalle ?? '').trim().slice(0, 200),
+      requisito: String(p?.requisito ?? '').trim().slice(0, 200),             // qué hay que hacer para participar
+      fecha_tope: /^\d{4}-\d{2}-\d{2}$/.test(String(p?.fecha_tope || '')) ? p.fecha_tope : null,   // hasta cuándo se participa
+    }))
     .filter((p) => p.nombre)
     .slice(0, 12);
 }
@@ -45,6 +55,8 @@ async function guardar(db, rifaId, body = {}) {
   const poner = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
   if (typeof body.publicada === 'boolean') poner('publicada', body.publicada);
   if (body.premios_extra !== undefined) poner('premios_extra', JSON.stringify(limpiarPremios(body.premios_extra)));
+  if (body.premio_segundo !== undefined) poner('premio_segundo', String(body.premio_segundo ?? '').trim().slice(0, 160) || null);
+  if (body.premio_tercero !== undefined) poner('premio_tercero', String(body.premio_tercero ?? '').trim().slice(0, 160) || null);
   if (typeof body.pago_diferido === 'boolean') poner('pago_diferido', body.pago_diferido);
   if (body.diferido_limite_horas !== undefined) poner('diferido_limite_horas', Math.min(72, Math.max(0, Math.round(Number(body.diferido_limite_horas)) || 0)));
   if (body.diferido_max_numeros !== undefined) poner('diferido_max_numeros', Math.min(50, Math.max(1, Math.round(Number(body.diferido_max_numeros)) || 10)));
@@ -52,8 +64,19 @@ async function guardar(db, rifaId, body = {}) {
   vals.push(rifaId);
   const r = await db.query(
     `UPDATE rifas SET ${sets.join(', ')} WHERE id = $${vals.length}
-     RETURNING publicada, premios_extra, pago_diferido, diferido_limite_horas, diferido_max_numeros`, vals);
+     RETURNING publicada, premios_extra, premio_segundo, premio_tercero, pago_diferido, diferido_limite_horas, diferido_max_numeros`, vals);
   return r.rows[0] || null;
+}
+
+// Premios especiales que siguen vigentes (sin fecha tope o con la fecha todavía por llegar, hora de Venezuela)
+function especialesVigentes(rifa) {
+  const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' });
+  return (Array.isArray(rifa?.premios_extra) ? rifa.premios_extra : []).filter((p) => p?.nombre && (!p.fecha_tope || p.fecha_tope >= hoy));
+}
+// "Moto Bera (participa con abonos de 10$, hasta el 2026-10-20)"
+function describirEspecial(p) {
+  const extra = [p.detalle, p.requisito ? `requisito: ${p.requisito}` : null, p.fecha_tope ? `hasta el ${p.fecha_tope}` : null].filter(Boolean).join('; ');
+  return extra ? `${p.nombre} (${extra})` : p.nombre;
 }
 
 // Momento del sorteo (hora de Venezuela). Sin hora cargada se asume 8:00 p. m.
@@ -87,4 +110,4 @@ function fmtLimite(d) {
   return `${dia} a las ${hora}`;
 }
 
-module.exports = { esquemaListo, COLUMNAS, guardar, limpiarPremios, momentoSorteo, limiteDePago, puedeApartarse, fmtLimite };
+module.exports = { esquemaListo, COLUMNAS, guardar, limpiarPremios, especialesVigentes, describirEspecial, momentoSorteo, limiteDePago, puedeApartarse, fmtLimite };

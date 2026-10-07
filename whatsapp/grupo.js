@@ -20,6 +20,7 @@ const reservas = require('../services/reservas');
 const resultados = require('../services/resultados');
 const ganadores = require('../services/ganadores');
 const sitio = require('../services/sitio');
+const opcionesRifa = require('../services/rifaOpciones');
 const { obtenerConfig, guardarConfig } = require('./botConfig');
 
 let t = null;     // transporte: lo inyecta whatsappService
@@ -101,13 +102,14 @@ async function resolverGrupo(cfg) {
 
 // ── Publicar ─────────────────────────────────────────────────
 // Con clave: el aviso sale una sola vez. Devuelve la fila o null si no se envió.
-async function publicar({ clave = null, tipo, texto, imagen = null }) {
+// obligatorio: lo pidió una persona desde el panel → si no se puede, falla con un mensaje claro
+async function publicar({ clave = null, tipo, texto, imagen = null, obligatorio = tipo === 'manual' }) {
   await tablaLista;
   const cfg = await obtenerConfig();
-  if (!cfg.grupo?.activo && tipo !== 'manual') return null;
-  if (!t?.conectado()) { if (tipo === 'manual') throw new Error('WhatsApp no está conectado.'); return null; }
+  if (!cfg.grupo?.activo && !obligatorio) return null;
+  if (!t?.conectado()) { if (obligatorio) throw new Error('WhatsApp no está conectado.'); return null; }
   const jid = await resolverGrupo(cfg);
-  if (!jid) { if (tipo === 'manual') throw new Error('No hay un grupo configurado. Elígelo en WhatsApp → Grupo.'); return null; }
+  if (!jid) { if (obligatorio) throw new Error('No hay un grupo configurado. Elígelo en WhatsApp → Grupo.'); return null; }
 
   const ins = await pool.query(
     `INSERT INTO wa_grupo_envios (clave, tipo, texto, imagen_url) VALUES ($1, $2, $3, $4)
@@ -121,7 +123,7 @@ async function publicar({ clave = null, tipo, texto, imagen = null }) {
   } catch (e) {
     console.error(`❌ [Grupo] No se pudo publicar (${tipo}):`, e.message);
     await pool.query(`UPDATE wa_grupo_envios SET estado = 'error', error = $2 WHERE id = $1`, [id, e.message.slice(0, 300)]);
-    if (tipo === 'manual') throw e;
+    if (obligatorio) throw e;
     return null;
   }
 }
@@ -217,7 +219,9 @@ async function revisarProgramados() {
       const texto =
         `🚨 *¡Nueva rifa!* ${rifa.nombre}\n\n` +
         `🏆 Premio: ${rifa.premio}\n` +
-        ((rifa.premios_extra || []).length ? `🎁 Además: ${rifa.premios_extra.map((p) => p.nombre).join(' · ')}\n` : '') +
+        (rifa.premio_segundo ? `🥈 2.º premio: ${rifa.premio_segundo}\n` : '') +
+        (rifa.premio_tercero ? `🥉 3.er premio: ${rifa.premio_tercero}\n` : '') +
+        (opcionesRifa.especialesVigentes(rifa).length ? `🎁 Premios especiales: ${opcionesRifa.especialesVigentes(rifa).map((p) => p.nombre).join(' · ')}\n` : '') +
         `💰 ${fmtMonto(rifa.precio, cfg)} por número${ofertas.length ? `\n🔥 Ofertas: ${ofertas.join(' · ')}` : ''}\n` +
         (rifa.fecha_sorteo ? `📅 Sorteo: ${fmtFecha(rifa.fecha_sorteo)}${fmtHora(rifa.hora_sorteo) ? ` a las ${fmtHora(rifa.hora_sorteo)}` : ''}\n` : '') +
         `\nAparta tu número 👇\n${comoComprar(cfg)}`;
@@ -306,4 +310,11 @@ async function guardar(cambios) {
 
 const enviarManual = ({ texto, imagen }) => publicar({ tipo: 'manual', texto: String(texto || '').trim(), imagen: imagen || null });
 
-module.exports = { init, usarBot, alRecibir, estado, guardar, enviarManual, revisarProgramados };
+// Imagen de resultado publicada en el panel (módulo Resultados): el bot la manda al grupo.
+// Lanza un error claro si no se pudo (WhatsApp desconectado, sin grupo…).
+function enviarResultado(r) {
+  const texto = `🎉 *${r.titulo}*${r.fecha ? `\n📅 ${fmtFecha(r.fecha)}` : ''}${r.descripcion ? `\n\n${r.descripcion}` : ''}\n\n¡Gracias a todos por participar! 🍀`;
+  return publicar({ tipo: 'resultado', texto, imagen: r.imagen_url, obligatorio: true });
+}
+
+module.exports = { init, usarBot, alRecibir, estado, guardar, enviarManual, enviarResultado, revisarProgramados };

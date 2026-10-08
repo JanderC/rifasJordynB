@@ -45,6 +45,10 @@ const DEFECTO = {
   recordatorios_apartado: {
     activo: true,
     final_horas: 2,             // el aviso final sale estas horas antes del límite de pago
+    frecuencia: 'momentos',     // 'momentos' = víspera, día del sorteo y aviso final · 'cada' = cada X horas (y el aviso final)
+    cada_horas: 12,
+    mensaje: '',                // texto propio con variables ({nombre}, {numeros}, {falta}…); vacío = el automático
+    con_imagen: false,          // se envía con la foto principal de la rifa
   },
   // El bot en el grupo de WhatsApp del negocio (avisos automáticos y respuestas si lo mencionan)
   grupo: {

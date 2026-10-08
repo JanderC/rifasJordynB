@@ -918,6 +918,7 @@ async function alRecibirPropio(mensaje) {
 
 recordatorios.init({
   enviar: async (jid, texto) => enviarBloque(jid, texto, await obtenerConfig()),
+  enviarImagen: async (jid, url, texto) => enviarFotos(jid, [{ url, caption: texto }]),
   conectado: () => !!transporte?.conectado(),
 });
 

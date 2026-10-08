@@ -797,7 +797,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
 
     const reservR = await pool.query(
       `SELECT numero, COUNT(*)::int AS veces FROM reservas_cliente
-        WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW())) GROUP BY numero`,
+        WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono))) GROUP BY numero`,
       [rifa_id]
     );
     reservR.rows.forEach(r => {
@@ -1190,7 +1190,7 @@ router.get('/:id/numero/:n/disponibilidad', authMiddleware, soloDueno, async (re
     // 2d. Reservas pendientes/aprobadas (no rechazadas)
     const resR = await pool.query(
       `SELECT COUNT(*)::int AS veces FROM reservas_cliente
-        WHERE rifa_id = $1 AND numero = $2 AND (estado = 'aprobado' OR (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW())))`,
+        WHERE rifa_id = $1 AND numero = $2 AND (estado = 'aprobado' OR (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono))))`,
       [rifa_id, numero]
     );
     const vecesReservado = resR.rows[0]?.veces || 0;
@@ -1299,7 +1299,7 @@ router.post('/:id/venta-directa', authMiddleware, soloDueno, async (req, res) =>
 
     const resR = await client.query(
       `SELECT COUNT(*)::int AS v FROM reservas_cliente
-        WHERE rifa_id = $1 AND numero = $2 AND (estado = 'aprobado' OR (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW())))`,
+        WHERE rifa_id = $1 AND numero = $2 AND (estado = 'aprobado' OR (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono))))`,
       [rifa_id, numero]
     );
     const vecesR = resR.rows[0]?.v || 0;

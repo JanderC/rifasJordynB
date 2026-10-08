@@ -29,6 +29,7 @@ const ganadores = require('../services/ganadores');
 const grupo = require('./grupo');
 const opciones = require('../services/rifaOpciones');
 const recordatorios = require('./recordatorios');
+const abonos = require('../services/abonos');
 
 let transporte = null;   // lo inyecta whatsappService: { enviarTexto, enviarImagen, escribiendo, leer, conectado }
 function init(t) { transporte = t; }
@@ -325,6 +326,18 @@ const HERRAMIENTAS = [
     },
   },
   {
+    nombre: 'abonar_apartado',
+    descripcion: 'Solo cuando el cliente tiene números APARTADOS PARA PAGAR DESPUÉS y quiere pagar UNA PARTE ahora (un abono) y el resto luego. Registra cuánto va a abonar; si dice el método, el SISTEMA le envía los datos de pago con ese monto. Luego el cliente manda la captura. Para pagar todo lo que falta usa elegir_metodo_pago, no esta.',
+    parametros: {
+      type: 'object',
+      properties: {
+        monto: { type: 'number', description: 'Cuánto va a abonar ahora, en la moneda de los precios (pesos). Ej: 20000' },
+        metodo_pago: { type: 'string', description: 'Método con el que paga, si ya lo dijo' },
+      },
+      required: ['monto'],
+    },
+  },
+  {
     nombre: 'cancelar_compra',
     descripcion: 'Cancela la compra apartada y libera los números (cuando el cliente ya no la quiere o quiere cambiar los números).',
     parametros: { type: 'object', properties: {}, required: [] },
@@ -354,7 +367,8 @@ async function rifaValida(rifaId) {
 async function prepararPago(metodo, ec, efectos) {
   if (!metodosPago.METODOS_PAGO[metodo]) throw new Error(`El método de pago "${metodo}" ya no está disponible`);
   const tasas = await metodosPago.obtenerTasas();
-  const monto = metodosPago.montoEnMetodo(ec.total, metodo, tasas);
+  // Si va a abonar una parte se cobra ese monto; si no, todo lo que falta
+  const monto = metodosPago.montoEnMetodo(ec.abono_monto || ec.total, metodo, tasas);
   efectos.mensajePago = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });
   return monto;
 }
@@ -574,8 +588,10 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (metodosPago.METODOS_PAGO[metodo].presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
-          const monto = await prepararPago(metodo, ec, efectos);
-          const nuevo = { ...ec, metodo, monto };
+          // Elegir método sin hablar de abonar = paga todo lo que falta
+          const base = { ...ec, abono_monto: null };
+          const monto = await prepararPago(metodo, base, efectos);
+          const nuevo = { ...base, metodo, monto };
           if (!prueba) {
             await chats.actualizarChat(jid, { estado_compra: nuevo });
             if (ec.reservas?.length) await pool.query(`UPDATE reservas_cliente SET metodo_pago=$1 WHERE id = ANY($2)`, [metodo, ec.reservas]);
@@ -584,7 +600,35 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           const quedan = Math.max(1, Math.round((ec.apartado_hasta - Date.now()) / 60000));
           return { ok: true, metodo, monto: monto.texto, nota: notaPago(nuevo, quedan) };
         }
+        case 'abonar_apartado': {
+          const ec = chat.estado_compra;
+          if (ec?.paso !== 'esperando_comprobante' || !ec.diferido) {
+            return { error: 'Los abonos solo aplican a números apartados para pagar después. Si es una compra normal, se paga completa.' };
+          }
+          const falta = Math.max(ec.total - (ec.por_confirmar || 0), 0);
+          const monto = Math.round(Number(args.monto));
+          if (!(monto > 0)) return { error: 'Pregúntale cuánto va a abonar.' };
+          if (falta <= 0) return { error: 'Ya envió el pago de todo lo que debía; está por confirmarse.' };
+          if (monto >= falta) return { error: `Ese monto cubre todo lo que le falta (${fmtMonto(falta, cfg)}): no es un abono. Usa elegir_metodo_pago para que pague el total pendiente.` };
+          const metodo = args.metodo_pago ? metodosPago.normalizarMetodo(args.metodo_pago) : (ec.metodo || null);
+          if (args.metodo_pago && !metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
+          if (metodo && metodosPago.METODOS_PAGO[metodo]?.presencial) {
+            return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere abonar en efectivo".' };
+          }
+          const nuevo = { ...ec, abono_monto: monto, metodo: metodo || null };
+          if (metodo) nuevo.monto = await prepararPago(metodo, nuevo, efectos);
+          if (!prueba) await chats.actualizarChat(jid, { estado_compra: nuevo });
+          chat.estado_compra = nuevo;
+          const restante = fmtMonto(falta - monto, cfg);
+          return metodo
+            ? { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, nota: `El SISTEMA le envía ahora los datos de pago con el monto del abono. NO repitas datos bancarios ni montos convertidos: dile en una frase que mande la captura del abono y que después le quedarían ${restante} por pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.` }
+            : { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial), instruccion: 'Pregúntale con qué método va a hacer el abono y vuelve a llamar abonar_apartado con monto y metodo_pago.' };
+        }
         case 'cancelar_compra': {
+          // Con abonos confirmados hay dinero de por medio: no lo libera el bot
+          if (chat.estado_compra?.diferido && (chat.estado_compra.abonado > 0 || chat.estado_compra.por_confirmar > 0)) {
+            return { error: 'Estos números tienen abonos. No se pueden cancelar desde aquí.', instruccion: 'Usa pasar_a_humano con motivo "Quiere cancelar un apartado que ya tiene abonos".' };
+          }
           if (!prueba) {
             if (chat.estado_compra?.reservas?.length) await reservas.liberarApartados(chat.estado_compra.reservas);
             await chats.actualizarChat(jid, { estado_compra: null });
@@ -623,7 +667,7 @@ function describirEstado(ec, cfg) {
     return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
       (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron` : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
       (ec.diferido
-        ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
+        ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan.${ec.abonado > 0 ? ` YA ABONÓ ${fmtMonto(ec.abonado, cfg)} de ${fmtMonto(ec.total_rifa, cfg)}: el "total" de arriba es lo que le FALTA` : ''}${ec.por_confirmar > 0 ? ` Tiene un abono de ${fmtMonto(ec.por_confirmar, cfg)} enviado que el equipo está por confirmar` : ''}${ec.abono_monto ? ` Dijo que ahora va a abonar ${fmtMonto(ec.abono_monto, cfg)}: espera la captura de ese abono` : ''}. Puede pagar todo lo que falta o ABONAR UNA PARTE (abonar_apartado) y el resto después. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
         : (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '')) + '. Si pregunta, recuérdale que mande la captura del pago.';
   }
   if (ec.paso === 'esperando_confirmacion')
@@ -685,6 +729,7 @@ CÓMO VENDER
 - Si la rifa tiene segundo_premio o tercer_premio, menciónalos al presentarla: es parte de lo que se gana.
 - Los premios_especiales son premios aparte que se ganan cumpliendo su requisito antes de su fecha tope: cuéntalos cuando venga al caso y di siempre el requisito y la fecha tal como vienen, sin inventar condiciones.
 - Las notas de voz te llegan transcritas ("[nota de voz, transcrita automáticamente] …"): respóndelas como cualquier mensaje, sin mencionar la transcripción. Puede traer errores: si un dato clave (número, cédula, nombre) no quedó claro, confírmalo con el cliente antes de usarlo.
+- ABONOS: quien tiene números apartados para pagar después puede pagar una parte ahora y el resto luego. Si dice "abono 20 mil", "pago una parte", etc., usa abonar_apartado con ese monto. Cuando el equipo confirma el abono el sistema le avisa cuánto le falta. No inventes saldos: usa los del contexto.
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
@@ -886,6 +931,43 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
     await marcarAtencion(jid, 'mandó una imagen que no parece un comprobante; si sí lo es, confírmala como comprobante');
     return { ok: false, error: 'La imagen no parece un comprobante.' };
   }
+  // ── ABONO: números apartados para pagar después y el cliente paga una parte,
+  //    o ya venía abonando (su último pago también entra como abono y completa el total).
+  //    Queda "por confirmar" en Reservas; los números siguen apartados.
+  if (ec.diferido && ec.reservas?.length && (ec.abono_monto || ec.abonado > 0 || ec.por_confirmar > 0)) {
+    const g = (await reservas.apartadosDe({ jid, telefono: chat.telefono, rifaId: ec.rifa_id }))[0];
+    if (g) {
+      const falta = Math.max(g.saldo - g.por_confirmar, 0);
+      const monto = Math.min(Math.round(Number(ec.abono_monto) || falta), falta);
+      if (monto > 0) {
+        try {
+          await abonos.crear(pool, {
+            g, jid, monto, metodo: ec.metodo || null, comprobanteUrl: url, origen: 'whatsapp',
+            datos: { ...(datos || {}), metodo: ec.metodo || null, monto_declarado: monto, monto_esperado: ec.monto?.texto || fmtMonto(monto, cfg), total: g.total, abonado_antes: g.abonado },
+          });
+        } catch (e) {
+          console.error('❌ [Bot] Error registrando abono:', e.message);
+          await marcarAtencion(jid, 'mandó el comprobante de un abono pero no pude registrarlo en el sistema');
+          await responder(jid, 'Recibí tu comprobante 🙌 dame un momento que lo reviso y te confirmo.', cfg);
+          return { ok: false, error: 'No se pudo registrar el abono.' };
+        }
+        const restante = Math.max(falta - monto, 0);
+        await chats.actualizarChat(jid, { estado_compra: { ...ec, abono_monto: null, monto: null, por_confirmar: (ec.por_confirmar || 0) + monto } });
+        bus.emit('wa:reserva', { jid, numeros: g.numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: monto });
+        await chats.guardarMensaje({
+          jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
+          texto: `💵 Abono recibido: ${fmtMonto(monto, cfg)} · ${ec.rifa_nombre} · números ${g.numeros.join(', ')}. Por confirmar en Reservas → Abonos.`,
+        });
+        if (!silencioso) {
+          await responder(jid, restante > 0
+            ? `Recibí tu abono de *${fmtMonto(monto, cfg)}* ✅\n\nApenas lo verifiquemos te confirmo. Te quedarían ${fmtMonto(restante, cfg)} por pagar hasta el ${opciones.fmtLimite(g.limite)}.`
+            : `Recibí tu comprobante ✅ Con este pago completas el total.\n\nApenas lo verifiquemos te llega tu ticket por aquí.`, cfg);
+        }
+        return { ok: true, abono: true, numeros: g.numeros, rifa: ec.rifa_nombre, conflictos: [] };
+      }
+    }
+  }
+
   // Lo que el sistema le pidió pagar queda junto al comprobante para revisarlo en Reservas
   datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg) };
   if (Number(datos.monto) && ec.monto?.valor && ec.monto.moneda === (/usd|\$/i.test(datos.moneda || '') ? 'USD' : /bs|ves|bol/i.test(datos.moneda || '') ? 'VES' : 'COP')) {
@@ -1017,6 +1099,45 @@ bus.on('reservas:aprobadas', async (lista) => {
     }
     await chats.guardarMensaje({ jid: chat.jid, deMi: true, autor: 'sistema', texto: `✅ Pago aprobado · números ${numeros.join(', ')}` });
   }
+});
+
+// ── Abonos confirmados o rechazados en Reservas ──────────────
+bus.on('abono:aprobado', async (info) => {
+  try {
+    const cfg = await obtenerConfig();
+    const jid = info.jid || (await chats.chatPorTelefono(info.abono.telefono).catch(() => null))?.jid;
+    if (!jid) return;
+    const chat = await chats.obtenerChat(jid);
+    if (chat) {
+      await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `✅ Abono confirmado · ${fmtMonto(info.abono.monto, cfg)} · números ${info.numeros.join(', ')}${info.completo ? ' · pago COMPLETO' : ` · falta ${fmtMonto(info.saldo, cfg)}`}` });
+      // El chat queda con las cuentas al día (o esperando la aprobación final)
+      if (info.completo) {
+        await chats.actualizarChat(jid, { estado_compra: { paso: 'esperando_confirmacion', rifa_id: info.rifa.id, rifa_nombre: info.rifa.nombre, numeros: info.numeros, nombre: info.abono.nombre_cliente, total: info.total, reservas: info.abono.reserva_ids, desde: Date.now() } });
+      } else {
+        await recordatorios.vincularApartados(jid, chat).catch(() => {});
+      }
+    }
+    if (!transporte?.conectado() || info.abono.origen === 'panel' && !chat) return;
+    const primer = String(info.abono.nombre_cliente || '').split(' ')[0];
+    await responder(jid, info.completo
+      ? `${primer ? `${primer}, c` : 'C'}onfirmamos tu pago de *${fmtMonto(info.abono.monto, cfg)}* ✅ Con eso completaste ${info.numeros.length > 1 ? 'los números' : 'el número'} ${info.numeros.join(', ')} de ${info.rifa.nombre}.\n\nEn un momento te llega tu ticket por aquí 🎟️`
+      : `${primer ? `${primer}, c` : 'C'}onfirmamos tu abono de *${fmtMonto(info.abono.monto, cfg)}* ✅\n\nLlevas abonado ${fmtMonto(info.abonado, cfg)} de ${fmtMonto(info.total, cfg)}. Te faltan *${fmtMonto(info.saldo, cfg)}*${info.limite ? ` y tienes hasta el ${opciones.fmtLimite(info.limite)}` : ''}.`, cfg);
+  } catch (e) { console.error('❌ [Bot] aviso de abono:', e.message); }
+});
+
+bus.on('abono:rechazado', async (info) => {
+  try {
+    const cfg = await obtenerConfig();
+    const jid = info.jid || (await chats.chatPorTelefono(info.abono.telefono).catch(() => null))?.jid;
+    if (!jid) return;
+    const chat = await chats.obtenerChat(jid);
+    if (!chat) return;
+    await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `❌ Abono rechazado · ${fmtMonto(info.abono.monto, cfg)}${info.abono.nota_admin ? ` · ${info.abono.nota_admin}` : ''}` });
+    await recordatorios.vincularApartados(jid, chat).catch(() => {});
+    if (!cfg.avisar_rechazo || !transporte?.conectado()) return;
+    const primer = String(info.abono.nombre_cliente || '').split(' ')[0];
+    await responder(jid, `Hola${primer ? ' ' + primer : ''}, no pudimos verificar tu abono de ${fmtMonto(info.abono.monto, cfg)} 😕${info.abono.nota_admin ? `\n\n${info.abono.nota_admin}` : ''}\n\nSi crees que es un error, escríbeme por aquí y lo revisamos.`, cfg);
+  } catch (e) { console.error('❌ [Bot] aviso de abono rechazado:', e.message); }
 });
 
 bus.on('reservas:rechazadas', async (lista) => {

@@ -23,6 +23,29 @@ const esquemaListo = (async () => {
     `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS pago_diferido BOOLEAN NOT NULL DEFAULT FALSE`,
     `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS recordatorios JSONB NOT NULL DEFAULT '[]'::jsonb`,
     `CREATE INDEX IF NOT EXISTS idx_reservas_diferidas ON reservas_cliente (rifa_id) WHERE estado = 'apartado' AND pago_diferido`,
+    // Abonos (pagos parciales) de números apartados — ver services/abonos.js
+    `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS tiene_abono BOOLEAN NOT NULL DEFAULT FALSE`,   // con abono confirmado no se libera solo
+    `CREATE TABLE IF NOT EXISTS reserva_abonos (
+       id                BIGSERIAL PRIMARY KEY,
+       rifa_id           UUID NOT NULL REFERENCES rifas(id) ON DELETE CASCADE,
+       reserva_ids       UUID[] NOT NULL DEFAULT '{}',       -- apartados a los que se abona
+       nombre_cliente    TEXT,
+       cedula            TEXT,
+       telefono          TEXT,
+       wa_jid            TEXT,
+       monto             NUMERIC(14,2) NOT NULL,             -- en la moneda de las rifas (pesos)
+       metodo_pago       TEXT,
+       comprobante_url   TEXT,
+       comprobante_datos JSONB,
+       origen            VARCHAR(20) NOT NULL DEFAULT 'web', -- web | whatsapp | panel
+       estado            VARCHAR(12) NOT NULL DEFAULT 'pendiente',   -- pendiente | aprobado | rechazado
+       aplicado          BOOLEAN NOT NULL DEFAULT FALSE,     -- ya quedó dentro de la venta final
+       nota_admin        TEXT,
+       created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_abonos_rifa ON reserva_abonos (rifa_id, estado)`,
+    `CREATE INDEX IF NOT EXISTS idx_abonos_reservas ON reserva_abonos USING GIN (reserva_ids)`,
   ];
   for (const sql of sqls) {
     try { await pool.query(sql); } catch (e) { console.error('[rifaOpciones] esquema:', e.message); }
@@ -106,7 +129,9 @@ function puedeApartarse(rifa) {
 function fmtLimite(d) {
   if (!d) return '';
   const dia = d.toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Caracas' });
-  const hora = d.toLocaleTimeString('es-VE', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Caracas' });
+  // "7:10 pm" (sin puntos, para que la frase pueda terminar en punto sin duplicarlo)
+  const hora = d.toLocaleTimeString('es-VE', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Caracas' })
+    .replace(/\s*([ap])\.\s*m\.?/i, (m, l) => ` ${l.toLowerCase()}m`);
   return `${dia} a las ${hora}`;
 }
 

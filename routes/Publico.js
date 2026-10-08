@@ -18,6 +18,7 @@ const {
 const { metodosActivos, obtenerTasas } = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const reservasSvc = require('../services/reservas');
+const abonos = require('../services/abonos');
 
 
 /* ─────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ router.get('/rifas/:id/numero/:n', async (req, res) => {
 
     const [vend, resv, asig] = await Promise.all([
       pool.query(`SELECT COUNT(*)::int n FROM ventas WHERE rifa_id=$1 AND numero=$2`, [req.params.id, numero]),
-      pool.query(`SELECT COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`, [req.params.id, numero]),
+      pool.query(`SELECT COUNT(*)::int n FROM reservas_cliente WHERE rifa_id=$1 AND numero=$2 AND (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono)))`, [req.params.id, numero]),
       pool.query(`SELECT 1 FROM numeros_vendedor WHERE rifa_id=$1 AND numero=$2
                   UNION SELECT 1 FROM boleteria_numeros_extra WHERE rifa_id=$1 AND numero=$2 LIMIT 1`,
                  [req.params.id, numero]),
@@ -188,7 +189,7 @@ router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
 
     // 3. Reservas pendientes por número (contamos cuántas hay, no solo si existe una)
     const reservados = await pool.query(
-      `SELECT numero, COUNT(*) AS veces FROM reservas_cliente WHERE rifa_id=$1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW())) GROUP BY numero`,
+      `SELECT numero, COUNT(*) AS veces FROM reservas_cliente WHERE rifa_id=$1 AND (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono))) GROUP BY numero`,
       [req.params.id]
     );
 
@@ -329,13 +330,13 @@ router.get('/rifas/:id/progreso', async (req, res) => {
         ? pool.query(
             `SELECT COUNT(*)::int AS n
                FROM reservas_cliente
-              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`,
+              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono)))`,
             [req.params.id]
           )
         : pool.query(
             `SELECT COUNT(DISTINCT numero)::int AS n
                FROM reservas_cliente
-              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`,
+              WHERE rifa_id = $1 AND (estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono)))`,
             [req.params.id]
           ),
       // Números en poder de vendedores
@@ -457,19 +458,26 @@ router.get('/apartados', async (req, res) => {
     res.json(grupos.map((g) => ({
       rifa_id: g.rifa.id, rifa: g.rifa.nombre, premio: g.rifa.premio, numeros: g.numeros, nombre: g.nombre,
       total: g.total, pago_hasta: g.limite.toISOString(), pago_hasta_texto: opciones.fmtLimite(g.limite),
+      // Abonos: lo confirmado, lo enviado sin confirmar y lo que falta por pagar
+      abonado: g.abonado, por_confirmar: g.por_confirmar, saldo: g.saldo,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ── POST /api/publico/apartados/pagar ─────────────────────
-   El cliente sube el comprobante de sus números apartados:
-   pasan a "pendiente" y el dueño los aprueba en Reservas.
-   Body: { rifa_id, telefono, cedula, metodo_pago, comprobante_base64 }
+   El cliente sube el comprobante de sus números apartados.
+   - Pago completo de una vez: pasan a "pendiente" y el dueño los aprueba en Reservas.
+   - Abono (paga una parte, o ya venía abonando): queda como abono por confirmar;
+     los números siguen apartados hasta completar el total.
+   Body: { rifa_id, telefono, cedula, metodo_pago, comprobante_base64, monto? }
+         monto (en pesos) = cuánto está pagando ahora; sin monto = todo lo que falta
 ────────────────────────────────────────────────────────── */
 router.post('/apartados/pagar', async (req, res) => {
   const { rifa_id, telefono, cedula, metodo_pago, comprobante_base64 } = req.body;
   if (!rifa_id || digitos(telefono).length < 10 || digitos(cedula).length < 5)
     return res.status(400).json({ error: 'Faltan datos para identificar tus números apartados' });
+  const montoPedido = req.body.monto === undefined || req.body.monto === null || req.body.monto === '' ? null : Math.round(Number(req.body.monto));
+  if (montoPedido !== null && !(montoPedido > 0)) return res.status(400).json({ error: 'Escribe cuánto vas a abonar' });
   if (!comprobante_base64)
     return res.status(400).json({ error: 'Adjunta el comprobante de pago' });
 
@@ -479,7 +487,29 @@ router.post('/apartados/pagar', async (req, res) => {
     const grupo = (await reservasSvc.apartadosDe({ telefono, rifaId: rifa_id })).find((g) => mismaCedula(g.cedula, cedula));
     if (!grupo) return res.status(404).json({ error: 'No encontramos números apartados con esos datos. Puede que ya se hayan pagado o que se venció el plazo.' });
 
+    // Lo que falta contando lo ya confirmado y lo que está por confirmar
+    const falta = Math.max(grupo.saldo - grupo.por_confirmar, 0);
+    if (falta <= 0) return res.status(409).json({ error: 'Ya enviaste el pago completo de estos números. Estamos verificándolo.' });
+    const monto = Math.min(montoPedido ?? falta, falta);
+
     url = await subirSiEsBase64(comprobante_base64, { folder: CARPETAS.comprobantes });
+
+    // Abono: paga una parte, o ya tenía abonos (el último también es un abono: al confirmarlo se completa)
+    if (monto < grupo.total || grupo.abonado > 0 || grupo.por_confirmar > 0) {
+      const a = await abonos.crear(pool, {
+        g: grupo, monto, metodo: metodo_pago || null, comprobanteUrl: url, origen: 'web',
+        datos: { metodo: metodo_pago || null, monto_declarado: monto, total: grupo.total, abonado_antes: grupo.abonado },
+      });
+      confirmado = true;
+      const restante = Math.max(falta - monto, 0);
+      return res.json({
+        ok: true, abono: true, id: a.id, monto, restante, numeros: grupo.numeros,
+        mensaje: restante > 0
+          ? `¡Abono recibido! Apenas lo verifiquemos te confirmamos por WhatsApp. Te quedarían ${restante.toLocaleString('es-CO')} pesos por pagar antes del ${opciones.fmtLimite(grupo.limite)}.`
+          : '¡Comprobante recibido! Con este pago completas el total. Apenas lo verifiquemos te llega tu ticket por WhatsApp.',
+      });
+    }
+
     await client.query('BEGIN');
     const filas = await reservasSvc.confirmarApartadoTx(client, grupo.ids, {
       comprobanteUrl: url, metodo_pago: metodo_pago || null, comprobante_nombre: 'comprobante-web',
@@ -688,7 +718,10 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
              ${FECHA_SQL('r')},
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
              env.id AS envio_id, env.estado AS envio_estado, env.error AS envio_error,
-             env.frio AS envio_frio, env.enviado_at AS envio_enviado_at
+             env.frio AS envio_frio, env.enviado_at AS envio_enviado_at,
+             -- Abonos confirmados del cliente sobre este apartado (el mismo valor en todos sus números)
+             (SELECT COALESCE(SUM(a.monto), 0) FROM reserva_abonos a
+               WHERE rc.id = ANY(a.reserva_ids) AND a.estado = 'aprobado' AND NOT a.aplicado) AS abonado
       FROM reservas_cliente rc
       JOIN rifas r ON r.id = rc.rifa_id
       -- Estado del envío del ticket por WhatsApp (cola anti-bloqueo)
@@ -715,6 +748,96 @@ router.put('/admin/apartados/pagado', authMiddleware, soloDueno, async (req, res
     const filas = await reservasSvc.marcarApartadosPagados(ids, req.body.nota || 'Pago recibido directamente');
     res.json({ ok: true, procesadas: filas.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ── GET /api/publico/admin/abonos?estado= ────────────────
+   Abonos de números apartados (por confirmar primero)
+────────────────────────────────────────────────────────── */
+router.get('/admin/abonos', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    const estado = ['pendiente', 'aprobado', 'rechazado'].includes(req.query.estado) ? req.query.estado : null;
+    res.json(await abonos.listar({ estado }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ── PUT /api/publico/admin/abonos/:id ────────────────────
+   Body: { accion: 'aprobar' | 'rechazar', monto?, nota? }
+   Al aprobar se puede corregir el monto (lo que realmente llegó).
+────────────────────────────────────────────────────────── */
+router.put('/admin/abonos/:id', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    const { accion, monto, nota } = req.body || {};
+    const r = accion === 'rechazar'
+      ? await abonos.rechazar(req.params.id, nota || null)
+      : accion === 'aprobar'
+        ? await abonos.aprobar(req.params.id, { monto: monto ?? null, nota: nota || null })
+        : { ok: false, status: 400, error: "accion debe ser 'aprobar' o 'rechazar'" };
+    if (!r.ok) return res.status(r.status || 400).json({ error: r.error });
+    res.json({ ok: true, completo: !!r.completo, abonado: r.abonado, saldo: r.saldo, total: r.total });
+  } catch (e) { console.error('[abonos]', e); res.status(500).json({ error: e.message }); }
+});
+
+/* ── POST /api/publico/admin/abonos ───────────────────────
+   El dueño recibió un abono por fuera (efectivo, en persona).
+   Body: { ids: [apartados del cliente], monto, nota?, metodo_pago? }
+   Queda confirmado de una vez.
+────────────────────────────────────────────────────────── */
+router.post('/admin/abonos', authMiddleware, soloDueno, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const monto = Math.round(Number(req.body?.monto));
+  if (!ids.length) return res.status(400).json({ error: 'ids[] es requerido' });
+  if (!(monto > 0)) return res.status(400).json({ error: 'Escribe el monto del abono' });
+  try {
+    const filas = await pool.query(
+      `SELECT id, rifa_id, nombre_cliente, cedula, telefono, wa_jid FROM reservas_cliente WHERE id = ANY($1) AND estado = 'apartado'`, [ids]);
+    const f = filas.rows[0];
+    if (!f) return res.status(404).json({ error: 'Esos números ya no están apartados' });
+    const rifa = await reservasSvc.infoRifa(pool, f.rifa_id);
+    const a = await abonos.crear(pool, {
+      g: { rifa, ids: filas.rows.map((x) => x.id), nombre: f.nombre_cliente, cedula: f.cedula, telefono: f.telefono, wa_jid: f.wa_jid },
+      monto, metodo: req.body.metodo_pago || 'Efectivo', origen: 'panel',
+    });
+    const r = await abonos.aprobar(a.id, { nota: req.body.nota || 'Abono recibido directamente' });
+    if (!r.ok) return res.status(r.status || 400).json({ error: r.error });
+    res.json({ ok: true, completo: r.completo, abonado: r.abonado, saldo: r.saldo, total: r.total });
+  } catch (e) { console.error('[abonos]', e); res.status(500).json({ error: e.message }); }
+});
+
+/* ── PUT /api/publico/admin/reservas-a-abono ──────────────
+   Un comprobante llegó como pago completo pero en realidad fue un abono
+   (el cliente mandó la captura de una parte sin avisar). Los números
+   vuelven a "apartado" y el comprobante queda como abono confirmado.
+   Body: { ids: [reservas pendientes], monto }
+────────────────────────────────────────────────────────── */
+router.put('/admin/reservas-a-abono', authMiddleware, soloDueno, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const monto = Math.round(Number(req.body?.monto));
+  if (!ids.length) return res.status(400).json({ error: 'ids[] es requerido' });
+  if (!(monto > 0)) return res.status(400).json({ error: 'Escribe cuánto abonó' });
+  try {
+    const filas = await pool.query(
+      `SELECT * FROM reservas_cliente WHERE id = ANY($1) AND estado = 'pendiente' AND pago_diferido`, [ids]);
+    const f = filas.rows[0];
+    if (!f) return res.status(404).json({ error: 'Solo aplica a pagos por aprobar de números que se habían apartado para pagar después' });
+    const rifa = await reservasSvc.infoRifa(pool, f.rifa_id);
+    const idsOk = filas.rows.map((x) => x.id);
+    const total = reservasSvc.calcularPrecioReal(idsOk.length, rifa.ofertas, Number(rifa.precio));
+    if (monto >= total) return res.status(400).json({ error: `Ese monto cubre el total (${total.toLocaleString('es-CO')} pesos): apruébalo como pago completo` });
+    // Vuelven a apartado hasta el límite de la rifa (o un día más si ya pasó)
+    const limiteRifa = opciones.limiteDePago(rifa);
+    const limite = limiteRifa && limiteRifa > new Date() ? limiteRifa : new Date(Date.now() + 24 * 3600000);
+    await pool.query(
+      `UPDATE reservas_cliente SET estado = 'apartado', apartado_hasta = $2, comprobante_base64 = NULL, comprobante_nombre = NULL, comprobante_datos = NULL, updated_at = NOW()
+        WHERE id = ANY($1)`, [idsOk, limite]);
+    const a = await abonos.crear(pool, {
+      g: { rifa, ids: idsOk, nombre: f.nombre_cliente, cedula: f.cedula, telefono: f.telefono, wa_jid: f.wa_jid },
+      monto, metodo: f.metodo_pago, comprobanteUrl: /^https?:\/\//.test(f.comprobante_base64 || '') ? f.comprobante_base64 : null,
+      origen: f.origen === 'whatsapp' ? 'whatsapp' : 'web', datos: f.comprobante_datos,
+    });
+    const r = await abonos.aprobar(a.id, { nota: 'Registrado como abono parcial' });
+    if (!r.ok) return res.status(r.status || 400).json({ error: r.error });
+    res.json({ ok: true, abonado: r.abonado, saldo: r.saldo, total: r.total });
+  } catch (e) { console.error('[abonos]', e); res.status(500).json({ error: e.message }); }
 });
 
 /* ── DELETE /api/publico/admin/apartados ──────────────────

@@ -42,7 +42,9 @@ function estadoDeApartado(g) {
   return {
     paso: 'esperando_comprobante', diferido: true,
     rifa_id: g.rifa.id, rifa_nombre: g.rifa.nombre, numeros: g.numeros,
-    nombre: g.nombre, cedula: g.cedula || null, total: g.total, metodo: null,
+    // total = lo que le FALTA pagar (el precio menos los abonos confirmados)
+    nombre: g.nombre, cedula: g.cedula || null, total: g.saldo ?? g.total, metodo: null,
+    total_rifa: g.total, abonado: g.abonado || 0, por_confirmar: g.por_confirmar || 0,
     reservas: g.ids, apartado_hasta: new Date(g.limite).getTime(), desde: Date.now(),
   };
 }
@@ -59,7 +61,9 @@ async function vincularApartados(jid, chat) {
   }
   const g = grupos.sort((a, b) => a.limite - b.limite)[0];   // el que vence primero
   const previo = chat?.estado_compra;
-  const mismo = previo?.diferido && previo.rifa_id === g.rifa.id && (previo.reservas || []).join() === g.ids.join();
+  // "Mismo" = mismos números y mismas cuentas (si le confirmaron un abono, cambia lo que debe)
+  const mismo = previo?.diferido && previo.rifa_id === g.rifa.id && (previo.reservas || []).join() === g.ids.join()
+    && previo.total === g.saldo && (previo.por_confirmar || 0) === (g.por_confirmar || 0);
   const estado = mismo ? previo : estadoDeApartado(g);
   if (!mismo) {
     await chats.actualizarChat(jid, { estado_compra: estado });
@@ -100,18 +104,24 @@ function textoRecordatorio(etapa, g, cfg) {
   const nombre = String(g.nombre || '').trim().split(/\s+/)[0] || '';
   const varios = g.numeros.length > 1;
   const nums = `${varios ? 'los números' : 'el número'} *${g.numeros.join(', ')}*`;
-  const total = `${Math.round(g.total).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
+  const pesos = (n) => `${Math.round(n).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
+  // Con abonos se le recuerda lo que FALTA, no el precio completo
+  const abonado = Number(g.abonado) || 0;
+  const total = pesos(g.saldo ?? g.total);
+  const cuenta = abonado > 0 ? `Llevas abonado ${pesos(abonado)}. Te falta: *${total}*` : null;
   const limite = opciones.fmtLimite(g.limite);
   const metodos = Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial);
   const comoPagar = `¿Con qué vas a pagar? ${metodos.length ? `Tenemos ${metodos.join(', ')}. ` : ''}Dime y te paso los datos 👇`;
   const hora = g.limite.toLocaleTimeString('es-VE', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Caracas' });
   if (etapa === 'final') {
     return `⏰ ${nombre ? `${nombre}, te` : 'Te'} quedan *${duracion(g.limite.getTime() - Date.now())}* para pagar ${nums} de *${g.rifa.nombre}*.\n\n` +
-      `Total: *${total}*. Después de las ${hora} ${varios ? 'se liberan y los puede tomar' : 'se libera y lo puede tomar'} otra persona 🙏\n\n${comoPagar}`;
+      (abonado > 0
+        ? `${cuenta}. El plazo vence a las ${hora} 🙏\n\n${comoPagar}`
+        : `Total: *${total}*. Después de las ${hora} ${varios ? 'se liberan y los puede tomar' : 'se libera y lo puede tomar'} otra persona 🙏\n\n${comoPagar}`);
   }
   const cuando = etapa === 'vispera' ? 'mañana es el sorteo' : '¡hoy es el sorteo!';
   return `Hola${nombre ? ` ${nombre}` : ''} 👋 Te recuerdo que tienes ${varios ? 'apartados' : 'apartado'} ${nums} en *${g.rifa.nombre}* y ${cuando} 🎉\n\n` +
-    `Total a pagar: *${total}*. Tienes hasta el ${limite}.\n\n${comoPagar}`;
+    `${cuenta || `Total a pagar: *${total}*`}. Tienes hasta el ${limite}.\n\n${comoPagar}`;
 }
 
 // ── Revisión periódica ───────────────────────────────────────
@@ -134,7 +144,7 @@ async function revisar() {
            (SELECT COALESCE(JSONB_AGG(DISTINCT e), '[]'::jsonb) FROM reservas_cliente x, JSONB_ARRAY_ELEMENTS(x.recordatorios) e
              WHERE x.id = ANY(ARRAY_AGG(rc.id))) AS enviados
       FROM reservas_cliente rc
-     WHERE estado = 'apartado' AND pago_diferido AND apartado_hasta > NOW()
+     WHERE estado = 'apartado' AND pago_diferido AND (apartado_hasta > NOW() OR tiene_abono)
      GROUP BY rifa_id, persona
      ORDER BY MIN(apartado_hasta)
      LIMIT 200`);
@@ -152,9 +162,17 @@ async function revisar() {
     const clave = `${x.rifa_id}|${x.persona}|${toca.etapa}`;
     if ((fallos.get(clave) || 0) > Date.now()) continue;
 
+    const total = reservas.calcularPrecioReal(x.numeros.length, rifa.ofertas, Number(rifa.precio));
+    const ab = await pool.query(
+      `SELECT COALESCE(SUM(monto) FILTER (WHERE estado = 'aprobado'), 0) AS abonado,
+              COALESCE(SUM(monto) FILTER (WHERE estado = 'pendiente'), 0) AS por_confirmar
+         FROM reserva_abonos WHERE reserva_ids && $1::uuid[] AND NOT aplicado`, [x.ids]);
+    const abonado = Number(ab.rows[0].abonado), porConfirmar = Number(ab.rows[0].por_confirmar);
+    // Ya mandó el pago de todo lo que falta y está por confirmarse: no se le recuerda
+    if (total - abonado - porConfirmar <= 0) continue;
     const g = {
       rifa, ids: x.ids, numeros: x.numeros, nombre: x.nombre, cedula: x.cedula, telefono: x.telefono, limite,
-      total: reservas.calcularPrecioReal(x.numeros.length, rifa.ofertas, Number(rifa.precio)),
+      total, abonado, por_confirmar: porConfirmar, saldo: Math.max(total - abonado, 0),
     };
     try {
       await t.enviar(jid, textoRecordatorio(toca.etapa, g, cfg));

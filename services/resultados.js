@@ -54,7 +54,7 @@ async function quienTiene(rifaId, numero) {
     pool.query(`SELECT id, nombre_cliente, telefono, cedula, estado, COALESCE(origen, 'web') AS origen, updated_at
                   FROM reservas_cliente
                  WHERE rifa_id = $1 AND TRIM(numero) = $2
-                   AND (estado IN ('pendiente', 'aprobado') OR (estado = 'apartado' AND apartado_hasta > NOW()))
+                   AND (estado IN ('pendiente', 'aprobado') OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono)))
                  ORDER BY updated_at`, [rifaId, numero]),
   ]);
   // Una reserva aprobada ES una venta en línea aunque no tenga su fila en ventas

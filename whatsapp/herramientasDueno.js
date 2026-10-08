@@ -108,7 +108,7 @@ async function resumenDe(rifa) {
     pool.query(`SELECT COALESCE(origen, 'vendedor') AS origen, COUNT(*)::int n, COALESCE(SUM(precio_venta), 0) AS monto
                   FROM ventas WHERE rifa_id=$1 GROUP BY 1`, [rifa.id]),
     pool.query(`SELECT estado, COUNT(*)::int n FROM reservas_cliente
-                 WHERE rifa_id=$1 AND (estado='pendiente' OR (estado='apartado' AND apartado_hasta > NOW())) GROUP BY 1`, [rifa.id]),
+                 WHERE rifa_id=$1 AND (estado='pendiente' OR (estado='apartado' AND (apartado_hasta > NOW() OR tiene_abono))) GROUP BY 1`, [rifa.id]),
     reservas.numerosLibres(pool, rifa, { cantidad: 1 }),
   ]);
   const por = Object.fromEntries(onl.rows.map((x) => [x.origen, x]));

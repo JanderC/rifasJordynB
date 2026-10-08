@@ -350,7 +350,7 @@ router.get('/rifas/:rifaId/ventas-online', async (req, res) => {
       SELECT COALESCE(rc.origen, 'web') AS origen, rc.estado, COUNT(*)::int AS numeros
         FROM reservas_cliente rc
        WHERE rc.rifa_id = $1
-         AND (rc.estado = 'pendiente' OR (rc.estado = 'apartado' AND rc.apartado_hasta > NOW()))
+         AND (rc.estado = 'pendiente' OR (rc.estado = 'apartado' AND (rc.apartado_hasta > NOW() OR rc.tiene_abono)))
        GROUP BY 1, 2`, [req.params.rifaId]);
     const precioR = await pool.query(`SELECT precio FROM rifas WHERE id=$1`, [req.params.rifaId]);
     const precio = Number(precioR.rows[0]?.precio || 0);
@@ -363,7 +363,12 @@ router.get('/rifas/:rifaId/ventas-online', async (req, res) => {
       pendientes[o].monto = redondear(pendientes[o].numeros * precio);
     }
 
+    // Abonos de números apartados: dinero ya recibido que todavía no es venta
+    // (cuando el cliente completa el pago pasa a ser una venta y sale de aquí)
+    const abonosRifa = await require('../services/abonos').resumenRifa(req.params.rifaId);
+
     res.json({
+      abonos: abonosRifa,
       total_numeros: ventas.length,
       total_monto: redondear(porOrigen.web.monto + porOrigen.whatsapp.monto),
       por_origen: porOrigen,

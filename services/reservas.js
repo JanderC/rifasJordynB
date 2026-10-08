@@ -52,7 +52,7 @@ const esquemaListo = (async () => {
 
 // Una reserva ocupa el número si está pendiente de aprobar o si está
 // "apartada" (el bot de WhatsApp la bloqueó mientras llega el comprobante).
-const SQL_RESERVA_OCUPA = `(estado = 'pendiente' OR (estado = 'apartado' AND apartado_hasta > NOW()))`;
+const SQL_RESERVA_OCUPA = `(estado = 'pendiente' OR (estado = 'apartado' AND (apartado_hasta > NOW() OR tiene_abono)))`;
 
 // Mejor precio total aplicando ofertas (p. ej. 3 números por $X)
 function calcularPrecioReal(cantidad, ofertas, precioUnitario) {
@@ -322,21 +322,24 @@ async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_da
 const soloDigitos = (t) => String(t || '').replace(/\D/g, '');
 
 // Apartados sin pagar de una persona (por su WhatsApp o su teléfono), agrupados por rifa:
-// [{ rifa (infoRifa), ids, numeros, nombre, cedula, telefono, total, limite (Date) }]
+// [{ rifa (infoRifa), ids, numeros, nombre, cedula, telefono, limite (Date),
+//    total (precio de todos sus números), abonado (abonos confirmados),
+//    por_confirmar (abonos enviados sin confirmar), saldo (lo que le falta pagar) }]
 async function apartadosDe({ jid = null, telefono = null, rifaId = null } = {}) {
+  await opciones.esquemaListo;
   const tel = soloDigitos(telefono);
   if (!jid && tel.length < 7) return [];
   const r = await pool.query(`
-    SELECT id, rifa_id, TRIM(numero) AS numero, nombre_cliente, cedula, telefono, apartado_hasta
+    SELECT id, rifa_id, TRIM(numero) AS numero, nombre_cliente, cedula, telefono, apartado_hasta, wa_jid
       FROM reservas_cliente
-     WHERE estado = 'apartado' AND pago_diferido AND apartado_hasta > NOW()
+     WHERE estado = 'apartado' AND pago_diferido AND (apartado_hasta > NOW() OR tiene_abono)
        AND ($1::text IS NOT NULL AND wa_jid = $1
             OR $2 <> '' AND RIGHT(regexp_replace(COALESCE(telefono, ''), '\\D', '', 'g'), 10) = RIGHT($2, 10))
        AND ($3::uuid IS NULL OR rifa_id = $3)
      ORDER BY created_at`, [jid, tel, rifaId]);
   const porRifa = new Map();
   for (const x of r.rows) {
-    const g = porRifa.get(x.rifa_id) || { ids: [], numeros: [], nombre: x.nombre_cliente, cedula: x.cedula, telefono: x.telefono, limite: x.apartado_hasta };
+    const g = porRifa.get(x.rifa_id) || { ids: [], numeros: [], nombre: x.nombre_cliente, cedula: x.cedula, telefono: x.telefono, limite: x.apartado_hasta, wa_jid: x.wa_jid };
     g.ids.push(x.id); g.numeros.push(x.numero);
     if (new Date(x.apartado_hasta) < new Date(g.limite)) g.limite = x.apartado_hasta;
     porRifa.set(x.rifa_id, g);
@@ -345,7 +348,13 @@ async function apartadosDe({ jid = null, telefono = null, rifaId = null } = {}) 
   for (const [id, g] of porRifa) {
     const rifa = await infoRifa(pool, id);
     if (!rifa) continue;
-    out.push({ rifa, ...g, limite: new Date(g.limite), total: calcularPrecioReal(g.numeros.length, rifa.ofertas, Number(rifa.precio)) });
+    const total = calcularPrecioReal(g.numeros.length, rifa.ofertas, Number(rifa.precio));
+    const ab = await pool.query(
+      `SELECT COALESCE(SUM(monto) FILTER (WHERE estado = 'aprobado'), 0) AS abonado,
+              COALESCE(SUM(monto) FILTER (WHERE estado = 'pendiente'), 0) AS por_confirmar
+         FROM reserva_abonos WHERE reserva_ids && $1::uuid[] AND NOT aplicado`, [g.ids]);
+    const abonado = Number(ab.rows[0].abonado);
+    out.push({ rifa, ...g, limite: new Date(g.limite), total, abonado, por_confirmar: Number(ab.rows[0].por_confirmar), saldo: Math.max(total - abonado, 0) });
   }
   return out;
 }
@@ -359,6 +368,10 @@ async function marcarApartadosPagados(ids, nota) {
            nota_admin = COALESCE($2, nota_admin), updated_at = NOW()
      WHERE id = ANY($1) AND estado = 'apartado'
      RETURNING *`, [ids, nota || null]);
+  // Sus abonos ya quedan dentro de la venta final: Caja deja de contarlos aparte
+  if (r.rows.length) {
+    await pool.query(`UPDATE reserva_abonos SET aplicado = TRUE, updated_at = NOW() WHERE reserva_ids && $1::uuid[] AND estado = 'aprobado'`, [r.rows.map((x) => x.id)]);
+  }
   return r.rows;
 }
 
@@ -369,7 +382,8 @@ async function liberarApartados(ids) {
   return r.rows;
 }
 async function liberarApartadosVencidos() {
-  const r = await pool.query(`DELETE FROM reservas_cliente WHERE estado = 'apartado' AND apartado_hasta <= NOW() RETURNING *`);
+  // Con un abono confirmado hay dinero de por medio: no se libera solo, lo decide el dueño
+  const r = await pool.query(`DELETE FROM reservas_cliente WHERE estado = 'apartado' AND apartado_hasta <= NOW() AND NOT tiene_abono RETURNING *`);
   return r.rows;
 }
 

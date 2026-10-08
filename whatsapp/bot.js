@@ -312,6 +312,7 @@ const HERRAMIENTAS = [
         nombre: { type: 'string', description: 'Nombre y apellido del cliente' },
         cedula: { type: 'string', description: 'Cédula de identidad del cliente' },
         metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle (opcional si aún no lo dijo)' },
+        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
       },
       required: ['rifa_id', 'numeros', 'nombre'],
     },
@@ -321,7 +322,10 @@ const HERRAMIENTAS = [
     descripcion: 'Cuando el cliente dice con qué va a pagar (o cambia de método) en una compra ya apartada: el SISTEMA le envía los datos de pago y el monto exacto en la moneda de ese método.',
     parametros: {
       type: 'object',
-      properties: { metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle' } },
+      properties: {
+        metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle' },
+        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
+      },
       required: ['metodo_pago'],
     },
   },
@@ -333,6 +337,7 @@ const HERRAMIENTAS = [
       properties: {
         monto: { type: 'number', description: 'Cuánto va a abonar ahora, en la moneda de los precios (pesos). Ej: 20000' },
         metodo_pago: { type: 'string', description: 'Método con el que paga, si ya lo dijo' },
+        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
       },
       required: ['monto'],
     },
@@ -385,6 +390,16 @@ function duracionTexto(min) {
 
 const NOTA_PAGO_ENVIADO = (min) =>
   `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${duracionTexto(min)} mientras paga.`;
+
+// Métodos como Zelle piden el nombre de quien envía el pago. Devuelve el nombre a guardar,
+// o { error } para que la IA se lo pregunte al cliente antes de enviar los datos de pago.
+function titularDelPago(metodo, args, ec) {
+  const nombre = String(args?.pagador || ec?.pagador || '').trim().slice(0, 120);
+  if (metodosPago.pideTitular(metodo) && nombre.length < 3) {
+    return { error: `Con ${metodo} necesitamos saber quién envía el pago.`, instruccion: `Pregúntale el nombre y apellido de la persona que va a enviar (o envió) el pago por ${metodo} — puede ser otra persona distinta del cliente — y vuelve a llamar esta herramienta pasándolo en "pagador".` };
+  }
+  return { pagador: nombre || null };
+}
 
 // Lo que la IA debe decir tras enviarse los datos de pago: cuánto dura el apartado
 const notaPago = (ec, minutos) => (ec?.diferido
@@ -492,6 +507,8 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (metodo && metodosPago.METODOS_PAGO[metodo].presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
+          const tit = metodo ? titularDelPago(metodo, args, chat.estado_compra) : { pagador: null };
+          if (tit.error) return tit;
 
           // Si ya tenía números apartados (cambió de idea), se liberan primero
           const ecPrevio = chat.estado_compra;
@@ -540,11 +557,12 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             nombre: nombreCli, cedula: cedula || null, total, metodo,
             reservas: idsApartados, apartado_hasta: apartadoHasta.getTime(), desde: Date.now(),
             ...(diferido ? { diferido: true } : {}),
+            ...(tit.pagador ? { pagador: tit.pagador } : {}),
           };
           // Con pago diferido la compra son TODOS sus apartados de la rifa (los de antes + estos)
           if (diferido && !prueba) {
             const todos = (await reservas.apartadosDe({ jid, telefono: chat.telefono, rifaId: rifa.id }))[0];
-            if (todos) { estado = { ...recordatorios.estadoDeApartado(todos), metodo }; total = estado.total; }
+            if (todos) { estado = { ...recordatorios.estadoDeApartado(todos), metodo, ...(tit.pagador ? { pagador: tit.pagador } : {}) }; total = estado.total; }
           }
           if (metodo) estado.monto = await prepararPago(metodo, estado, efectos);
           if (!prueba) await chats.actualizarChat(jid, { estado_compra: estado });
@@ -588,8 +606,10 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (metodosPago.METODOS_PAGO[metodo].presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
+          const tit = titularDelPago(metodo, args, ec);
+          if (tit.error) return tit;
           // Elegir método sin hablar de abonar = paga todo lo que falta
-          const base = { ...ec, abono_monto: null };
+          const base = { ...ec, abono_monto: null, pagador: tit.pagador };
           const monto = await prepararPago(metodo, base, efectos);
           const nuevo = { ...base, metodo, monto };
           if (!prueba) {
@@ -615,7 +635,9 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (metodo && metodosPago.METODOS_PAGO[metodo]?.presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere abonar en efectivo".' };
           }
-          const nuevo = { ...ec, abono_monto: monto, metodo: metodo || null };
+          const tit = metodo ? titularDelPago(metodo, args, ec) : { pagador: ec.pagador || null };
+          if (tit.error) return tit;
+          const nuevo = { ...ec, abono_monto: monto, metodo: metodo || null, pagador: tit.pagador };
           if (metodo) nuevo.monto = await prepararPago(metodo, nuevo, efectos);
           if (!prueba) await chats.actualizarChat(jid, { estado_compra: nuevo });
           chat.estado_compra = nuevo;
@@ -730,6 +752,7 @@ CÓMO VENDER
 - Los premios_especiales son premios aparte que se ganan cumpliendo su requisito antes de su fecha tope: cuéntalos cuando venga al caso y di siempre el requisito y la fecha tal como vienen, sin inventar condiciones.
 - Las notas de voz te llegan transcritas ("[nota de voz, transcrita automáticamente] …"): respóndelas como cualquier mensaje, sin mencionar la transcripción. Puede traer errores: si un dato clave (número, cédula, nombre) no quedó claro, confírmalo con el cliente antes de usarlo.
 - ABONOS: quien tiene números apartados para pagar después puede pagar una parte ahora y el resto luego. Si dice "abono 20 mil", "pago una parte", etc., usa abonar_apartado con ese monto. Cuando el equipo confirma el abono el sistema le avisa cuánto le falta. No inventes saldos: usa los del contexto.
+- Algunos métodos (como Zelle) piden saber QUIÉN ENVÍA el pago, porque a veces paga otra persona. Si la herramienta te responde que falta ese dato, pregúntale el nombre y apellido de quien envía el pago y vuelve a llamarla con "pagador". No lo inventes ni asumas que es el mismo cliente sin preguntarle.
 - Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
@@ -942,7 +965,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
       if (monto > 0) {
         try {
           await abonos.crear(pool, {
-            g, jid, monto, metodo: ec.metodo || null, comprobanteUrl: url, origen: 'whatsapp',
+            g, jid, monto, metodo: ec.metodo || null, comprobanteUrl: url, origen: 'whatsapp', pagador: ec.pagador || null,
             datos: { ...(datos || {}), metodo: ec.metodo || null, monto_declarado: monto, monto_esperado: ec.monto?.texto || fmtMonto(monto, cfg), total: g.total, abonado_antes: g.abonado },
           });
         } catch (e) {
@@ -969,7 +992,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
   }
 
   // Lo que el sistema le pidió pagar queda junto al comprobante para revisarlo en Reservas
-  datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg) };
+  datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg), ...(ec.pagador ? { enviado_por: ec.pagador } : {}) };
   if (Number(datos.monto) && ec.monto?.valor && ec.monto.moneda === (/usd|\$/i.test(datos.moneda || '') ? 'USD' : /bs|ves|bol/i.test(datos.moneda || '') ? 'VES' : 'COP')) {
     datos.diferencia = +(Number(datos.monto) - Number(ec.monto.valor)).toFixed(2);
   }
@@ -981,7 +1004,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
     await client.query('BEGIN');
     // 1) Los números apartados pasan a "pendiente" con la foto del comprobante
     const confirmadas = ec.reservas?.length
-      ? await reservas.confirmarApartadoTx(client, ec.reservas, { comprobanteUrl: url, comprobante_datos: datos, metodo_pago: metodoPago })
+      ? await reservas.confirmarApartadoTx(client, ec.reservas, { comprobanteUrl: url, comprobante_datos: datos, metodo_pago: metodoPago, pagador: ec.pagador || null })
       : [];
     r = { ok: true, reservas: confirmadas, conflictos: [] };
     // 2) Si el apartado venció (o no existía), se intenta reservar lo que falte
@@ -992,7 +1015,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
         rifa_id: ec.rifa_id, numeros: faltan, nombre_cliente: ec.nombre, cedula: ec.cedula,
         telefono: chat.telefono, metodo_pago: metodoPago,
         comprobanteUrl: url, comprobante_nombre: 'comprobante-whatsapp', comprobante_datos: datos,
-        wa_jid: jid, origen: 'whatsapp',
+        wa_jid: jid, origen: 'whatsapp', pagador: ec.pagador || null,
       });
       r.reservas.push(...(r2.reservas || []));
       r.conflictos = r2.conflictos || [];

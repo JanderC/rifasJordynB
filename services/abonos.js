@@ -24,13 +24,13 @@ const soloDigitos = (t) => String(t || '').replace(/\D/g, '');
 
 // Registra un abono. estado 'pendiente' = espera confirmación del dueño.
 // g: grupo de apartados del cliente en la rifa (de reservas.apartadosDe)
-async function crear(db, { g, monto, metodo = null, comprobanteUrl = null, datos = null, origen = 'web', jid = null }) {
+async function crear(db, { g, monto, metodo = null, comprobanteUrl = null, datos = null, origen = 'web', jid = null, pagador = null }) {
   await opciones.esquemaListo;
   const r = await db.query(
-    `INSERT INTO reserva_abonos (rifa_id, reserva_ids, nombre_cliente, cedula, telefono, wa_jid, monto, metodo_pago, comprobante_url, comprobante_datos, origen)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+    `INSERT INTO reserva_abonos (rifa_id, reserva_ids, nombre_cliente, cedula, telefono, wa_jid, monto, metodo_pago, comprobante_url, comprobante_datos, origen, pagador)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
     [g.rifa.id, g.ids, g.nombre, g.cedula || null, g.telefono || null, jid || g.wa_jid || null, redondear(monto), metodo, comprobanteUrl,
-     datos ? JSON.stringify(datos) : null, origen]);
+     datos ? JSON.stringify(datos) : null, origen, String(pagador || '').trim().slice(0, 120) || null]);
   return r.rows[0];
 }
 

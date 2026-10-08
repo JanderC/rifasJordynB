@@ -31,6 +31,7 @@ const bot          = require('./bot');
 const envios       = require('./envios');
 const grupo        = require('./grupo');
 const ia           = require('./ia');
+const sesionDB     = require('./sesionDB');
 const { obtenerConfig } = require('./botConfig');
 
 // La sesión vive fuera del código; WA_SESSION_PATH permite ponerla en un
@@ -54,6 +55,9 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 const azar = (a, b) => Math.floor(a + Math.random() * Math.max(1, b - a));
 
 // ── Limpieza de sesión ─────────────────────────────────────
+// También se vacía el respaldo en la base de datos: si no, al reiniciar se
+// restauraría una sesión que ya no sirve.
+let borradoPendiente = Promise.resolve();
 function clearSession() {
   try {
     if (fs.existsSync(SESSION_PATH)) {
@@ -63,7 +67,26 @@ function clearSession() {
   } catch (err) {
     console.error('❌ [WhatsApp] Error borrando sesión:', err.message);
   }
+  borradoPendiente = sesionDB.borrar().catch((e) => console.error('❌ [WhatsApp] Error borrando el respaldo de la sesión:', e.message));
 }
+
+// ── Respaldo de la sesión en la base de datos ──────────────
+// La carpeta de la sesión se pierde en cada despliegue; con el respaldo el bot
+// vuelve a conectarse solo, sin escanear el QR. Solo se respalda una sesión viva.
+function respaldarSesion() {
+  if (connectionStatus !== 'open') return Promise.resolve(0);
+  return sesionDB.respaldar(SESSION_PATH).catch((e) => { console.error('❌ [WhatsApp] Error respaldando la sesión:', e.message); return 0; });
+}
+let respaldoTimer = null;
+function programarRespaldo(ms = 4000) {
+  clearTimeout(respaldoTimer);
+  respaldoTimer = setTimeout(respaldarSesion, ms);
+}
+setInterval(respaldarSesion, 45 * 1000).unref();
+// Railway avisa con SIGTERM antes de reemplazar el contenedor: último respaldo y salir
+process.once('SIGTERM', () => {
+  Promise.race([respaldarSesion(), sleep(8000)]).finally(() => process.exit(0));
+});
 
 // ─────────────────────────────────────────────────────────────
 // ANTI-BLOQUEO: cola única de envío
@@ -180,6 +203,10 @@ async function startWhatsApp() {
     const anterior = soltarSocket();
     if (anterior) { try { anterior.end(undefined); } catch (_) {} }
 
+    // Contenedor nuevo (despliegue): si no hay sesión en disco se baja la respaldada
+    await borradoPendiente;
+    await sesionDB.restaurar(SESSION_PATH).catch((e) => console.error('❌ [WhatsApp] No se pudo restaurar la sesión:', e.message));
+
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
     // Si WhatsApp no responde la versión, Baileys usa la que trae incluida
     let version;
@@ -199,7 +226,7 @@ async function startWhatsApp() {
     });
     const esteSock = sock;
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => { await saveCreds(); programarRespaldo(); });
     sock.ev.on('connection.update', (update) => {
       if (esteSock !== sock) return;   // eventos de un socket viejo
       onConnectionUpdate(update);
@@ -227,6 +254,7 @@ function onConnectionUpdate({ connection, lastDisconnect, qr }) {
     conectadoDesde    = new Date();
     waEvents.emit('ready');
     console.log(`✅ [WhatsApp] Conectado como ${sock?.user?.id || '?'}.`);
+    programarRespaldo(3000);   // recién vinculado o reconectado: que quede respaldado ya
   }
 
   if (connection !== 'close') return;

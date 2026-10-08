@@ -15,7 +15,7 @@ const {
   crearReservasTx, aprobarReservasTx, rechazarReservasTx,
   avisarAprobadas, avisarRechazadas,
 } = require('../services/reservas');
-const { metodosActivos, obtenerTasas } = require('../services/metodosPago');
+const { metodosActivos, obtenerTasas, pideTitular } = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const reservasSvc = require('../services/reservas');
 const abonos = require('../services/abonos');
@@ -480,6 +480,9 @@ router.post('/apartados/pagar', async (req, res) => {
   if (montoPedido !== null && !(montoPedido > 0)) return res.status(400).json({ error: 'Escribe cuánto vas a abonar' });
   if (!comprobante_base64)
     return res.status(400).json({ error: 'Adjunta el comprobante de pago' });
+  const pagador = String(req.body.pagador || '').trim();
+  if (pideTitular(metodo_pago) && pagador.length < 3)
+    return res.status(400).json({ error: `Escribe el nombre de la persona que envió el pago por ${metodo_pago}` });
 
   let url = null, confirmado = false;
   const client = await pool.connect();
@@ -497,7 +500,7 @@ router.post('/apartados/pagar', async (req, res) => {
     // Abono: paga una parte, o ya tenía abonos (el último también es un abono: al confirmarlo se completa)
     if (monto < grupo.total || grupo.abonado > 0 || grupo.por_confirmar > 0) {
       const a = await abonos.crear(pool, {
-        g: grupo, monto, metodo: metodo_pago || null, comprobanteUrl: url, origen: 'web',
+        g: grupo, monto, metodo: metodo_pago || null, comprobanteUrl: url, origen: 'web', pagador,
         datos: { metodo: metodo_pago || null, monto_declarado: monto, total: grupo.total, abonado_antes: grupo.abonado },
       });
       confirmado = true;
@@ -512,7 +515,7 @@ router.post('/apartados/pagar', async (req, res) => {
 
     await client.query('BEGIN');
     const filas = await reservasSvc.confirmarApartadoTx(client, grupo.ids, {
-      comprobanteUrl: url, metodo_pago: metodo_pago || null, comprobante_nombre: 'comprobante-web',
+      comprobanteUrl: url, metodo_pago: metodo_pago || null, comprobante_nombre: 'comprobante-web', pagador,
       comprobante_datos: { metodo: metodo_pago || null, monto_esperado: `${Math.round(grupo.total).toLocaleString('es-CO')} pesos` },
     });
     if (!filas.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Esos números ya no están apartados.' }); }
@@ -583,6 +586,11 @@ router.post('/reservar', async (req, res) => {
   if (!comprobante_base64)
     return res.status(400).json({ error: 'El comprobante de pago es obligatorio para reservar' });
 
+  // Métodos como Zelle: hay que decir quién envió el pago para poder ubicarlo
+  const pagador = String(req.body.pagador || '').trim();
+  if (pideTitular(metodo_pago) && pagador.length < 3)
+    return res.status(400).json({ error: `Escribe el nombre de la persona que envió el pago por ${metodo_pago}` });
+
   // El comprobante se sube UNA vez a Cloudinary y todas las filas guardan la URL
   // (antes se guardaba el base64 completo repetido en cada número reservado).
   let comprobanteUrl;
@@ -601,7 +609,7 @@ router.post('/reservar', async (req, res) => {
     await client.query('BEGIN');
     const r = await crearReservasTx(client, {
       rifa_id, numeros, nombre_cliente, cedula, correo, telefono, metodo_pago,
-      comprobanteUrl, comprobante_nombre, origen: 'web',
+      comprobanteUrl, comprobante_nombre, origen: 'web', pagador,
     });
     if (!r.ok) {
       await client.query('ROLLBACK');

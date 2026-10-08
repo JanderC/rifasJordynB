@@ -179,6 +179,7 @@ async function crearReservasTx(client, datos) {
     estado = 'pendiente',        // 'apartado' = bloqueado hasta que llegue el comprobante
     apartadoHasta = null,
     pagoDiferido = false,        // apartado para pagar después (rifas con pago diferido)
+    pagador = null,              // quién envió el pago (métodos que lo piden, p. ej. Zelle)
   } = datos;
   const numeros = [...datos.numeros];
 
@@ -212,8 +213,8 @@ async function crearReservasTx(client, datos) {
       INSERT INTO reservas_cliente
         (rifa_id, numero, nombre_cliente, cedula, correo, telefono, metodo_pago,
          comprobante_base64, comprobante_nombre, origen, comprobante_datos, wa_jid,
-         estado, apartado_hasta, pago_diferido)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         estado, apartado_hasta, pago_diferido, pagador)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
       RETURNING id, numero, nombre_cliente, cedula, correo, estado, created_at`,
     [
       rifa_id, numero, String(nombre_cliente).trim(), String(cedula || '').trim() || null,
@@ -222,6 +223,7 @@ async function crearReservasTx(client, datos) {
       comprobante_datos ? JSON.stringify(comprobante_datos) : null, wa_jid || null,
       estado, estado === 'apartado' ? apartadoHasta : null,
       estado === 'apartado' && !!pagoDiferido,
+      String(pagador || '').trim().slice(0, 120) || null,
     ]);
     reservas.push(r.rows[0]);
   }
@@ -306,15 +308,16 @@ async function aprobarReservasTx(client, ids, nota) {
 }
 
 // El comprobante llegó: los números apartados pasan a "pendiente" (aparecen en Reservas)
-async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_datos, metodo_pago, comprobante_nombre = 'comprobante-whatsapp' }) {
+async function confirmarApartadoTx(client, ids, { comprobanteUrl, comprobante_datos, metodo_pago, comprobante_nombre = 'comprobante-whatsapp', pagador = null }) {
   const r = await client.query(`
     UPDATE reservas_cliente
        SET estado = 'pendiente', apartado_hasta = NULL, comprobante_base64 = $2,
            comprobante_nombre = $5, comprobante_datos = $3,
-           metodo_pago = COALESCE($4, metodo_pago), updated_at = NOW()
+           metodo_pago = COALESCE($4, metodo_pago), pagador = COALESCE($6, pagador), updated_at = NOW()
      WHERE id = ANY($1) AND estado = 'apartado'
      RETURNING id, numero, nombre_cliente, estado`,
-  [ids, comprobanteUrl, comprobante_datos ? JSON.stringify(comprobante_datos) : null, metodo_pago || null, comprobante_nombre]);
+  [ids, comprobanteUrl, comprobante_datos ? JSON.stringify(comprobante_datos) : null, metodo_pago || null, comprobante_nombre,
+   String(pagador || '').trim().slice(0, 120) || null]);
   return r.rows;
 }
 

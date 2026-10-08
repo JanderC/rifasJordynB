@@ -62,6 +62,7 @@ function leerCuerpo(body) {
       pais: limpio(body.pais, 60) || null,
       nota: limpio(body.nota, 160) || null,
       presencial: body.presencial === true,
+      pedir_titular: body.pedir_titular === true,
       activo: body.activo !== false,
     },
   };
@@ -92,10 +93,10 @@ router.post('/', async (req, res) => {
   try {
     await tablaLista;
     const r = await pool.query(
-      `INSERT INTO metodos_pago (nombre, icono, color, moneda, pais, campos, nota, presencial, activo, orden)
+      `INSERT INTO metodos_pago (nombre, icono, color, moneda, pais, campos, nota, presencial, activo, pedir_titular, orden)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, (SELECT COALESCE(MAX(orden), -1) + 1 FROM metodos_pago))
        RETURNING *`,
-      [d.nombre, d.icono, d.color, d.moneda, d.pais, JSON.stringify(d.campos), d.nota, d.presencial, d.activo]);
+      [d.nombre, d.icono, d.color, d.moneda, d.pais, JSON.stringify(d.campos), d.nota, d.presencial, d.activo, d.pedir_titular]);
     await recargar();
     res.status(201).json(r.rows[0]);
   } catch (err) {
@@ -133,9 +134,9 @@ router.put('/:id', async (req, res) => {
     const r = await pool.query(
       `UPDATE metodos_pago
           SET nombre = $1, icono = $2, color = $3, moneda = $4, pais = $5, campos = $6,
-              nota = $7, presencial = $8, activo = $9, updated_at = NOW()
+              nota = $7, presencial = $8, activo = $9, pedir_titular = $11, updated_at = NOW()
         WHERE id = $10 RETURNING *`,
-      [d.nombre, d.icono, d.color, d.moneda, d.pais, JSON.stringify(d.campos), d.nota, d.presencial, d.activo, req.params.id]);
+      [d.nombre, d.icono, d.color, d.moneda, d.pais, JSON.stringify(d.campos), d.nota, d.presencial, d.activo, req.params.id, d.pedir_titular]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Cuenta no encontrada' });
     await recargar();
     res.json(r.rows[0]);

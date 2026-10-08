@@ -9,11 +9,16 @@
 //     se libera. El bot le va recordando por WhatsApp.
 // ============================================================
 const pool = require('../config/db');
+const { eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 
 const esquemaListo = (async () => {
   const sqls = [
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS publicada BOOLEAN NOT NULL DEFAULT TRUE`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premios_extra JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    // Más fotos de la rifa (además de la principal, imagen_url): se ven como carrusel en la página
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    // Quién envió el pago (métodos que lo piden, p. ej. Zelle)
+    `ALTER TABLE reservas_cliente ADD COLUMN IF NOT EXISTS pagador TEXT`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premio_segundo TEXT`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premio_tercero TEXT`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS pago_diferido BOOLEAN NOT NULL DEFAULT FALSE`,
@@ -35,6 +40,7 @@ const esquemaListo = (async () => {
        wa_jid            TEXT,
        monto             NUMERIC(14,2) NOT NULL,             -- en la moneda de las rifas (pesos)
        metodo_pago       TEXT,
+       pagador           TEXT,                               -- quién envió el pago (si el método lo pide)
        comprobante_url   TEXT,
        comprobante_datos JSONB,
        origen            VARCHAR(20) NOT NULL DEFAULT 'web', -- web | whatsapp | panel
@@ -44,6 +50,7 @@ const esquemaListo = (async () => {
        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
+    `ALTER TABLE reserva_abonos ADD COLUMN IF NOT EXISTS pagador TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_abonos_rifa ON reserva_abonos (rifa_id, estado)`,
     `CREATE INDEX IF NOT EXISTS idx_abonos_reservas ON reserva_abonos USING GIN (reserva_ids)`,
   ];
@@ -55,7 +62,7 @@ const esquemaListo = (async () => {
 // Columnas para los SELECT de rifas (alias de la tabla)
 const COLUMNAS = (a = 'r') => `
   ${a}.publicada, COALESCE(${a}.premios_extra, '[]'::jsonb) AS premios_extra,
-  ${a}.premio_segundo, ${a}.premio_tercero,
+  ${a}.premio_segundo, ${a}.premio_tercero, COALESCE(${a}.imagenes, '[]'::jsonb) AS imagenes,
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros`;
 
 function limpiarPremios(lista) {
@@ -78,6 +85,14 @@ async function guardar(db, rifaId, body = {}) {
   const poner = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
   if (typeof body.publicada === 'boolean') poner('publicada', body.publicada);
   if (body.premios_extra !== undefined) poner('premios_extra', JSON.stringify(limpiarPremios(body.premios_extra)));
+  if (body.imagenes !== undefined) {
+    // Solo URLs ya subidas a Cloudinary (el panel las sube una por una); máximo 10
+    const nuevas = (Array.isArray(body.imagenes) ? body.imagenes : []).filter((u) => /^https:\/\/res\.cloudinary\.com\//.test(String(u || ''))).slice(0, 10);
+    const antes = (await db.query(`SELECT COALESCE(imagenes, '[]'::jsonb) AS imagenes FROM rifas WHERE id = $1`, [rifaId])).rows[0]?.imagenes || [];
+    poner('imagenes', JSON.stringify(nuevas));
+    // Las que se quitaron se borran de Cloudinary (sin esperar: no debe frenar el guardado)
+    antes.filter((u) => !nuevas.includes(u)).forEach((u) => { const id = extraerPublicId(u); if (id) eliminarImagen(id); });
+  }
   if (body.premio_segundo !== undefined) poner('premio_segundo', String(body.premio_segundo ?? '').trim().slice(0, 160) || null);
   if (body.premio_tercero !== undefined) poner('premio_tercero', String(body.premio_tercero ?? '').trim().slice(0, 160) || null);
   if (typeof body.pago_diferido === 'boolean') poner('pago_diferido', body.pago_diferido);
@@ -87,7 +102,7 @@ async function guardar(db, rifaId, body = {}) {
   vals.push(rifaId);
   const r = await db.query(
     `UPDATE rifas SET ${sets.join(', ')} WHERE id = $${vals.length}
-     RETURNING publicada, premios_extra, premio_segundo, premio_tercero, pago_diferido, diferido_limite_horas, diferido_max_numeros`, vals);
+     RETURNING publicada, premios_extra, imagenes, premio_segundo, premio_tercero, pago_diferido, diferido_limite_horas, diferido_max_numeros`, vals);
   return r.rows[0] || null;
 }
 

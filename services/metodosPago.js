@@ -80,6 +80,12 @@ const tablaLista = (async () => {
        )`);
     // Logo de la cuenta (opcional): si no hay, se muestra el ícono
     await pool.query(`ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS imagen_url TEXT`);
+    // Pedir el nombre de quien envía el pago (el titular de la cuenta que paga). Nace activo en Zelle.
+    const tenia = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'metodos_pago' AND column_name = 'pedir_titular'`);
+    if (!tenia.rows.length) {
+      await pool.query(`ALTER TABLE metodos_pago ADD COLUMN pedir_titular BOOLEAN NOT NULL DEFAULT FALSE`);
+      await pool.query(`UPDATE metodos_pago SET pedir_titular = TRUE WHERE nombre ILIKE '%zelle%'`);
+    }
     const hay = await pool.query(`SELECT 1 FROM metodos_pago LIMIT 1`);
     if (!hay.rows.length) {
       let orden = 0;
@@ -108,6 +114,7 @@ async function recargar() {
         ...(m.color ? { color: m.color } : {}),
         ...(m.imagen_url ? { imagen: m.imagen_url } : {}),
         ...(m.presencial ? { presencial: true } : {}),
+        ...(m.pedir_titular ? { pedir_titular: true } : {}),
       };
     }
     cargadoAt = Date.now();
@@ -170,6 +177,9 @@ function normalizarMetodo(txt) {
   return null;
 }
 
+// ¿Ese método pide el nombre de quien envía el pago?
+const pideTitular = (metodo) => !!METODOS_PAGO[metodo]?.pedir_titular;
+
 // Mensaje exacto con los datos y el monto (lo envía el sistema, no la IA)
 function mensajeDePago(metodo, monto, { numeros, rifa }) {
   const m = METODOS_PAGO[metodo];
@@ -179,4 +189,4 @@ function mensajeDePago(metodo, monto, { numeros, rifa }) {
     '📸 Cuando pagues, envíame la captura del comprobante por aquí.';
 }
 
-module.exports = { METODOS_PAGO, MONEDAS, tablaLista, recargar, metodosActivos, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago };
+module.exports = { METODOS_PAGO, MONEDAS, tablaLista, recargar, metodosActivos, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago, pideTitular };

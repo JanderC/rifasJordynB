@@ -60,6 +60,19 @@ router.post(
   }
 );
 
+/* ── POST /api/upload/rifa-foto ────────────────────────────
+   Sube UNA foto adicional de una rifa y devuelve su URL. El panel las sube
+   una por una y al guardar la rifa manda la lista de URLs (campo "imagenes").
+   Form-data: campo "imagen". Devuelve: { ok, url }
+────────────────────────────────────────────────────────────*/
+router.post('/rifa-foto', authMiddleware, soloDueno, (req, res) => {
+  uploadRifa.single('imagen')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'La foto pesa más de 5MB' : err.message });
+    if (!req.file) return res.status(400).json({ error: 'No se recibió ninguna imagen' });
+    res.json({ ok: true, url: req.file.path });
+  });
+});
+
 /* ── POST /api/upload/rifa/:id/imagen ──────────────────────
    Sube o reemplaza la imagen de una rifa.
    Form-data: campo "imagen" con el archivo.

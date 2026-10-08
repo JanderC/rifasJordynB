@@ -119,6 +119,11 @@ function textoRecordatorio(etapa, g, cfg) {
         ? `${cuenta}. El plazo vence a las ${hora} 🙏\n\n${comoPagar}`
         : `Total: *${total}*. Después de las ${hora} ${varios ? 'se liberan y los puede tomar' : 'se libera y lo puede tomar'} otra persona 🙏\n\n${comoPagar}`);
   }
+  // Recordatorio pedido a mano desde Reservas: sin "mañana/hoy es el sorteo"
+  if (etapa === 'manual') {
+    return `Hola${nombre ? ` ${nombre}` : ''} 👋 Te recuerdo que tienes ${varios ? 'apartados' : 'apartado'} ${nums} en *${g.rifa.nombre}* 🎟️\n\n` +
+      `${cuenta || `Total a pagar: *${total}*`}. Tienes hasta el ${limite}.\n\n${comoPagar}`;
+  }
   const cuando = etapa === 'vispera' ? 'mañana es el sorteo' : '¡hoy es el sorteo!';
   return `Hola${nombre ? ` ${nombre}` : ''} 👋 Te recuerdo que tienes ${varios ? 'apartados' : 'apartado'} ${nums} en *${g.rifa.nombre}* y ${cuando} 🎉\n\n` +
     `${cuenta || `Total a pagar: *${total}*`}. Tienes hasta el ${limite}.\n\n${comoPagar}`;
@@ -200,6 +205,37 @@ async function revisar() {
   if (fallos.size > 2000) fallos.clear();
 }
 
+// ── Recordatorio manual (botón "Recordar" en Reservas) ───────
+// ids: apartados de UN cliente en una rifa. Sale ya, a cualquier hora, porque lo pide el dueño.
+// Lanza un error claro si no se puede (WhatsApp desconectado, sin teléfono, tope de chats nuevos…).
+async function recordarAhora(ids) {
+  await opciones.esquemaListo;
+  if (!t?.conectado()) throw new Error('WhatsApp no está conectado.');
+  const filas = await pool.query(
+    `SELECT id, rifa_id, telefono, wa_jid FROM reservas_cliente WHERE id = ANY($1) AND estado = 'apartado'`, [ids]);
+  const f = filas.rows[0];
+  if (!f) throw new Error('Esos números ya no están apartados.');
+  const jid = filas.rows.find((x) => x.wa_jid)?.wa_jid || jidDe(f.telefono);
+  if (!jid) throw new Error('Este cliente no tiene un WhatsApp válido registrado.');
+  // Todos sus apartados de esa rifa, con lo abonado y lo que falta
+  const g = (await reservas.apartadosDe({ jid: f.wa_jid || null, telefono: f.telefono, rifaId: f.rifa_id }))
+    .find((x) => x.ids.includes(f.id));
+  if (!g) throw new Error('No se encontraron los números apartados de este cliente.');
+  if (g.saldo - g.por_confirmar <= 0) throw new Error('Este cliente ya envió el pago de todo lo que debía; está por confirmarse en Abonos.');
+  const cfg = await obtenerConfig();
+  await t.enviar(jid, textoRecordatorio('manual', g, cfg));
+  await pool.query(
+    `UPDATE reservas_cliente SET recordatorios = recordatorios || $2::jsonb, wa_jid = COALESCE(wa_jid, $3) WHERE id = ANY($1)`,
+    [g.ids, JSON.stringify([`manual:${Date.now()}`]), jid]);
+  const chat = await chats.obtenerChat(jid);
+  if (chat && (!chat.estado_compra?.paso || chat.estado_compra.diferido)) {
+    await chats.actualizarChat(jid, { estado_compra: estadoDeApartado(g) });
+  }
+  await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
+    texto: `🔔 Recordatorio de pago enviado a mano · ${g.rifa.nombre} · números ${g.numeros.join(', ')}` });
+  return { ok: true, numeros: g.numeros, saldo: g.saldo };
+}
+
 let revisando = false;
 setInterval(() => {
   if (revisando) return;
@@ -207,4 +243,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Recordatorios]', e.message)).finally(() => { revisando = false; });
 }, 10 * 60000).unref();
 
-module.exports = { init, revisar, vincularApartados, estadoDeApartado, etapaQueToca, textoRecordatorio };
+module.exports = { init, revisar, recordarAhora, vincularApartados, estadoDeApartado, etapaQueToca, textoRecordatorio };

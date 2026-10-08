@@ -848,6 +848,18 @@ router.put('/admin/reservas-a-abono', authMiddleware, soloDueno, async (req, res
   } catch (e) { console.error('[abonos]', e); res.status(500).json({ error: e.message }); }
 });
 
+/* ── POST /api/publico/admin/apartados/recordar ───────────
+   El bot le manda YA un recordatorio de pago al cliente (además de los
+   automáticos). Body: { ids: [apartados del cliente en la rifa] }
+────────────────────────────────────────────────────────── */
+router.post('/admin/apartados/recordar', authMiddleware, soloDueno, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids[] es requerido' });
+  try {
+    res.json(await require('../whatsapp/recordatorios').recordarAhora(ids));
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 /* ── DELETE /api/publico/admin/apartados ──────────────────
    Libera números apartados sin pagar. Body: { ids: [] }
 ────────────────────────────────────────────────────────── */

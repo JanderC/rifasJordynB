@@ -7,6 +7,8 @@
 //    - el día del sorteo (9:00 a. m.)
 //    - el aviso final, unas horas antes de que venza el plazo
 //  o, si el dueño lo configura así, cada X horas (más el aviso final).
+//  También puede elegir días de la semana y una hora (p. ej. lunes y sábados
+//  a las 10:00): entonces salen solo en esos momentos.
 //  Una rifa puede tener sus propios días y horas (se ponen al editarla):
 //  entonces sus recordatorios salen solo en esos momentos.
 //  El texto puede ser uno propio (con variables) y llevar la foto de la rifa.
@@ -123,6 +125,20 @@ function tocaProgramado({ programados, limite, creado, enviados }) {
   return { etapa: 'programado', marcar: [...pasados.map((p) => `prog:${p}`), `auto:${ahora}`] };
 }
 
+// Días de la semana y hora elegidos por el dueño (hora de Venezuela, UTC-4 fijo).
+// Sale una vez por día elegido, desde esa hora; si se pasó más de 6 horas, ya no.
+function tocaDias({ dias, hora, limite, creado, enviados }) {
+  const ahora = Date.now();
+  if (limite.getTime() <= ahora) return null;
+  const ve = new Date(ahora - 4 * 3600000);
+  if (!dias.includes(ve.getUTCDay())) return null;
+  const fecha = ve.toISOString().slice(0, 10);
+  const slot = new Date(`${fecha}T${hora}:00-04:00`).getTime();
+  if (!Number.isFinite(slot) || ahora < slot || ahora - slot >= 6 * 3600000) return null;
+  if (slot <= creado.getTime() || enviados.includes(`dia:${fecha}`)) return null;
+  return { etapa: 'dias', marcar: [`dia:${fecha}`, `auto:${ahora}`] };
+}
+
 function duracion(ms) {
   const min = Math.max(1, Math.round(ms / 60000));
   if (min < 60) return `${min} minutos`;
@@ -151,7 +167,7 @@ function textoRecordatorio(etapa, g, cfg) {
         : `Total: *${total}*. Después de las ${hora} ${varios ? 'se liberan y los puede tomar' : 'se libera y lo puede tomar'} otra persona 🙏\n\n${comoPagar}`);
   }
   // Recordatorio pedido a mano desde Reservas o el de "cada X horas": sin "mañana/hoy es el sorteo"
-  if (etapa === 'manual' || etapa === 'cada' || etapa === 'programado') {
+  if (['manual', 'cada', 'programado', 'dias'].includes(etapa)) {
     return `Hola${nombre ? ` ${nombre}` : ''} 👋 Te recuerdo que tienes ${varios ? 'apartados' : 'apartado'} ${nums} en *${g.rifa.nombre}* 🎟️\n\n` +
       `${cuenta || `Total a pagar: *${total}*`}. Tienes hasta el ${limite}.\n\n${comoPagar}`;
   }
@@ -216,6 +232,9 @@ async function revisar() {
   const esDeDia = deDia();   // los automáticos solo de día; los de fecha y hora propias, a la hora que puso el dueño
   const finalHoras = Math.min(12, Math.max(1, Number(rc.final_horas) || 2));
   const cadaHoras = rc.frecuencia === 'cada' ? Math.min(72, Math.max(1, Number(rc.cada_horas) || 12)) : 0;
+  const porDias = rc.frecuencia === 'dias';
+  const dias = (Array.isArray(rc.dias) ? rc.dias : []).map(Number).filter((n) => n >= 0 && n <= 6);
+  const hora = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(rc.hora || '')) ? rc.hora : '10:00';
 
   const r = await pool.query(`
     SELECT rifa_id,
@@ -241,6 +260,7 @@ async function revisar() {
     const datos = { rifa, limite, creado: new Date(x.creado), enviados: x.enviados || [], finalHoras, cadaHoras };
     const programados = (rifa.recordatorios_programados || []).map((p) => new Date(p).getTime()).filter(Number.isFinite);
     const toca = programados.length ? tocaProgramado({ ...datos, programados })
+      : porDias ? tocaDias({ ...datos, dias, hora })     // a la hora que eligió el dueño
       : !esDeDia ? null
       : cadaHoras ? tocaCada(datos) : etapaQueToca(datos);
     if (!toca) continue;
@@ -276,7 +296,7 @@ async function revisar() {
         await chats.actualizarChat(jid, { estado_compra: estadoDeApartado(g) });
       }
       await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-        texto: `🔔 Recordatorio de pago (${{ final: 'aviso final', dia: 'día del sorteo', vispera: 'víspera', programado: 'programado para esta rifa' }[toca.etapa] || `cada ${cadaHoras} h`}) · ${rifa.nombre} · números ${x.numeros.join(', ')}` });
+        texto: `🔔 Recordatorio de pago (${{ final: 'aviso final', dia: 'día del sorteo', vispera: 'víspera', programado: 'programado para esta rifa', dias: 'día programado' }[toca.etapa] || `cada ${cadaHoras} h`}) · ${rifa.nombre} · números ${x.numeros.join(', ')}` });
       enviadosAhora++;
       await sleep(20000 + Math.random() * 20000);   // de a poco (anti-bloqueo)
     } catch (e) {
@@ -327,4 +347,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Recordatorios]', e.message)).finally(() => { revisando = false; });
 }, 5 * 60000).unref();
 
-module.exports = { init, revisar, recordarAhora, vincularApartados, estadoDeApartado, etapaQueToca, tocaCada, tocaProgramado, textoRecordatorio, mensajeRecordatorio };
+module.exports = { init, revisar, recordarAhora, vincularApartados, estadoDeApartado, etapaQueToca, tocaCada, tocaProgramado, tocaDias, textoRecordatorio, mensajeRecordatorio };

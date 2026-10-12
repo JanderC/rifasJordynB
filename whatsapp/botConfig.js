@@ -46,7 +46,10 @@ const DEFECTO = {
     activo: true,
     final_horas: 2,             // el aviso final sale estas horas antes del límite de pago
     frecuencia: 'momentos',     // 'momentos' = víspera, día del sorteo y aviso final · 'cada' = cada X horas (y el aviso final)
+                                // 'dias' = solo los días de la semana y a la hora que elija el dueño
     cada_horas: 12,
+    dias: [1, 6],               // días de la semana para 'dias' (0 = domingo … 6 = sábado)
+    hora: '10:00',              // hora de Venezuela
     mensaje: '',                // texto propio con variables ({nombre}, {numeros}, {falta}…); vacío = el automático
     con_imagen: false,          // se envía con la foto principal de la rifa
   },

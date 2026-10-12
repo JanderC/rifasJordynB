@@ -168,10 +168,13 @@ async function procesar(jid, items) {
 
   // Anti-bucle (p. ej. otro bot contestándonos)
   const recientes = (respuestasRecientes.get(jid) || []).filter((t) => Date.now() - t < 5 * 60000);
-  if (recientes.length >= (cfg.antiban.max_respuestas_5min || 8)) {
+  // Se cuentan turnos (respuestas a un mensaje o ráfaga), no cada mensaje enviado: una persona
+  // que escribe rápido no llega a 12 turnos en 5 minutos; otro bot sí.
+  if (recientes.length >= Math.max(12, Number(cfg.antiban.max_respuestas_5min) || 0)) {
     await marcarAtencion(jid, 'está mandando demasiados mensajes seguidos (parece otro bot o algo raro)', { pausarBot: true });
     return;
   }
+  respuestasRecientes.set(jid, [...recientes, Date.now()].slice(-40));
 
   // Si tiene números apartados para pagar después (por la página o por aquí), el chat
   // queda apuntando a ellos: así puede pagarlos por WhatsApp aunque escriba él primero.
@@ -192,7 +195,104 @@ async function procesar(jid, items) {
     chat.estado_compra = (await chats.obtenerChat(jid)).estado_compra;
   }
 
+  // Pidió las cuentas / dijo con qué paga: los datos salen ya, sin depender de la IA
+  if (await atajoCuentas(jid, chat, items, cfg).catch((e) => { console.error('❌ [Bot] atajo de cuentas:', e.message); return false; })) return;
+
   await turnoIA(jid, chat, items, cfg);
+}
+
+// ─────────────────────────────────────────────────────────────
+// CUENTAS DE PAGO
+// Cuando el cliente ya tiene números apartados y pide los datos para pagar
+// ("pásame el pago móvil", "nequi y bancolombia", "¿y por zelle cuánto es?"),
+// el SISTEMA le manda de una vez la cuenta y el monto exacto de cada método
+// que nombró. Así nunca queda esperando unos datos que "ya se pidieron".
+// ─────────────────────────────────────────────────────────────
+const planoTxt = (t) => String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ$ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+const metodosEnLinea = () => Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial);
+
+// Métodos de pago nombrados en un texto (pueden ser varios), en el orden en que aparecen
+function metodosEnTexto(texto) {
+  const t = planoTxt(texto);
+  if (!t) return [];
+  const junto = t.replace(/ /g, '');
+  const hallados = [];
+  for (const n of metodosEnLinea()) {
+    const pn = planoTxt(n);
+    let pos = t.indexOf(pn);
+    if (pos < 0) { const j = junto.indexOf(pn.replace(/ /g, '')); if (j >= 0) pos = j; }
+    // Formas comunes de decirlo
+    if (pos < 0 && /movil/.test(pn)) pos = t.search(/\bpago ?m[ou]vil\b|\bpagomovil\b/);
+    if (pos < 0 && /zelle/.test(pn)) pos = t.search(/\bzel+e?\b|\bzelle\b/);
+    if (pos < 0 && /nequi/.test(pn)) pos = t.search(/\bne[qk]u?i\b/);
+    if (pos >= 0) hallados.push([pos, n]);
+  }
+  return hallados.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
+}
+
+// Mensajes que hablan de un pago ya hecho, de abonar o de un monto: esos los conversa la IA
+const NO_ES_PEDIDO_DE_CUENTA = /\b(pague|pagado|transferi|deposite|consigne|ya (hice|mande|envie|pase)|abon\w*|una parte|la mitad|el resto|comprobante|captura)\b|\bno (tengo|uso|manejo|puedo|quiero|voy)\b|\d/;
+const PIDE_CUENTAS_EN_GENERAL = /\b(pasa(me)?|envia(me)?|manda(me)?|dame|deme|necesito|quiero|regala(me)?|cual(es)? (es|son))\b.{0,25}\b(cuentas?|datos)\b|\b(datos|cuentas?) (de|del|para) (el )?(pago|pagar|transfer\w*|deposit\w*)\b|\b(a )?donde (te )?(pago|deposito|transfiero|consigno|envio)\b|\bcomo (te |le )?(pago|puedo pagar|hago el pago|cancelo)\b|\b(metodos?|formas?|medios?) de pago\b/;
+
+// → { metodos: [...] } si nombró métodos · { general: true } si pidió "las cuentas" sin decir cuál · null si no es eso
+function cuentasPedidas(texto, anteriores = '') {
+  const t = planoTxt(texto);
+  if (!t || t.split(' ').length > 25 || NO_ES_PEDIDO_DE_CUENTA.test(t)) return null;
+  let metodos = metodosEnTexto(t);
+  if (!metodos.length && /\b(los dos|las dos|ambos|ambas|los tres|las tres|todos|todas)\b/.test(t)) {
+    // "envíame los dos": los que se venían nombrando; "todas las cuentas": todas
+    const previos = metodosEnTexto(anteriores);
+    if (previos.length >= 2 && !/\btod[oa]s\b/.test(t)) metodos = previos;
+    else if (/\btod[oa]s\b/.test(t) && /\b(cuentas?|datos|metodos?|formas?)\b/.test(t)) metodos = metodosEnLinea();
+  }
+  if (metodos.length) return { metodos };
+  return PIDE_CUENTAS_EN_GENERAL.test(t) ? { general: true } : null;
+}
+
+// Manda los datos de pago de esos métodos y deja la compra apuntando a ellos
+async function enviarCuentas(jid, chat, metodos, cfg) {
+  const ec = chat.estado_compra;
+  const efectos = {};
+  let monto = null;
+  for (const m of metodos) monto = await prepararPago(m, ec, efectos);
+  const uno = metodos.length === 1 ? metodos[0] : null;
+  const nuevo = { ...ec, metodo: uno, monto: uno ? monto : null, cuentas_enviadas: [...new Set([...(ec.cuentas_enviadas || []), ...metodos])] };
+  await chats.actualizarChat(jid, { estado_compra: nuevo });
+  if (uno && ec.reservas?.length) await pool.query(`UPDATE reservas_cliente SET metodo_pago = $1 WHERE id = ANY($2)`, [uno, ec.reservas]);
+  chat.estado_compra = nuevo;
+  await responder(jid, uno ? `Claro, aquí tienes los datos de *${uno}* 👇` : 'Claro, aquí te van 👇', cfg);
+  for (const msg of efectos.mensajesPago) {
+    await sleep(azar(500, 1200));
+    await enviarBloque(jid, msg, cfg);
+  }
+}
+
+const preguntaMetodo = () => {
+  const lista = metodosEnLinea();
+  return `¿Con cuál vas a pagar? Tenemos ${lista.join(', ')}.\n\nDime cuál (pueden ser varias) y te paso los datos de una vez 👇`;
+};
+
+// Devuelve true si el turno quedó atendido (no hace falta la IA)
+async function atajoCuentas(jid, chat, items, cfg) {
+  const ec = chat.estado_compra;
+  if (ec?.paso !== 'esperando_comprobante' || dueno.adminDe(jid, cfg)) return false;
+  if (items.some((i) => !['texto', 'audio'].includes(i.mensaje.tipo))) return false;
+  const texto = items.map((i) => i.mensaje.texto || '').join(' ').trim();
+  if (!texto) return false;
+  let pedido = cuentasPedidas(texto);
+  if (!pedido && /\b(los dos|las dos|ambos|ambas|los tres|las tres)\b/.test(planoTxt(texto))) {
+    const ids = new Set(items.map((i) => String(i.mensaje.id)));
+    const previos = (await chats.historialReciente(jid, 10)).filter((m) => !ids.has(String(m.id)) && m.autor !== 'sistema').slice(-6).map((m) => m.texto || '').join(' ');
+    pedido = cuentasPedidas(texto, previos);
+  }
+  if (!pedido) return false;
+  const lista = metodosEnLinea();
+  if (!lista.length) return false;
+  const metodos = pedido.metodos?.length ? pedido.metodos : (lista.length === 1 ? lista : null);
+  if (metodos) await enviarCuentas(jid, chat, metodos, cfg);
+  else await responder(jid, preguntaMetodo(), cfg);
+  // Si además preguntó otra cosa larga, que la IA siga la conversación con los datos ya enviados
+  return planoTxt(texto).split(' ').length <= 14;
 }
 
 // ── Enviar respuesta como persona: "escribiendo…" y en partes ─
@@ -218,9 +318,6 @@ async function enviarBloque(jid, texto, cfg) {
   const cps = cfg.antiban.escribiendo_cps || 28;
   await transporte.escribiendo(jid, Math.min(5000, Math.max(900, (texto.length / (cps * 2)) * 1000)));
   await transporte.enviarTexto(jid, texto, { autor: 'bot' });
-  const r = respuestasRecientes.get(jid) || [];
-  r.push(Date.now());
-  respuestasRecientes.set(jid, r.slice(-30));
 }
 
 async function responder(jid, texto, cfg) {
@@ -232,9 +329,6 @@ async function responder(jid, texto, cfg) {
     const ms = Math.min(7000, Math.max(900, (p.length / cps) * 1000)) + azar(0, 600);
     await transporte.escribiendo(jid, ms);
     await transporte.enviarTexto(jid, p, { autor: 'bot' });
-    const r = respuestasRecientes.get(jid) || [];
-    r.push(Date.now());
-    respuestasRecientes.set(jid, r.slice(-30));
     if (i < partes.length - 1) await sleep(azar(500, 1400));
   }
 }
@@ -247,9 +341,6 @@ async function enviarFotos(jid, fotos) {
     await sleep(azar(900, 2000));
     await transporte.escribiendo(jid, azar(900, 1800));
     await transporte.enviarImagen(jid, f.url, f.caption || '', { autor: 'bot' });
-    const r = respuestasRecientes.get(jid) || [];
-    r.push(Date.now());
-    respuestasRecientes.set(jid, r.slice(-30));
   }
 }
 
@@ -312,21 +403,30 @@ const HERRAMIENTAS = [
         nombre: { type: 'string', description: 'Nombre y apellido del cliente' },
         cedula: { type: 'string', description: 'Cédula de identidad del cliente' },
         metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle (opcional si aún no lo dijo)' },
-        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
+        pagador: { type: 'string', description: 'Nombre de quien envía el pago, SOLO si el cliente ya lo dijo. Nunca lo pidas antes de enviar la cuenta' },
       },
       required: ['rifa_id', 'numeros', 'nombre'],
     },
   },
   {
     nombre: 'elegir_metodo_pago',
-    descripcion: 'Cuando el cliente dice con qué va a pagar (o cambia de método) en una compra ya apartada: el SISTEMA le envía los datos de pago y el monto exacto en la moneda de ese método.',
+    descripcion: 'Envía AL INSTANTE la cuenta y el monto exacto de un método de pago (o de varios) en una compra ya apartada. Llámala SIEMPRE que el cliente diga con qué va a pagar, cambie de método, pregunte cuánto es por un método o pida los datos/la cuenta de uno o varios. Es la ÚNICA forma de que le lleguen los datos: si no la llamas, no le llega nada. No hace falta ningún dato previo del cliente.',
     parametros: {
       type: 'object',
       properties: {
-        metodo_pago: { type: 'string', description: 'Nombre del método de pago tal como lo dijo el cliente, p. ej. Pago Móvil, Nequi, Zelle' },
-        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
+        metodo_pago: { type: 'string', description: 'El método tal como lo dijo el cliente (Pago Móvil, Nequi, Zelle…). Si pide varios, todos separados por coma: "Pago Móvil, Zelle"' },
+        pagador: { type: 'string', description: 'Nombre de quien envía el pago, SOLO si el cliente ya lo dijo. Nunca lo pidas antes de enviar la cuenta' },
       },
       required: ['metodo_pago'],
+    },
+  },
+  {
+    nombre: 'registrar_pagador',
+    descripcion: 'Anota el nombre y apellido de la persona que envió (o va a enviar) el pago, cuando el cliente lo dice. Solo hace falta en métodos como Zelle.',
+    parametros: {
+      type: 'object',
+      properties: { nombre: { type: 'string', description: 'Nombre y apellido de quien envía el pago' } },
+      required: ['nombre'],
     },
   },
   {
@@ -337,7 +437,7 @@ const HERRAMIENTAS = [
       properties: {
         monto: { type: 'number', description: 'Cuánto va a abonar ahora, en la moneda de los precios (pesos). Ej: 20000' },
         metodo_pago: { type: 'string', description: 'Método con el que paga, si ya lo dijo' },
-        pagador: { type: 'string', description: 'Nombre de la persona que envía el pago. Obligatorio solo en los métodos que lo piden (el sistema te lo dice)' },
+        pagador: { type: 'string', description: 'Nombre de quien envía el pago, SOLO si el cliente ya lo dijo. Nunca lo pidas antes de enviar la cuenta' },
       },
       required: ['monto'],
     },
@@ -374,7 +474,11 @@ async function prepararPago(metodo, ec, efectos) {
   const tasas = await metodosPago.obtenerTasas();
   // Si va a abonar una parte se cobra ese monto; si no, todo lo que falta
   const monto = metodosPago.montoEnMetodo(ec.abono_monto || ec.total, metodo, tasas);
-  efectos.mensajePago = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });
+  let msg = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });
+  // Zelle y similares: hace falta saber quién envía, pero se le pide junto con la captura (no antes de darle la cuenta)
+  if (metodosPago.pideTitular(metodo) && !ec.pagador) msg += '\n✍️ Con la captura dime también el nombre y apellido de quien envía el pago.';
+  efectos.mensajesPago = [...(efectos.mensajesPago || []), msg];
+  efectos.mensajePago = efectos.mensajesPago.join('\n\n');
   return monto;
 }
 
@@ -388,22 +492,22 @@ function duracionTexto(min) {
   return h && m ? `${h} y ${m}` : h || m;
 }
 
+// Los datos salen SIEMPRE justo después del texto de la IA: que no los anuncie como algo por llegar
+const DATOS_YA_SALEN = 'Los datos de pago y el monto exacto se le envían SOLOS justo después de tu mensaje (salen seguro, al instante). Escribe UNA sola frase corta y natural, tipo "Claro, aquí te van 👇". NO repitas datos bancarios ni montos, NO menciones "el sistema" ni "un mensaje aparte", y NUNCA digas que los pediste, que hay que esperar o que alguien los tiene que confirmar.';
 const NOTA_PAGO_ENVIADO = (min) =>
-  `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que le apartaste los números por ${duracionTexto(min)} mientras paga.`;
+  `${DATOS_YA_SALEN} Puedes agregar que le apartaste los números por ${duracionTexto(min)} mientras paga.`;
 
 // Métodos como Zelle piden el nombre de quien envía el pago. Devuelve el nombre a guardar,
 // o { error } para que la IA se lo pregunte al cliente antes de enviar los datos de pago.
+// Nunca frena el envío de la cuenta: si falta, el mensaje de pago se lo pide junto con la captura.
 function titularDelPago(metodo, args, ec) {
   const nombre = String(args?.pagador || ec?.pagador || '').trim().slice(0, 120);
-  if (metodosPago.pideTitular(metodo) && nombre.length < 3) {
-    return { error: `Con ${metodo} necesitamos saber quién envía el pago.`, instruccion: `Pregúntale el nombre y apellido de la persona que va a enviar (o envió) el pago por ${metodo} — puede ser otra persona distinta del cliente — y vuelve a llamar esta herramienta pasándolo en "pagador".` };
-  }
-  return { pagador: nombre || null };
+  return { pagador: nombre.length >= 3 ? nombre : null };
 }
 
 // Lo que la IA debe decir tras enviarse los datos de pago: cuánto dura el apartado
 const notaPago = (ec, minutos) => (ec?.diferido
-  ? `El SISTEMA le envía ahora mismo, en un mensaje aparte, los datos de pago y el monto exacto. NO repitas datos bancarios ni montos: solo dile en una frase corta que sus números están apartados y que puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.`
+  ? `${DATOS_YA_SALEN} Puedes agregar que sus números siguen apartados y que puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.`
   : NOTA_PAGO_ENVIADO(minutos));
 
 // prueba=true: modo simulador del panel (no escribe nada en la BD)
@@ -571,7 +675,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           // El cliente ya había mandado el comprobante antes: registrarlo ya
           if (previo && Date.now() - previo.at < 60 * 60000) {
             efectos.comprobantePrevio = previo;
-            delete efectos.mensajePago;
+            delete efectos.mensajePago; delete efectos.mensajesPago;
             return {
               ok: true, total_a_pagar: fmtMonto(total, cfg), numeros: nums,
               comprobante: 'El cliente YA envió una imagen de comprobante antes; el sistema la registrará automáticamente. Solo confírmale en una frase que ya la recibiste y que apenas se verifique el pago le llega su ticket.',
@@ -601,24 +705,48 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
         case 'elegir_metodo_pago': {
           const ec = chat.estado_compra;
           if (ec?.paso !== 'esperando_comprobante') return { error: 'No hay una compra apartada. Usa preparar_compra primero.' };
-          const metodo = metodosPago.normalizarMetodo(args.metodo_pago);
-          if (!metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
-          if (metodosPago.METODOS_PAGO[metodo].presencial) {
+          // Puede pedir varios ("pago móvil o banco de venezuela", "nequi y bancolombia")
+          const varios = [...new Set([...metodosEnTexto(args.metodo_pago), ...String(args.metodo_pago || '').split(/\s*(?:,|\/|\+|\by\b|\bo\b|\bu\b)\s*/i).map((x) => metodosPago.normalizarMetodo(x)).filter(Boolean)])];
+          const unico = varios.length ? null : metodosPago.normalizarMetodo(args.metodo_pago);
+          const pedidos = varios.length ? varios : (unico ? [unico] : []);
+          if (!pedidos.length) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
+          const enLinea = pedidos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial);
+          if (!enLinea.length) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
-          const tit = titularDelPago(metodo, args, ec);
-          if (tit.error) return tit;
+          const tit = titularDelPago(enLinea[0], args, ec);
           // Elegir método sin hablar de abonar = paga todo lo que falta
           const base = { ...ec, abono_monto: null, pagador: tit.pagador };
-          const monto = await prepararPago(metodo, base, efectos);
-          const nuevo = { ...base, metodo, monto };
+          let monto = null;
+          for (const m of enLinea) monto = await prepararPago(m, base, efectos);
+          const metodo = enLinea.length === 1 ? enLinea[0] : null;
+          const nuevo = { ...base, metodo, monto: metodo ? monto : null, cuentas_enviadas: [...new Set([...(ec.cuentas_enviadas || []), ...enLinea])] };
           if (!prueba) {
             await chats.actualizarChat(jid, { estado_compra: nuevo });
-            if (ec.reservas?.length) await pool.query(`UPDATE reservas_cliente SET metodo_pago=$1 WHERE id = ANY($2)`, [metodo, ec.reservas]);
+            if (metodo && ec.reservas?.length) await pool.query(`UPDATE reservas_cliente SET metodo_pago=$1 WHERE id = ANY($2)`, [metodo, ec.reservas]);
           }
           chat.estado_compra = nuevo;
           const quedan = Math.max(1, Math.round((ec.apartado_hasta - Date.now()) / 60000));
-          return { ok: true, metodo, monto: monto.texto, nota: notaPago(nuevo, quedan) };
+          return { ok: true, cuentas_enviadas: enLinea, ...(metodo ? { monto: monto.texto } : {}), nota: notaPago(nuevo, quedan) };
+        }
+        case 'registrar_pagador': {
+          const nombre = String(args.nombre || '').trim().slice(0, 120);
+          if (nombre.length < 3) return { error: 'Pregúntale el nombre y apellido de quien envía el pago.' };
+          const ec = chat.estado_compra;
+          if (!ec?.paso) return { error: 'No hay un pago en curso al que anotarle ese nombre.' };
+          const nuevo = { ...ec, pagador: nombre };
+          delete nuevo.falta_pagador; delete nuevo.abono_sin_pagador;
+          if (!prueba) {
+            if (ec.paso === 'esperando_confirmacion' && ec.reservas?.length) {
+              await pool.query(
+                `UPDATE reservas_cliente SET pagador = $1, comprobante_datos = COALESCE(comprobante_datos, '{}'::jsonb) || $3::jsonb WHERE id = ANY($2)`,
+                [nombre, ec.reservas, JSON.stringify({ enviado_por: nombre })]);
+            }
+            if (ec.abono_sin_pagador) await pool.query(`UPDATE reserva_abonos SET pagador = $1 WHERE id = $2 AND pagador IS NULL`, [nombre, ec.abono_sin_pagador]);
+            await chats.actualizarChat(jid, { estado_compra: nuevo });
+          }
+          chat.estado_compra = nuevo;
+          return { ok: true, nota: 'Anotado. Agradécele en una frase corta; no le pidas nada más.' };
         }
         case 'abonar_apartado': {
           const ec = chat.estado_compra;
@@ -636,14 +764,13 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere abonar en efectivo".' };
           }
           const tit = metodo ? titularDelPago(metodo, args, ec) : { pagador: ec.pagador || null };
-          if (tit.error) return tit;
           const nuevo = { ...ec, abono_monto: monto, metodo: metodo || null, pagador: tit.pagador };
           if (metodo) nuevo.monto = await prepararPago(metodo, nuevo, efectos);
           if (!prueba) await chats.actualizarChat(jid, { estado_compra: nuevo });
           chat.estado_compra = nuevo;
           const restante = fmtMonto(falta - monto, cfg);
           return metodo
-            ? { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, nota: `El SISTEMA le envía ahora los datos de pago con el monto del abono. NO repitas datos bancarios ni montos convertidos: dile en una frase que mande la captura del abono y que después le quedarían ${restante} por pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.` }
+            ? { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, nota: `${DATOS_YA_SALEN} (van con el monto del abono). Puedes agregar que después le quedarían ${restante} por pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.` }
             : { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial), instruccion: 'Pregúntale con qué método va a hacer el abono y vuelve a llamar abonar_apartado con monto y metodo_pago.' };
         }
         case 'cancelar_compra': {
@@ -687,13 +814,16 @@ function describirEstado(ec, cfg) {
   if (ec.paso === 'esperando_comprobante') {
     const quedan = ec.apartado_hasta ? Math.max(0, Math.round((ec.apartado_hasta - Date.now()) / 60000)) : null;
     return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
-      (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron` : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
+      (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron`
+        : ec.cuentas_enviadas?.length ? `; ya se le enviaron los datos de pago de ${ec.cuentas_enviadas.join(', ')} (no le vuelvas a preguntar el método: paga con el que prefiera)`
+        : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
+      (ec.cuentas_enviadas?.length ? ` Si pide los datos de otro método o que se los repitas, llama elegir_metodo_pago otra vez.` : '') +
       (ec.diferido
         ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan.${ec.abonado > 0 ? ` YA ABONÓ ${fmtMonto(ec.abonado, cfg)} de ${fmtMonto(ec.total_rifa, cfg)}: el "total" de arriba es lo que le FALTA` : ''}${ec.por_confirmar > 0 ? ` Tiene un abono de ${fmtMonto(ec.por_confirmar, cfg)} enviado que el equipo está por confirmar` : ''}${ec.abono_monto ? ` Dijo que ahora va a abonar ${fmtMonto(ec.abono_monto, cfg)}: espera la captura de ese abono` : ''}. Puede pagar todo lo que falta o ABONAR UNA PARTE (abonar_apartado) y el resto después. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
         : (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '')) + '. Si pregunta, recuérdale que mande la captura del pago.';
   }
   if (ec.paso === 'esperando_confirmacion')
-    return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.`;
+    return `Ya envió el comprobante (números ${(ec.numeros || []).join(', ')} de "${ec.rifa_nombre}"). Está pendiente de que el equipo verifique el pago; cuando se apruebe le llega el ticket. Si quiere comprar más números, puede hacerlo.${ec.falta_pagador ? ' FALTA saber quién envió el pago: ya se le preguntó; cuando diga el nombre usa registrar_pagador.' : ''}`;
   if (ec.paso === 'apartado_vencido')
     return `Se le venció el apartado de ${ec.numeros.length > 1 ? 'los números' : 'el número'} ${ec.numeros.join(', ')} de "${ec.rifa_nombre}" porque no mandó la captura a tiempo. Si manda la captura ahora, el sistema la registra si siguen libres; si quiere, puedes apartarlos de nuevo con preparar_compra.`;
   if (ec.paso === 'comprobante_sin_compra')
@@ -752,8 +882,9 @@ CÓMO VENDER
 - Los premios_especiales son premios aparte que se ganan cumpliendo su requisito antes de su fecha tope: cuéntalos cuando venga al caso y di siempre el requisito y la fecha tal como vienen, sin inventar condiciones.
 - Las notas de voz te llegan transcritas ("[nota de voz, transcrita automáticamente] …"): respóndelas como cualquier mensaje, sin mencionar la transcripción. Puede traer errores: si un dato clave (número, cédula, nombre) no quedó claro, confírmalo con el cliente antes de usarlo.
 - ABONOS: quien tiene números apartados para pagar después puede pagar una parte ahora y el resto luego. Si dice "abono 20 mil", "pago una parte", etc., usa abonar_apartado con ese monto. Cuando el equipo confirma el abono el sistema le avisa cuánto le falta. No inventes saldos: usa los del contexto.
-- Algunos métodos (como Zelle) piden saber QUIÉN ENVÍA el pago, porque a veces paga otra persona. Si la herramienta te responde que falta ese dato, pregúntale el nombre y apellido de quien envía el pago y vuelve a llamarla con "pagador". No lo inventes ni asumas que es el mismo cliente sin preguntarle.
-- Los datos de pago y el monto exacto los envía el SISTEMA automáticamente. Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos.
+- CUENTAS Y DATOS DE PAGO: se envían solos y AL INSTANTE cuando llamas elegir_metodo_pago (o preparar_compra / abonar_apartado con metodo_pago). Si el cliente nombra un método, pregunta cuánto es por un método o pide la cuenta, LLAMA la herramienta en ese mismo turno; si nombra varios, pásalos todos juntos. No existe ninguna espera ni nadie que "confirme" los datos: NUNCA digas que "ya los pediste", que "apenas te los confirmen se los pasas" ni que "ya van" si no llamaste la herramienta en este turno. Si pide las cuentas sin decir cuál, pregúntale con cuál método y nombra las opciones.
+- Nunca le pidas un dato como condición para enviarle una cuenta. En métodos como Zelle hace falta saber QUIÉN ENVÍA el pago (a veces paga otra persona), pero eso se le pide junto con la captura, no antes: cuando te diga ese nombre, usa registrar_pagador. No lo inventes ni asumas que es el mismo cliente.
+- Tú nunca escribas números de cuenta, teléfonos de pago ni montos convertidos: eso va en el mensaje de datos que sale solo.
 - Cuando el cliente manda la captura del pago, el sistema la guarda y la registra sola; tú solo acompañas.
 - Tú resuelves todo lo de la compra. Usa pasar_a_humano solo en los casos que describe esa herramienta.
 - Nunca menciones "series" ni detalles internos del sistema.
@@ -814,6 +945,9 @@ async function historialParaIA(jid, hastaId) {
   return out;
 }
 
+// Frases con las que la IA anuncia unos datos de pago (solo valen si de verdad los envió en ese turno)
+const PROMETE_DATOS = /ya (te )?(los |las |lo )?ped[ií]|apenas (me )?(los |las |lo )?(confirm|teng|salg|lleg|env)|sigo esperando (que|los|las|la confirm)|mensaje aparte|el sistema (ya )?(te )?(los |lo |las )?(env[ií]a|manda|acaba|genera|pasa)|ya te (van|llegan) (los|las)|ya te (los|las) (envi[eé]|mand[eé]|pas[eé])|te (los |las )?(env[ií]o|mando|paso) (ya|ahora|ahorita|de una|enseguida|en un)|aqu[ií] (te van|tienes los datos|te los dejo)/i;
+
 async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   const hastaId = items.length ? Math.max(...items.map((i) => Number(i.mensaje.id) || 0)) : null;
   const mensajes = await historialParaIA(jid, hastaId || null);
@@ -843,6 +977,18 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
     return null;
   }
 
+  // Red de seguridad: dijo que "ya pidió" o "ya van" los datos pero no llamó la herramienta.
+  // Con una compra apartada, se le mandan de verdad (o se le pregunta el método) y ese texto no sale.
+  if (!esDueno && !notaDueno && resultado.texto && !efectos.mensajePago && !efectos.pasadoAHumano
+      && chat.estado_compra?.paso === 'esperando_comprobante' && PROMETE_DATOS.test(resultado.texto)) {
+    const delCliente = mensajes.filter((m) => m.role === 'user').slice(-2).map((m) => (typeof m.content === 'string' ? m.content : '')).reverse();
+    const metodos = delCliente.map((t) => metodosEnTexto(t)).find((l) => l.length) || [];
+    console.warn(`⚠️  [Bot] La IA prometió datos de pago sin enviarlos (${jid}); ${metodos.length ? `se envían: ${metodos.join(', ')}` : 'se pregunta el método'}`);
+    if (metodos.length) await enviarCuentas(jid, chat, metodos, cfg);
+    else await responder(jid, preguntaMetodo(), cfg);
+    return [];
+  }
+
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
   else if (efectos.pasadoAHumano) {
     // La IA pasó el chat a una persona pero no redactó el aviso: se lo dice el sistema
@@ -865,9 +1011,9 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
   }
 
   // Datos de pago + monto exacto: los manda el sistema, en un solo mensaje
-  if (efectos.mensajePago) {
-    await sleep(azar(700, 1500));
-    await enviarBloque(jid, efectos.mensajePago, cfg);
+  for (const msg of efectos.mensajesPago || []) {
+    await sleep(azar(600, 1300));
+    await enviarBloque(jid, msg, cfg);
   }
 
   // Comprobante enviado antes de preparar la compra → registrarlo ahora
@@ -949,6 +1095,11 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
     try { datos = await ia.leerComprobante(cfg, { base64: await descargarBase64(url), mime }); }
     catch (e) { console.warn('⚠️  [Bot] No se pudo leer el comprobante:', e.message); }
   }
+  // Zelle y similares: falta el nombre de quien envió el pago → se le pregunta al recibir la captura
+  const metodosDelPago = ec.metodo ? [ec.metodo] : (ec.cuentas_enviadas || []);
+  const faltaPagador = !ec.pagador && metodosDelPago.some((m) => metodosPago.pideTitular(m))
+    && (!!ec.metodo || /usd|\$|d[oó]lar/i.test(String(datos?.moneda || '')) || metodosDelPago.every((m) => metodosPago.pideTitular(m)));
+  const PREGUNTA_PAGADOR = '\n\n¿Me dices el nombre y apellido de quien envió el pago? 🙏';
   if (datos && datos.es_comprobante === false && !silencioso && !forzar) {
     await responder(jid, 'Mmm esa imagen no parece un comprobante de pago 🤔\n\n¿Me mandas la captura del pago cuando puedas?', cfg);
     // Por si la IA se equivocó: una persona la puede confirmar con "Este es el comprobante"
@@ -964,8 +1115,9 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
       const falta = Math.max(g.saldo - g.por_confirmar, 0);
       const monto = Math.min(Math.round(Number(ec.abono_monto) || falta), falta);
       if (monto > 0) {
+        let abonoCreado = null;
         try {
-          await abonos.crear(pool, {
+          abonoCreado = await abonos.crear(pool, {
             g, jid, monto, metodo: ec.metodo || null, comprobanteUrl: url, origen: 'whatsapp', pagador: ec.pagador || null,
             datos: { ...(datos || {}), metodo: ec.metodo || null, monto_declarado: monto, monto_esperado: ec.monto?.texto || fmtMonto(monto, cfg), total: g.total, abonado_antes: g.abonado },
           });
@@ -976,16 +1128,16 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
           return { ok: false, error: 'No se pudo registrar el abono.' };
         }
         const restante = Math.max(falta - monto, 0);
-        await chats.actualizarChat(jid, { estado_compra: { ...ec, abono_monto: null, monto: null, por_confirmar: (ec.por_confirmar || 0) + monto } });
+        await chats.actualizarChat(jid, { estado_compra: { ...ec, abono_monto: null, monto: null, por_confirmar: (ec.por_confirmar || 0) + monto, ...(faltaPagador && abonoCreado?.id ? { abono_sin_pagador: abonoCreado.id } : {}) } });
         bus.emit('wa:reserva', { jid, numeros: g.numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: monto });
         await chats.guardarMensaje({
           jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
           texto: `💵 Abono recibido: ${fmtMonto(monto, cfg)} · ${ec.rifa_nombre} · números ${g.numeros.join(', ')}. Por confirmar en Reservas → Abonos.`,
         });
         if (!silencioso) {
-          await responder(jid, restante > 0
+          await responder(jid, (restante > 0
             ? `Recibí tu abono de *${fmtMonto(monto, cfg)}* ✅\n\nApenas lo verifiquemos te confirmo. Te quedarían ${fmtMonto(restante, cfg)} por pagar hasta el ${opciones.fmtLimite(g.limite)}.`
-            : `Recibí tu comprobante ✅ Con este pago completas el total.\n\nApenas lo verifiquemos te llega tu ticket por aquí.`, cfg);
+            : `Recibí tu comprobante ✅ Con este pago completas el total.\n\nApenas lo verifiquemos te llega tu ticket por aquí.`) + (faltaPagador ? PREGUNTA_PAGADOR : ''), cfg);
         }
         return { ok: true, abono: true, numeros: g.numeros, rifa: ec.rifa_nombre, conflictos: [] };
       }
@@ -1047,6 +1199,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
     estado_compra: {
       paso: 'esperando_confirmacion', rifa_id: ec.rifa_id, rifa_nombre: ec.rifa_nombre,
       numeros, nombre: ec.nombre, total: ec.total, reservas: r.reservas.map((x) => x.id), desde: Date.now(),
+      ...(faltaPagador ? { falta_pagador: true } : {}),
     },
   });
   bus.emit('wa:reserva', { jid, numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: ec.total });
@@ -1057,7 +1210,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
 
   if (!silencioso) {
     const extra = r.conflictos?.length ? `\n\nOjo: ${r.conflictos.map((c) => c.numero).join(', ')} se ocupó mientras tanto, así que quedó solo con ${numeros.join(', ')}.` : '';
-    await responder(jid, `Listo ${ec.nombre.split(' ')[0]}, recibí tu comprobante ✅\n\nApenas verifiquemos el pago te llega tu ticket por aquí.${extra}`, cfg);
+    await responder(jid, `Listo ${ec.nombre.split(' ')[0]}, recibí tu comprobante ✅\n\nApenas verifiquemos el pago te llega tu ticket por aquí.${extra}${faltaPagador ? PREGUNTA_PAGADOR : ''}`, cfg);
   }
   return { ok: true, numeros, rifa: ec.rifa_nombre, conflictos: (r.conflictos || []).map((c) => c.numero) };
 }
@@ -1281,8 +1434,8 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
   });
   const partes = dividir(aFormatoWhatsApp(texto || ''));
   for (const f of efectos.fotos || []) partes.push(`📷 [foto] ${f.caption || ''}\n${f.url}`);
-  if (efectos.mensajePago) partes.push(efectos.mensajePago);
+  for (const msg of efectos.mensajesPago || []) partes.push(msg);
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };
+module.exports = { cuentasPedidas, metodosEnTexto, atajoCuentas, PROMETE_DATOS, init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };

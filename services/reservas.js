@@ -192,6 +192,9 @@ async function crearReservasTx(client, datos) {
     if (!n) return { ok: false, status: 400, error: `Número fuera de rango para rifa de ${cifras} cifras: ${numeros[i]}` };
     numeros[i] = n;
   }
+  if (rifa.activa === false) {
+    return { ok: false, status: 403, error: 'Las ventas de esta rifa ya cerraron. ¡Suerte para todos!', compra_desactivada: true };
+  }
   if (rifa.fecha_desactivacion_compra && new Date(rifa.fecha_desactivacion_compra) <= new Date()) {
     return { ok: false, status: 403, error: 'La compra de esta rifa está desactivada. El sorteo ya fue realizado.', compra_desactivada: true };
   }

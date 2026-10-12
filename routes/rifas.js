@@ -508,10 +508,14 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
         precio                  = COALESCE($4,  precio),
         fecha_sorteo            = COALESCE($5,  fecha_sorteo),
         loteria_ref             = COALESCE($6,  loteria_ref),
-        activa                  = COALESCE($7,  activa),
+        activa                  = COALESCE($7::boolean,  activa),
         tipo                    = COALESCE($8,  tipo),
         imagen_url              = CASE WHEN $9::text  IS NOT NULL THEN $9::text  ELSE imagen_url END,
-        estado                  = COALESCE($10, estado),
+        -- Sin estado explícito sigue a "activa" (si no, una rifa reactivada quedaba 'inactiva'
+        -- y el bot no la ofrecía). Una archivada solo sale de ahí con estado explícito.
+        estado                  = CASE WHEN $10::text IS NOT NULL THEN $10::text
+                                       WHEN $7::boolean IS NULL OR estado = 'archivada' THEN estado
+                                       WHEN $7::boolean THEN 'activa' ELSE 'inactiva' END,
         ofertas                 = CASE WHEN $11::text IS NOT NULL THEN $11::jsonb ELSE ofertas END,
         categoria_seleccionada_id = COALESCE($13::uuid, categoria_seleccionada_id),
         hora_sorteo             = CASE WHEN $14::text IS NOT NULL
@@ -1406,6 +1410,7 @@ router.put('/:id/programar-desactivacion', authMiddleware, soloDueno, async (req
         `UPDATE rifas
             SET activa       = false,
                 estado       = 'inactiva',
+                cerrada_visible = true,   -- sigue en la página del cliente, sin números para comprar
                 desactivar_en = NULL
           WHERE activa = true
             AND desactivar_en IS NOT NULL

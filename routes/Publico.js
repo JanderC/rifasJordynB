@@ -88,7 +88,7 @@ router.get('/rifas', async (req, res) => {
         ) AS porcentaje_comprado
       FROM rifas r
       LEFT JOIN ventas v ON v.rifa_id = r.id
-      WHERE r.activa = TRUE
+      WHERE (r.activa = TRUE OR COALESCE(r.cerrada_visible, FALSE))   -- las de ventas cerradas siguen a la vista
         AND r.publicada                              -- el dueño decide cuáles salen en la página
         AND COALESCE(r.estado, 'activa') != 'archivada'
         -- Ocultar completamente si ya pasó la fecha de eliminación
@@ -97,18 +97,20 @@ router.get('/rifas', async (req, res) => {
           OR r.fecha_eliminacion_pantalla > $1
         )
       GROUP BY r.id
-      ORDER BY r.created_at DESC
+      ORDER BY r.activa DESC, r.created_at DESC
     `, [ahora]);
 
     // Enriquecer cada rifa con el flag compra_activa
     const rifas = r.rows.map(rifa => {
-      const compra_activa = !rifa.fecha_desactivacion_compra
-        || new Date(rifa.fecha_desactivacion_compra) > new Date(ahora);
+      const compra_activa = rifa.activa && (!rifa.fecha_desactivacion_compra
+        || new Date(rifa.fecha_desactivacion_compra) > new Date(ahora));
       // Apartar sin pagar: solo si la rifa lo permite y todavía hay tiempo para pagar
       const limite = compra_activa && opciones.puedeApartarse(rifa) ? opciones.limiteDePago(rifa) : null;
       return {
         ...rifa,
         compra_activa,
+        cerrada: !rifa.activa,                     // ventas cerradas: se muestra sin números ("¡Suerte para todos!")
+        recordatorios_programados: undefined,      // interno
         rifa_con_apartado: !!rifa.pago_diferido,   // la rifa trabaja con apartados (aunque ya no se pueda apartar)
         pago_diferido: !!limite,
         pago_hasta: limite ? limite.toISOString() : null,

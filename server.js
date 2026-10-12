@@ -65,6 +65,7 @@ app.use("/api/reportes",           require("./routes/reportes"));
 app.use("/api/caja",               require("./routes/caja"));
 app.use("/api/publico",            require("./routes/Publico"));
 app.use("/api/tasas",              require("./routes/tasas"));
+app.use("/api/comprobantes",       require("./routes/comprobantes"));
 app.use("/api/ticket-design",      require("./routes/ticketDesign"));
 app.use("/api/ticket-templates",   require("./routes/ticketTemplates"));
 app.use("/api/categorias-globales", categoriasGlobalesRouter);

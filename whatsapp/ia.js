@@ -55,7 +55,7 @@ const PROVEEDORES = {
     base: 'https://api.deepseek.com',
     env: 'DEEPSEEK_API_KEY',
     modeloDefecto: 'deepseek-chat',
-    nota: 'Muy económico. No lee imágenes.',
+    nota: 'Muy económico. No lee imágenes: para los comprobantes se usa la clave de Groq o Gemini.',
     urlClave: 'https://platform.deepseek.com/api_keys',
   },
 };
@@ -317,8 +317,54 @@ async function transcribirAudio(cfg, buffer, mime = 'audio/ogg') {
   } finally { clearTimeout(timer); }
 }
 
+// ── Leer imágenes ────────────────────────────────────────────
+// Igual que con los audios: si el proveedor con el que conversa el bot no lee
+// imágenes (DeepSeek), se usa otro que sí, con la clave que esté guardada.
+const SIN_VISION = ['deepseek'];
+// Modelos que leen imágenes, por proveedor (el de Groq es gratis y usa la misma clave de las notas de voz)
+const VISION_RESPALDO = [
+  { proveedor: 'gemini',    modelo: PROVEEDORES.gemini.modeloDefecto },
+  { proveedor: 'anthropic', modelo: PROVEEDORES.anthropic.modeloDefecto },
+  { proveedor: 'groq',      modelo: 'qwen/qwen3.8-27b' },
+];
+
+// Con qué se puede leer una imagen, en orden de preferencia: [{ proveedor, modelo }]
+function proveedoresVision(cfg) {
+  const lista = [];
+  if (!SIN_VISION.includes(cfg.proveedor) && claveDe(cfg) && modeloDe(cfg)) lista.push({ proveedor: cfg.proveedor, modelo: modeloDe(cfg) });
+  for (const v of VISION_RESPALDO) {
+    if (claveDe(cfg, v.proveedor) && !lista.some((x) => x.proveedor === v.proveedor && x.modelo === v.modelo)) lista.push(v);
+  }
+  return lista;
+}
+const proveedorVision = (cfg) => proveedoresVision(cfg)[0] || null;
+
 // ── Leer un comprobante de pago con visión ───────────────────
 async function leerComprobante(cfg, { base64, mime }) {
+  const candidatos = proveedoresVision(cfg);
+  if (!candidatos.length) {
+    throw new ErrorIA(`${PROVEEDORES[cfg.proveedor]?.nombre || 'El proveedor del bot'} no lee imágenes. Guarda una API key de Groq o de Google Gemini (gratis) en la configuración del bot y se usará solo para leer las fotos.`);
+  }
+  // Los que fallaron hace poco por la clave (inválida, sin permiso) van al final: no se pierde tiempo en cada foto
+  const k = (c) => `${c.proveedor}|${c.modelo}`;
+  const orden = [...candidatos].sort((x, y) => ((visionCaida.get(k(x)) || 0) > Date.now()) - ((visionCaida.get(k(y)) || 0) > Date.now()));
+  let ultimo = null;
+  for (const c of orden) {
+    try {
+      const d = await leerComprobanteCon({ ...cfg, proveedor: c.proveedor, modelo: c.modelo }, { base64, mime });
+      visionCaida.delete(k(c));
+      return d;
+    } catch (e) {
+      ultimo = e;
+      if ([400, 401, 403, 404].includes(e.status) || /api key|unauthori|permission|not found|must be a string/i.test(e.message)) visionCaida.set(k(c), Date.now() + 6 * 3600000);
+      console.warn(`⚠️  [IA] ${PROVEEDORES[c.proveedor].nombre} no pudo leer la imagen: ${e.message}`);
+    }
+  }
+  throw ultimo;
+}
+const visionCaida = new Map();   // "proveedor|modelo" → hasta cuándo se deja de último
+
+async function leerComprobanteCon(cfg, { base64, mime }) {
   const system = 'Extraes datos de comprobantes de pago (pago móvil, transferencias, Zelle, Binance) de Venezuela. Respondes SOLO con JSON válido, sin texto adicional.';
   const pedido = 'Analiza la imagen. Devuelve este JSON: {"es_comprobante": true|false, "monto": number|null, "moneda": "Bs"|"USD"|"USDT"|null, "referencia": string|null, "banco": string|null, "fecha": string|null, "titular": string|null}. Si no es un comprobante de pago, es_comprobante=false.';
   const { texto } = await chatConHerramientas(cfg, {
@@ -375,4 +421,4 @@ function catalogo() {
   }));
 }
 
-module.exports = { PROVEEDORES, ErrorIA, limpiarTexto, esBasura, transcribirAudio, proveedorTranscripcion, chatConHerramientas, leerComprobante, probar, listarModelos, catalogo, claveDe, modeloDe };
+module.exports = { PROVEEDORES, ErrorIA, limpiarTexto, esBasura, transcribirAudio, proveedorTranscripcion, chatConHerramientas, leerComprobante, proveedorVision, probar, listarModelos, catalogo, claveDe, modeloDe };

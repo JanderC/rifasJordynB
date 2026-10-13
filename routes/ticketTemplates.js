@@ -50,7 +50,9 @@ router.get('/:id', async (req, res) => {
 
 // ── POST /api/ticket-templates ────────────────────────────
 router.post('/', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, descripcion, design, is_default } = req.body;
+  const { nombre, descripcion, design } = req.body;
+  // El boleto de 4 cifras es un modelo aparte: nunca es la plantilla por defecto (esa es del clásico)
+  const is_default = design?.modelo === 'cuatro' ? false : req.body.is_default;
 
   if (!nombre || !nombre.trim()) {
     return res.status(400).json({ error: 'El nombre es requerido' });
@@ -102,7 +104,9 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
 
 // ── PUT /api/ticket-templates/:id ─────────────────────────
 router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, descripcion, design, is_default } = req.body;
+  const { nombre, descripcion, design } = req.body;
+  // El boleto de 4 cifras es un modelo aparte: nunca es la plantilla por defecto (esa es del clásico)
+  const is_default = design?.modelo === 'cuatro' ? false : req.body.is_default;
 
   if (!nombre || !nombre.trim()) {
     return res.status(400).json({ error: 'El nombre es requerido' });

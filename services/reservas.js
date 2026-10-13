@@ -155,6 +155,26 @@ async function numerosLibres(db, rifa, { cantidad = 5, terminacion = '' } = {}) 
   const cifras = Number(rifa.cifras) || 3;
   const total = 10 ** cifras;
   const term = String(terminacion || '').replace(/\D/g, '');
+  // Rifas grandes (4 cifras) sin terminación: no hace falta revisar los 10.000 números.
+  // Se sortean unos cuantos, se revisan solo esos y el total de libres sale de un conteo.
+  if (!term && total > 2000 && rifa.tipo !== 'simultanea') {
+    const pedir = Math.min(20, cantidad);
+    const muestra = new Set();
+    while (muestra.size < Math.min(total, pedir * 6)) muestra.add(String(Math.floor(Math.random() * total)).padStart(cifras, '0'));
+    const occ = await ocupacionNumeros(db, rifa, [...muestra]);
+    const libres = [...muestra].filter((n) => occ[n].disponible).slice(0, pedir);
+    const ocupados = await db.query(
+      `SELECT COUNT(*)::int AS n FROM (
+         SELECT numero FROM ventas WHERE rifa_id = $1
+         UNION SELECT numero FROM reservas_cliente WHERE rifa_id = $1 AND ${SQL_RESERVA_OCUPA}
+         UNION SELECT numero FROM numeros_vendedor WHERE rifa_id = $1
+         UNION SELECT numero FROM boleteria_numeros_extra WHERE rifa_id = $1
+       ) x`, [rifa.id]);
+    // Casi agotada: la muestra no alcanzó → se revisa completa (abajo)
+    if (libres.length >= pedir || total - ocupados.rows[0].n <= libres.length) {
+      return { libres: libres.sort(), totalLibres: Math.max(total - ocupados.rows[0].n, libres.length) };
+    }
+  }
   const candidatos = [];
   for (let i = 0; i < total; i++) {
     const n = String(i).padStart(cifras, '0');
@@ -167,6 +187,32 @@ async function numerosLibres(db, rifa, { cantidad = 5, terminacion = '' } = {}) 
     [libres[i], libres[j]] = [libres[j], libres[i]];
   }
   return { libres: libres.slice(0, Math.min(20, cantidad)).sort(), totalLibres: libres.length };
+}
+
+// Libres PARECIDOS a un número que no está disponible: los vecinos y los de su misma
+// terminación (3 y 2 últimas cifras). Para ofrecer alternativas en el buscador.
+async function numerosParecidos(db, rifa, numero, cantidad = 8) {
+  const cifras = Number(rifa.cifras) || 3;
+  const n = normalizarNumero(numero, cifras);
+  if (!n) return [];
+  const total = 10 ** cifras, base = Number(n);
+  const pad = (x) => String(x).padStart(cifras, '0');
+  const orden = [];
+  for (let d = 1; d <= 4; d++) { if (base + d < total) orden.push(pad(base + d)); if (base - d >= 0) orden.push(pad(base - d)); }
+  for (const largo of [3, 2]) {
+    if (cifras <= largo) continue;
+    const fin = n.slice(-largo);
+    for (let i = 0; i < 10 ** (cifras - largo); i++) orden.push(String(i).padStart(cifras - largo, '0') + fin);
+  }
+  const vecinos = orden.slice(0, 8);
+  const candidatos = [...new Set(orden)].filter((x) => x !== n);
+  const occ = await ocupacionNumeros(db, rifa, candidatos);
+  const libres = candidatos.filter((x) => occ[x].disponible);
+  // Mitad vecinos (el de al lado) y mitad con su misma terminación
+  const tope = Math.min(20, cantidad);
+  const cerca = libres.filter((x) => vecinos.includes(x)).slice(0, Math.ceil(tope / 2));
+  const mismaTerminacion = libres.filter((x) => !vecinos.includes(x)).slice(0, tope - cerca.length);
+  return [...cerca, ...mismaTerminacion, ...libres.filter((x) => vecinos.includes(x)).slice(cerca.length)].slice(0, tope);
 }
 
 // ── Crear reservas (pendientes de aprobación) dentro de una transacción ──
@@ -417,7 +463,7 @@ module.exports = {
   infoRifa,
   rifasEnVenta,
   normalizarNumero,
-  ocupacionNumeros,
+  ocupacionNumeros, numerosParecidos,
   numerosLibres,
   crearReservasTx,
   aprobarReservasTx,

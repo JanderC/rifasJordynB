@@ -567,6 +567,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
               sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' ') || 'por anunciar',
               loteria: r.loteria_ref || null,
               numeros_van_de: `${'0'.repeat(r.cifras)} a ${'9'.repeat(r.cifras)}`,
+              ...(Number(r.venta_minima) > 1 ? { venta_minima: `En cada compra hay que llevar mínimo ${r.venta_minima} números (no se vende ni se aparta menos)` } : {}),
               ...(r.premio_segundo ? { segundo_premio: r.premio_segundo } : {}),
               ...(r.premio_tercero ? { tercer_premio: r.premio_tercero } : {}),
               ...(opciones.especialesVigentes(r).length ? { premios_especiales: opciones.especialesVigentes(r).map(opciones.describirEspecial) } : {}),
@@ -606,6 +607,10 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           const nums = [...new Set((args.numeros || []).map((n) => reservas.normalizarNumero(n, rifa.cifras)).filter(Boolean))];
           if (!nums.length) return { error: 'No hay números válidos.' };
           if (nums.length > 20) return { error: 'Máximo 20 números por compra.' };
+          const ventaMinima = Number(rifa.venta_minima) || 1;
+          if (nums.length < ventaMinima) {
+            return { error: `La venta mínima de esta rifa es de ${ventaMinima} números y lleva ${nums.length}.`, instruccion: `Dile con naturalidad que en esta rifa se llevan mínimo ${ventaMinima} números y que elija ${ventaMinima - nums.length} más (puedes sugerirle libres con numeros_disponibles). No apartes nada todavía.` };
+          }
           const metodo = args.metodo_pago ? metodosPago.normalizarMetodo(args.metodo_pago) : null;
           if (args.metodo_pago && !metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
           if (metodo && metodosPago.METODOS_PAGO[metodo].presencial) {

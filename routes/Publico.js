@@ -164,6 +164,29 @@ router.get('/rifas/:id/numero/:n', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ── GET /api/publico/rifas/:id/sugerencias ──────────────────
+   Para el buscador de las rifas de 4 cifras (no se pinta la cuadrícula de 10.000):
+     ?cantidad=16            números libres al azar ("números de la suerte")
+     ?termina=57             … que terminen en esas cifras
+     ?cerca=0457             libres parecidos a un número que no está disponible
+   Devuelve { numeros: [...], total_libres } */
+router.get('/rifas/:id/sugerencias', async (req, res) => {
+  try {
+    const rifa = await reservasSvc.infoRifa(pool, req.params.id);
+    if (!rifa || !rifa.activa || !rifa.publicada) return res.status(404).json({ error: 'Rifa no encontrada' });
+    const cantidad = Math.min(20, Math.max(1, parseInt(req.query.cantidad, 10) || 16));
+    if (req.query.cerca) {
+      return res.json({ numeros: await reservasSvc.numerosParecidos(pool, rifa, req.query.cerca, cantidad) });
+    }
+    const termina = String(req.query.termina || '').replace(/\D/g, '').slice(0, Math.max(1, Number(rifa.cifras) - 1));
+    const r = await reservasSvc.numerosLibres(pool, rifa, { cantidad, terminacion: termina });
+    res.json({ numeros: r.libres, total_libres: r.totalLibres, termina });
+  } catch (e) {
+    console.error('Error sugiriendo números:', e);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
 /* ── GET /api/publico/rifas/:id/numeros-disponibles ─────── */
 router.get('/rifas/:id/numeros-disponibles', async (req, res) => {
   try {
@@ -582,6 +605,12 @@ router.post('/reservar', async (req, res) => {
 
   if (correo && correo.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo.trim()))
     return res.status(400).json({ error: 'El correo electrónico no tiene un formato válido' });
+
+  // Venta mínima de la rifa: números por compra
+  const minR = await pool.query(`SELECT COALESCE(venta_minima, 1)::int AS minimo FROM rifas WHERE id = $1`, [rifa_id]).catch(() => ({ rows: [] }));
+  const ventaMinima = minR.rows[0]?.minimo || 1;
+  if (new Set(numeros.map(String)).size < ventaMinima)
+    return res.status(400).json({ error: `La venta mínima de esta rifa es de ${ventaMinima} números. Elige ${ventaMinima - new Set(numeros.map(String)).size} más.`, venta_minima: ventaMinima });
 
   if (apartar) return apartarSinPago(req, res, numeros);
 

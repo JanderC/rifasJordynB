@@ -24,6 +24,8 @@ const esquemaListo = (async () => {
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS pago_diferido BOOLEAN NOT NULL DEFAULT FALSE`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS diferido_limite_horas SMALLINT NOT NULL DEFAULT 3`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS diferido_max_numeros SMALLINT NOT NULL DEFAULT 10`,
+    // Venta mínima: cuántos números hay que llevar, como mínimo, en cada compra en línea (página y bot)
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS venta_minima SMALLINT NOT NULL DEFAULT 1`,
     // Recordatorios de pago en días y horas elegidos para ESTA rifa (momentos ISO); vacío = la frecuencia general del bot
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS recordatorios_programados JSONB NOT NULL DEFAULT '[]'::jsonb`,
     // La desactivación programada cierra las ventas pero la rifa sigue en la página del cliente ("¡Suerte para todos!")
@@ -68,7 +70,8 @@ const COLUMNAS = (a = 'r') => `
   ${a}.publicada, COALESCE(${a}.premios_extra, '[]'::jsonb) AS premios_extra,
   ${a}.premio_segundo, ${a}.premio_tercero, COALESCE(${a}.imagenes, '[]'::jsonb) AS imagenes,
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros,
-  COALESCE(${a}.recordatorios_programados, '[]'::jsonb) AS recordatorios_programados, COALESCE(${a}.cerrada_visible, FALSE) AS cerrada_visible`;
+  COALESCE(${a}.recordatorios_programados, '[]'::jsonb) AS recordatorios_programados, COALESCE(${a}.cerrada_visible, FALSE) AS cerrada_visible,
+  COALESCE(${a}.venta_minima, 1)::int AS venta_minima`;
 
 // Momentos válidos, sin repetir y en orden (máximo 12)
 function limpiarProgramados(lista) {
@@ -109,6 +112,7 @@ async function guardar(db, rifaId, body = {}) {
   if (typeof body.pago_diferido === 'boolean') poner('pago_diferido', body.pago_diferido);
   if (body.diferido_limite_horas !== undefined) poner('diferido_limite_horas', Math.min(72, Math.max(0, Math.round(Number(body.diferido_limite_horas)) || 0)));
   if (body.diferido_max_numeros !== undefined) poner('diferido_max_numeros', Math.min(50, Math.max(1, Math.round(Number(body.diferido_max_numeros)) || 10)));
+  if (body.venta_minima !== undefined) poner('venta_minima', Math.min(50, Math.max(1, Math.round(Number(body.venta_minima)) || 1)));
   if (body.recordatorios_programados !== undefined) poner('recordatorios_programados', JSON.stringify(limpiarProgramados(body.recordatorios_programados)));
   // Al volver a activarla deja de ser una rifa "cerrada a la vista"
   if (body.activa === true) poner('cerrada_visible', false);
@@ -117,7 +121,7 @@ async function guardar(db, rifaId, body = {}) {
   const r = await db.query(
     `UPDATE rifas SET ${sets.join(', ')} WHERE id = $${vals.length}
      RETURNING publicada, premios_extra, imagenes, premio_segundo, premio_tercero, pago_diferido, diferido_limite_horas, diferido_max_numeros,
-               recordatorios_programados, cerrada_visible`, vals);
+               recordatorios_programados, cerrada_visible, venta_minima`, vals);
   return r.rows[0] || null;
 }
 

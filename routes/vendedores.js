@@ -14,6 +14,13 @@ const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const vendedoresSvc = require('../services/vendedores');
 
+// Cifras de los números de cada categoría: 3 (000–999) o 4 (0000–9999).
+// Una rifa solo puede usar categorías de sus mismas cifras.
+pool.query(`ALTER TABLE categorias_globales ADD COLUMN IF NOT EXISTS cifras SMALLINT NOT NULL DEFAULT 3`)
+  .catch((e) => console.error('[categorias] esquema:', e.message));
+const cifrasDeCat = (cat) => (Number(cat?.cifras) === 4 ? 4 : 3);
+const formatoNumero = (cat) => new RegExp(`^\\d{${cifrasDeCat(cat)}}$`);
+
 /* ══════════════════════════════════════════════════════════════
    resolverSerie — fuente de verdad para decidir serie destino
 ══════════════════════════════════════════════════════════════ */
@@ -239,7 +246,7 @@ const catRouter = express.Router();
 catRouter.get('/', authMiddleware, soloDueno, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT cg.id,cg.nombre,cg.tipo,cg.monto,cg.descripcion,cg.created_at,
+      SELECT cg.id,cg.nombre,cg.tipo,cg.monto,cg.descripcion,cg.created_at,COALESCE(cg.cifras,3)::int AS cifras,
         (SELECT COUNT(DISTINCT cga.vendedor_id) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id)::int AS total_vendedores,
         (SELECT COUNT(*) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id)::int AS total_asignaciones,
         (SELECT COUNT(*) FROM cat_global_asignaciones cga WHERE cga.categoria_id=cg.id AND cga.serie='A')::int AS numeros_serie_a,
@@ -255,11 +262,13 @@ catRouter.post('/', authMiddleware, soloDueno, async (req, res) => {
   const { nombre, tipo='parcial', monto, descripcion } = req.body;
   if (!nombre?.trim()) return res.status(400).json({ error: 'El nombre es requerido' });
   if (!['parcial','simultanea'].includes(tipo)) return res.status(400).json({ error: 'Tipo inválido' });
+  const cifras = Number(req.body.cifras) || 3;
+  if (![3, 4].includes(cifras)) return res.status(400).json({ error: 'Las cifras deben ser 3 o 4' });
   try {
     const r = await pool.query(
-      `INSERT INTO categorias_globales (nombre,tipo,monto,descripcion,created_by)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id,nombre,tipo,monto,descripcion,created_at`,
-      [nombre.trim(), tipo, monto||null, descripcion||null, req.user?.id||null]
+      `INSERT INTO categorias_globales (nombre,tipo,monto,descripcion,created_by,cifras)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,nombre,tipo,monto,descripcion,created_at,cifras`,
+      [nombre.trim(), tipo, monto||null, descripcion||null, req.user?.id||null, cifras]
     );
     res.status(201).json({ ...r.rows[0], total_vendedores:0, total_asignaciones:0, numeros_serie_a:0, numeros_serie_b:0, total_numeros_definidos:0 });
   } catch (err) {
@@ -277,7 +286,7 @@ catRouter.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     if (descripcion!==undefined) { fields.push(`descripcion=$${i++}`); params.push(descripcion||null); }
     if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
     params.push(req.params.id);
-    const r = await pool.query(`UPDATE categorias_globales SET ${fields.join(',')},updated_at=now() WHERE id=$${i} RETURNING id,nombre,tipo,monto,descripcion`, params);
+    const r = await pool.query(`UPDATE categorias_globales SET ${fields.join(',')},updated_at=now() WHERE id=$${i} RETURNING id,nombre,tipo,monto,descripcion,cifras`, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
     res.json(r.rows[0]);
   } catch (err) {
@@ -299,7 +308,7 @@ catRouter.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, res) => {
   try {
-    const catR = await pool.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
+    const catR = await pool.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
     // v8: usa cat_categoria_vendedores como fuente de verdad; incluye vendedores sin números
     const r = await pool.query(`
@@ -343,13 +352,14 @@ catRouter.get('/:id/vendedores-resumen', authMiddleware, soloDueno, async (req, 
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/buscar-numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero } = req.query;
-  if (!numero || !/^\d{3}$/.test(numero))
-    return res.status(400).json({ error: 'numero debe ser 3 dígitos' });
+  if (!numero || !/^\d{3,4}$/.test(numero))
+    return res.status(400).json({ error: 'numero debe ser de 3 o 4 dígitos' });
 
   const client = await pool.connect();
   try {
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+    if (!formatoNumero(catR.rows[0]).test(numero)) return res.status(400).json({ error: `Esta categoría es de ${cifrasDeCat(catR.rows[0])} cifras` });
     const { tipo } = catR.rows[0];
 
     const r = await client.query(
@@ -400,13 +410,14 @@ catRouter.get('/:id/buscar-numero', authMiddleware, soloDueno, async (req, res) 
 ──────────────────────────────────────────────────────────────────*/
 catRouter.get('/:id/validar-numero', authMiddleware, soloDueno, async (req, res) => {
   const { numero, vendedor_id } = req.query;
-  if (!numero || !/^\d{3}$/.test(numero)) return res.status(400).json({ error: 'numero debe ser 3 dígitos' });
+  if (!numero || !/^\d{3,4}$/.test(numero)) return res.status(400).json({ error: 'numero debe ser de 3 o 4 dígitos' });
   if (!vendedor_id) return res.status(400).json({ error: 'vendedor_id es requerido' });
 
   const client = await pool.connect();
   try {
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
+    if (!formatoNumero(catR.rows[0]).test(numero)) return res.status(400).json({ error: `Esta categoría es de ${cifrasDeCat(catR.rows[0])} cifras` });
     const { tipo } = catR.rows[0];
 
     const enPoolR = await client.query(
@@ -449,15 +460,20 @@ catRouter.post('/:id/vendedores/:vendedorId/numeros', authMiddleware, soloDueno,
   if (!Array.isArray(numeros) || !numeros.length)
     return res.status(400).json({ error: 'numeros[] es requerido' });
 
-  const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
+  const invalidos = numeros.filter(n => !/^\d{3,4}$/.test(n));
   if (invalidos.length) return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Categoría no encontrada' }); }
+    const fueraDeFormato = numeros.filter(n => !formatoNumero(catR.rows[0]).test(n));
+    if (fueraDeFormato.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Esta categoría es de ${cifrasDeCat(catR.rows[0])} cifras. No valen: ${fueraDeFormato.slice(0, 10).join(', ')}${fueraDeFormato.length > 10 ? '…' : ''}` });
+    }
     const { tipo } = catR.rows[0];
 
     const vendR = await client.query('SELECT id,nombre,activo FROM users WHERE id=$1 AND rol=$2', [req.params.vendedorId, 'vendedor']);
@@ -588,7 +604,7 @@ catRouter.post('/:id/vendedores/:vendedorId/asignar', authMiddleware, soloDueno,
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1 FOR UPDATE', [req.params.id]);
     if (!catR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Categoría no encontrada' }); }
     const { tipo } = catR.rows[0];
     const vendR = await client.query('SELECT id,nombre,activo FROM users WHERE id=$1 AND rol=$2', [req.params.vendedorId, 'vendedor']);
@@ -616,7 +632,7 @@ catRouter.post('/:id/vendedores/:vendedorId/asignar', authMiddleware, soloDueno,
 catRouter.get('/:id/preview/:vendedorId', authMiddleware, soloDueno, async (req, res) => {
   const client = await pool.connect();
   try {
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1', [req.params.id]);
     if (!catR.rows[0]) return res.status(404).json({ error: 'Categoría no encontrada' });
     const { tipo } = catR.rows[0];
     const vendR = await client.query('SELECT id,nombre FROM users WHERE id=$1 AND rol=$2', [req.params.vendedorId, 'vendedor']);
@@ -670,14 +686,19 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
   if (!vendedor_id && !nombre?.trim())
     return res.status(400).json({ error: 'Indica vendedor_id o nombre del nuevo vendedor' });
 
-  const invalidos = numeros.filter(n => !/^\d{3}$/.test(n));
+  const invalidos = numeros.filter(n => !/^\d{3,4}$/.test(n));
   if (invalidos.length) return res.status(400).json({ error: `Números inválidos: ${invalidos.join(', ')}` });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const catR = await client.query('SELECT id,tipo FROM categorias_globales WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const catR = await client.query('SELECT id,tipo,cifras FROM categorias_globales WHERE id=$1 FOR UPDATE', [req.params.id]);
     if (!catR.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Categoría no encontrada' }); }
+    const fueraDeFormato = numeros.filter(n => !formatoNumero(catR.rows[0]).test(n));
+    if (fueraDeFormato.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Esta categoría es de ${cifrasDeCat(catR.rows[0])} cifras. No valen: ${fueraDeFormato.slice(0, 10).join(', ')}${fueraDeFormato.length > 10 ? '…' : ''}` });
+    }
     const { tipo } = catR.rows[0];
 
     let vendedorFinal; let credencialesGeneradas=null;

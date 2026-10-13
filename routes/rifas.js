@@ -106,6 +106,21 @@ async function sincronizarVendedoresRifa(client, rifa_id, vendedores_ids, vended
   );
   if (Number(cifrasR.rows[0]?.cifras) === 2) return;
 
+  // La categoría tiene que ser de las mismas cifras que la rifa (3 con 3, 4 con 4):
+  // si no, sus números fijos no caben en la rifa.
+  const cifrasRifa = Number(cifrasR.rows[0]?.cifras) || 3;
+  if (vendedores_categorias.length > 0) {
+    const idsCat = [...new Set(vendedores_categorias.map((v) => String(v.categoria_id)))];
+    const cats = await client.query(
+      `SELECT nombre, COALESCE(cifras, 3)::int AS cifras FROM categorias_globales WHERE id::text = ANY($1::text[])`, [idsCat]);
+    const distinta = cats.rows.find((c) => Number(c.cifras) !== cifrasRifa);
+    if (distinta) {
+      const e = new Error(`La categoría "${distinta.nombre}" es de ${distinta.cifras} cifras y esta rifa es de ${cifrasRifa}. Elige una categoría de ${cifrasRifa} cifras.`);
+      e.status = 400;
+      throw e;
+    }
+  }
+
   if (vendedores_categorias.length > 0) {
     const colCheck = await client.query(
       `SELECT 1 FROM information_schema.columns
@@ -457,8 +472,8 @@ router.post('/', authMiddleware, soloDueno, async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Error creando rifa:', err);
-    res.status(500).json({ error: 'Error del servidor' });
+    if (!err.status) console.error('Error creando rifa:', err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Error del servidor' });
   } finally {
     client.release();
   }
@@ -593,8 +608,8 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Error actualizando rifa:', err);
-    res.status(500).json({ error: 'Error del servidor' });
+    if (!err.status) console.error('Error actualizando rifa:', err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Error del servidor' });
   } finally {
     client.release();
   }

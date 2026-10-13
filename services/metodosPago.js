@@ -130,9 +130,12 @@ recargar();
 setInterval(() => recargar(), 60 * 1000).unref();
 
 async function obtenerTasas() {
-  const r = await pool.query(`SELECT clave, valor FROM config_tasas WHERE clave IN ('COP_POR_USD','BSD_POR_USD')`);
+  const r = await pool.query(`SELECT clave, valor FROM config_tasas WHERE clave IN ('COP_POR_USD','BSD_POR_USD','COP_POR_USD_BS')`);
   const t = Object.fromEntries(r.rows.map((x) => [x.clave, parseFloat(x.valor)]));
-  return { copUsd: t.COP_POR_USD || 4200, bsdUsd: t.BSD_POR_USD || 0 };
+  const copUsd = t.COP_POR_USD || 4200;
+  // copUsd: solo para Zelle (pesos → dólares). copUsdBs: solo para pasar los pesos a bolívares.
+  // Van separadas: cambiar la de Zelle no mueve lo que se cobra por Pago Móvil.
+  return { copUsd, copUsdBs: t.COP_POR_USD_BS || copUsd, bsdUsd: t.BSD_POR_USD || 0 };
 }
 
 // Monto en la moneda del método, igual que calcularPrecioMetodo de la pantalla del cliente
@@ -143,7 +146,8 @@ function montoEnMetodo(totalCOP, metodo, tasas) {
   const usd = totalCOP / tasas.copUsd;
   if (m.moneda === 'USD') return { moneda: 'USD', valor: +usd.toFixed(2), texto: `$${usd.toFixed(2)} USD` };
   if (!tasas.bsdUsd) return { moneda: 'COP', valor: totalCOP, texto: fmtCOP(totalCOP), sinTasa: true };
-  const bs = usd * tasas.bsdUsd;
+  // Regla de tres con su propia tasa de pesos: pesos ÷ (pesos por dólar para Bs) × (Bs por dólar)
+  const bs = (totalCOP / (tasas.copUsdBs || tasas.copUsd)) * tasas.bsdUsd;
   return {
     moneda: 'VES', valor: +bs.toFixed(2),
     texto: `Bs. ${bs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,

@@ -14,6 +14,7 @@ const { authMiddleware, soloDueno } = require('../middleware/auth');
 const FUENTES = {
   BSD_POR_USD: ['manual', 'bcv', 'paralelo'],
   COP_POR_USD: ['manual', 'oficial'],
+  COP_POR_USD_BS: ['manual', 'oficial'],
 };
 const NOMBRE_FUENTE = { bcv: 'BCV (oficial)', paralelo: 'dólar paralelo', oficial: 'dólar oficial de Colombia' };
 
@@ -23,7 +24,15 @@ const esquemaListo = pool.query(`
     fuente       VARCHAR(20) NOT NULL DEFAULT 'manual',
     revisado_at  TIMESTAMPTZ,
     error        TEXT
-  )`).catch((e) => console.error('[tasas] esquema:', e.message));
+  )`)
+  // Tasa de pesos SOLO para calcular los bolívares (antes se usaba la misma de Zelle).
+  // Nace con el valor que tenga la de Zelle, para que ningún monto cambie al crearla.
+  .then(() => pool.query(`
+    INSERT INTO config_tasas (clave, valor, descripcion, updated_at)
+    SELECT 'COP_POR_USD_BS', valor, 'Pesos colombianos por 1 dólar, solo para calcular los bolívares de Pago Móvil', NOW()
+      FROM config_tasas WHERE clave = 'COP_POR_USD'
+    ON CONFLICT (clave) DO NOTHING`))
+  .catch((e) => console.error('[tasas] esquema:', e.message));
 
 async function traer(url) {
   const r = await fetch(url, { signal: AbortSignal.timeout(9000) });

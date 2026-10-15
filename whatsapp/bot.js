@@ -26,6 +26,7 @@ const envios = require('./envios');
 const resultados = require('../services/resultados');
 const herramientasDueno = require('./herramientasDueno');
 const ganadores = require('../services/ganadores');
+const publicaciones = require('../services/publicacionesResultado');
 const grupo = require('./grupo');
 const opciones = require('../services/rifaOpciones');
 const recordatorios = require('./recordatorios');
@@ -384,6 +385,15 @@ const HERRAMIENTAS = [
     parametros: { type: 'object', properties: {}, required: [] },
   },
   {
+    nombre: 'enviar_resultado_publicado',
+    descripcion: 'Envía la PUBLICACIÓN OFICIAL del resultado de un sorteo (la imagen con el mensaje completo: sorteo, número ganador, premio, quién lo vendió). La manda el SISTEMA. Úsala cuando pregunten por el resultado de un sorteo que tenga publicacion_id en ver_resultados (o por "el último resultado" sin decir cuál). Nunca mandes la de otro sorteo distinto al que preguntan.',
+    parametros: {
+      type: 'object',
+      properties: { publicacion_id: { type: 'integer', description: 'El publicacion_id que trae ver_resultados' } },
+      required: ['publicacion_id'],
+    },
+  },
+  {
     nombre: 'enviar_foto_ganador',
     descripcion: 'Envía por WhatsApp la foto del ganador de un sorteo (la manda el SISTEMA después de tu mensaje). Úsala cuando respondas qué número cayó o quién ganó y ese resultado tenga foto_ganador_id en ver_resultados. Solo las fotos del sorteo por el que preguntan.',
     parametros: {
@@ -525,13 +535,21 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
         case 'ver_resultados': {
           const sorteos = await resultados.sorteosRecientes(21);
           if (!sorteos.length) return { sorteos: [], nota: 'No hay sorteos recientes.' };
-          const sinCargar = sorteos.filter((s) => s.ya_sorteo && !s.resultados.length);
-          if (sinCargar.length) efectos.resultadoFaltante = sinCargar[0];
           const fotos = await ganadores.fotosDeResultados(sorteos.slice(0, 6)).catch(() => new Map());
+          // Publicaciones del módulo Resultados (imagen + mensaje oficial), por sorteo
+          const pubs = await publicaciones.recientes(30);
+          const pubDe = (s) => pubs.find((p) => p.rifa_id === s.id) || null;
+          // Sin número cargado ni publicación: se le pide al dueño
+          const sinCargar = sorteos.filter((s) => s.ya_sorteo && !s.resultados.length && !pubDe(s));
+          if (sinCargar.length) efectos.resultadoFaltante = sinCargar[0];
+          const sueltas = pubs.filter((p) => !p.rifa_id || !sorteos.slice(0, 6).some((s) => s.id === p.rifa_id));
           return {
+            ...(pubs.length ? { nota_publicaciones: 'Si preguntan por un sorteo con publicacion_id, usa enviar_resultado_publicado: el sistema le manda la imagen con el mensaje oficial. Tú solo escribe una frase corta y natural (ej: "¡Aquí tienes el resultado! 👇"), sin repetir los datos.' } : {}),
             ...(fotos.size ? { nota_fotos: 'Los resultados con foto_ganador_id tienen foto del ganador: si te preguntan por ese sorteo, envíala con enviar_foto_ganador.' } : {}),
+            ...(sueltas.length ? { otras_publicaciones: sueltas.slice(0, 4).map((p) => ({ publicacion_id: Number(p.id), titulo: p.titulo, fecha: p.fecha, numero_ganador: p.numero || null })) } : {}),
             sorteos: sorteos.slice(0, 6).map((s) => ({
               rifa: s.nombre, fecha: s.fecha_sorteo, hora: s.hora_sorteo?.slice(0, 5) || null, loteria: s.loteria_ref || null,
+              ...(pubDe(s) ? { publicacion_id: Number(pubDe(s).id), ...(pubDe(s).numero && !s.resultados.length ? { numero_ganador_publicado: pubDe(s).numero } : {}) } : {}),
               ...(s.resultados.length
                 ? { resultados: s.resultados.map((x) => ({
                     premio: x.premio, numero_ganador: x.numero, ...(x.serie ? { serie: x.serie } : {}),
@@ -541,9 +559,19 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
                         : 'lo vendió uno de nuestros vendedores; el nombre del ganador se anuncia pronto'),
                     ...(fotos.has(x.id) ? { foto_ganador_id: fotos.get(x.id).id } : {}),
                   })) }
+                : pubDe(s)
+                  ? { resultados: `Publicado: ${pubDe(s).numero ? `cayó el ${pubDe(s).numero}. ` : ''}Envíale la publicación oficial con enviar_resultado_publicado (publicacion_id ${Number(pubDe(s).id)}).` }
                 : { resultados: s.ya_sorteo ? 'AÚN NO CARGADO: dile que todavía no tienes el resultado confirmado y que apenas lo tengan se lo dices. No lo inventes.' : 'El sorteo todavía no se ha hecho.' }),
             })),
           };
+        }
+        case 'enviar_resultado_publicado': {
+          const p = await publicaciones.porId(Number(args.publicacion_id));
+          if (!p) return { error: 'Esa publicación no existe o está oculta. Responde con los datos de ver_resultados.' };
+          if (!prueba && yaAvisado(`resultado_pub_${p.id}`, jid, 6)) return { ok: true, nota: 'Esa publicación ya se la enviaste hace poco en este chat; no la repitas.' };
+          efectos.fotos = [...(efectos.fotos || []), { url: p.imagen_url, caption: await publicaciones.textoParaGrupo(p) }];
+          efectos.fotosPrimero = true;
+          return { ok: true, nota: 'El SISTEMA le acaba de enviar la imagen con el mensaje oficial del resultado (sale ANTES de tu texto). Escribe solo una frase corta que la acompañe (ej: "¡Ahí lo tienes! Felicidades al ganador 🎉"), sin repetir el número ni los datos.' };
         }
         case 'enviar_foto_ganador': {
           const lista = await ganadores.porIds(args.foto_ids);
@@ -838,7 +866,7 @@ function describirEstado(ec, cfg) {
 
 // ── Modo dueño: trato especial y acceso a la información del negocio ──
 const HERRAMIENTAS_PARA_DUENO = () => [
-  ...HERRAMIENTAS.filter((h) => ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_foto_ganador'].includes(h.nombre)),
+  ...HERRAMIENTAS.filter((h) => ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_resultado_publicado', 'enviar_foto_ganador'].includes(h.nombre)),
   ...herramientasDueno.DEFINICIONES,
 ];
 
@@ -896,6 +924,8 @@ CÓMO VENDER
 
 RESULTADOS DE LOS SORTEOS
 - Si preguntan qué número salió, los resultados o quién ganó, usa ver_resultados y responde con lo que devuelva: el número ganador y el ganador si ya se anunció.
+- Si el sorteo por el que preguntan tiene publicacion_id (la publicación oficial del resultado), envíala con enviar_resultado_publicado: le llega la imagen con el mensaje completo. En ese caso tu texto es solo una frase corta para acompañarla; no repitas los datos ni mandes además la foto del ganador.
+- Si preguntan por una rifa que no aparece en ver_resultados (por ejemplo "la de la moto" y no hay ninguna así), dilo con naturalidad; no le mandes el resultado de otro sorteo.
 - Si el cliente compró, dile con tacto si su número salió o no (mira sus compras recientes en el contexto).
 - Si el resultado aún no está cargado, dilo con naturalidad ("todavía no lo tengo confirmado, apenas esté te aviso") y no lo inventes.
 - Si el resultado por el que preguntan trae foto_ganador_id, envía la foto del ganador con enviar_foto_ganador (la manda el sistema después de tu mensaje). Si no trae, no ofrezcas ni prometas foto.
@@ -994,6 +1024,12 @@ async function turnoIA(jid, chat, items, cfg, { notaDueno = null } = {}) {
     return [];
   }
 
+  // La publicación oficial de un resultado va primero (la imagen con su mensaje) y la frase del bot después
+  if (efectos.fotosPrimero && efectos.fotos?.length) {
+    await enviarFotos(jid, efectos.fotos).catch((e) => console.error('❌ [Bot] No se pudo enviar la foto:', e.message));
+    efectos.fotos = [];
+    await sleep(azar(700, 1400));
+  }
   if (resultado.texto) await responder(jid, resultado.texto, cfg);
   else if (efectos.pasadoAHumano) {
     // La IA pasó el chat a una persona pero no redactó el aviso: se lo dice el sistema
@@ -1383,7 +1419,7 @@ setInterval(() => revisarApartadosVencidos().catch((e) => console.error('❌ [Bo
 // Solo herramientas de consulta y en modo prueba (no escribe nada en la BD):
 // en el grupo no se aparta, no se cobra ni se piden datos.
 // ─────────────────────────────────────────────────────────────
-const HERRAMIENTAS_GRUPO = ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_foto_ganador'];
+const HERRAMIENTAS_GRUPO = ['ver_rifas', 'consultar_numeros', 'numeros_disponibles', 'ver_resultados', 'enviar_resultado_publicado', 'enviar_foto_ganador'];
 
 async function responderEnGrupo(pregunta, nombre) {
   const cfg = await obtenerConfig();

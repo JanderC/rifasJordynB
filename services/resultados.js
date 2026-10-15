@@ -76,7 +76,8 @@ async function quienTiene(rifaId, numero) {
 
 // Normaliza el número a las cifras de la rifa y registra (o corrige) el resultado.
 // Si no se indica el ganador, se deduce de quién tenía el número.
-async function registrar({ rifaId, numero, premio = 'Premio mayor', serie = null, ganador = null }) {
+// anunciar=false: no dispara el aviso automático al grupo (lo usa el módulo Resultados, que publica el suyo)
+async function registrar({ rifaId, numero, premio = 'Premio mayor', serie = null, ganador = null, anunciar = true }) {
   await tablaLista;
   const r = await pool.query(`SELECT id, nombre, COALESCE(cifras, 3) AS cifras FROM rifas WHERE id = $1`, [rifaId]);
   const rifa = r.rows[0];
@@ -104,7 +105,7 @@ async function registrar({ rifaId, numero, premio = 'Premio mayor', serie = null
     ON CONFLICT (rifa_id, premio) DO UPDATE
       SET numero = EXCLUDED.numero, serie = EXCLUDED.serie, ganador = EXCLUDED.ganador, detalle = EXCLUDED.detalle, created_at = NOW()
     RETURNING *`, [rifaId, String(premio).trim() || 'Premio mayor', num, serie ? serie.toUpperCase() : null, ganador || null, detalle]);
-  bus.emit('resultado:registrado', { rifaId });   // el bot lo anuncia en el grupo de WhatsApp
+  if (anunciar) bus.emit('resultado:registrado', { rifaId });   // el bot lo anuncia en el grupo de WhatsApp
   return { ...ins.rows[0], rifa: rifa.nombre, tenencia: t };
 }
 

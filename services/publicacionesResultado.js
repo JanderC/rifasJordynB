@@ -45,12 +45,13 @@ async function textoParaGrupo(r) {
   });
 }
 
-// Publicaciones visibles recientes, la más nueva primero
+// Publicaciones recientes, la más nueva primero. "Mostrar en la página" solo decide si salen
+// en la página del cliente: al bot le sirven igual para responder.
 async function recientes(dias = 30) {
   const r = await pool.query(
     `SELECT id, titulo, descripcion, rifa_id, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, numero, vendido_por, mensaje, created_at
        FROM resultados_publicados
-      WHERE visible AND COALESCE(fecha, created_at::date) >= (NOW() AT TIME ZONE 'America/Caracas')::date - $1::int
+      WHERE COALESCE(fecha, created_at::date) >= (NOW() AT TIME ZONE 'America/Caracas')::date - $1::int
       ORDER BY fecha DESC NULLS LAST, created_at DESC
       LIMIT 20`, [dias]).catch(() => ({ rows: [] }));   // la tabla puede no existir todavía
   return r.rows;
@@ -59,7 +60,7 @@ async function recientes(dias = 30) {
 async function porId(id) {
   const r = await pool.query(
     `SELECT id, titulo, descripcion, rifa_id, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, numero, vendido_por, mensaje
-       FROM resultados_publicados WHERE id = $1 AND visible`, [id]).catch(() => ({ rows: [] }));
+       FROM resultados_publicados WHERE id = $1`, [id]).catch(() => ({ rows: [] }));
   return r.rows[0] || null;
 }
 

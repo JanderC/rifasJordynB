@@ -37,6 +37,18 @@ const tablaLista = (async () => {
 
 const { textoParaGrupo } = require('../services/publicacionesResultado');
 
+// El número de la publicación pasa a ser el resultado del sorteo: así el bot, la búsqueda
+// de ganadores y todo lo demás usan lo que se cargó aquí (una sola fuente).
+async function sincronizarNumero(r) {
+  if (!r?.rifa_id || !r.numero) return null;
+  try {
+    const actual = (await pool.query(`SELECT numero FROM rifa_resultados WHERE rifa_id = $1 AND premio = 'Premio mayor'`, [r.rifa_id]).catch(() => ({ rows: [] }))).rows[0];
+    if (actual && String(actual.numero).trim() === String(r.numero).trim()) return null;
+    await resultadosSvc.registrar({ rifaId: r.rifa_id, numero: r.numero, premio: 'Premio mayor', anunciar: false });
+    return true;
+  } catch (e) { console.error('[Resultados] No se pudo guardar el número como resultado:', e.message); return false; }
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },   // 10MB máx
@@ -152,6 +164,7 @@ router.post('/', authMiddleware, soloDueno, recibirImagen, async (req, res) => {
        req.body.visible === undefined ? true : esVerdadero(req.body.visible),
        limpio(req.body.numero, 8), limpio(req.body.vendido_por, 120), limpio(req.body.mensaje, 1000)]);
     let resultado = r.rows[0];
+    await sincronizarNumero(resultado);
     let grupoInfo = null;
     if (esVerdadero(req.body.enviar_grupo)) {
       grupoInfo = await enviarAlGrupo(resultado);
@@ -203,6 +216,7 @@ router.put('/:id', authMiddleware, soloDueno, recibirImagen, async (req, res) =>
        urlNueva, esVerdadero(req.body.visible), req.params.id,
        limpio(req.body.numero, 8), limpio(req.body.vendido_por, 120), limpio(req.body.mensaje, 1000)]);
     if (urlNueva) await eliminarImagen(extraerPublicId(actual.rows[0].imagen_url));
+    await sincronizarNumero(r.rows[0]);
     res.json(r.rows[0]);
   } catch (err) {
     console.error('[Resultados] Error actualizando:', err);

@@ -312,8 +312,9 @@ const enviarManual = ({ texto, imagen }) => publicar({ tipo: 'manual', texto: St
 
 // Imagen de resultado publicada en el panel (módulo Resultados): el bot la manda al grupo.
 // Lanza un error claro si no se pudo (WhatsApp desconectado, sin grupo…).
-function enviarResultado(r) {
-  const texto = `🎉 *${r.titulo}*${r.fecha ? `\n📅 ${fmtFecha(r.fecha)}` : ''}${r.descripcion ? `\n\n${r.descripcion}` : ''}\n\n¡Gracias a todos por participar! 🍀`;
+// textoListo: el mensaje armado/ajustado en el panel (si no llega, el resumen de siempre)
+function enviarResultado(r, textoListo = null) {
+  const texto = textoListo || `🎉 *${r.titulo}*${r.fecha ? `\n📅 ${fmtFecha(r.fecha)}` : ''}${r.descripcion ? `\n\n${r.descripcion}` : ''}\n\n¡Gracias a todos por participar! 🍀`;
   return publicar({ tipo: 'resultado', texto, imagen: r.imagen_url, obligatorio: true });
 }
 

@@ -12,6 +12,7 @@ const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { cloudinary, eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 const grupo = require('../whatsapp/grupo');
+const resultadosSvc = require('../services/resultados');
 
 const tablaLista = (async () => {
   try {
@@ -27,8 +28,51 @@ const tablaLista = (async () => {
          enviado_grupo TIMESTAMPTZ,                        -- cuándo lo publicó el bot en el grupo
          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )`);
+    // Número que cayó, quién lo vendió y el texto que se manda al grupo (editable)
+    for (const col of ['numero TEXT', 'vendido_por TEXT', 'mensaje TEXT']) {
+      await pool.query(`ALTER TABLE resultados_publicados ADD COLUMN IF NOT EXISTS ${col}`);
+    }
   } catch (e) { console.error('[resultados] esquema:', e.message); }
 })();
+
+// ── Mensaje para el grupo ─────────────────────────────────────
+// El mismo armado que muestra el panel (pages/Resultados.js → mensajeResultado).
+const DIAS  = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+function fechaLarga(f) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(f || ''));
+  if (!m) return null;
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  return `${DIAS[d.getDay()]} ${+m[3]} de ${MESES[+m[2] - 1]} de ${m[1]}`;
+}
+function hora12(h) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(h || ''));
+  if (!m) return '';
+  const hh = +m[1];
+  return `${((hh + 11) % 12) + 1}:${m[2]} ${hh < 12 ? 'am' : 'pm'}`;
+}
+function mensajeResultado({ titulo, rifa, fecha, loteria, numero, premio, vendido_por: vendidoPor, descripcion }) {
+  const l = [`🎉 *${String(titulo || 'Resultado').toUpperCase()}* 🎉`, ''];
+  if (rifa) l.push(`🎟️ Sorteo: *${rifa}*`);
+  if (fecha) l.push(`📅 ${fecha}`);
+  if (loteria) l.push(`🎰 Lotería: ${loteria}`);
+  if (numero) l.push('', `🔢 Número ganador: *${numero}*`);
+  if (premio) l.push(`🏆 Premio: ${premio}`);
+  if (vendidoPor) l.push(`🤝 Vendido por: *${vendidoPor}*`);
+  if (descripcion) l.push('', descripcion);
+  l.push('', '¡Felicidades al ganador y gracias a todos por participar! 🍀');
+  return l.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+// Texto final: el que escribió/ajustó el dueño o, si no hay, el armado con los datos
+async function textoParaGrupo(r) {
+  if (r.mensaje && r.mensaje.trim()) return r.mensaje.trim();
+  const rifa = r.rifa_id ? (await pool.query(`SELECT nombre, premio, loteria_ref, hora_sorteo::text AS hora FROM rifas WHERE id = $1`, [r.rifa_id])).rows[0] : null;
+  return mensajeResultado({
+    titulo: r.titulo, rifa: rifa?.nombre, fecha: fechaLarga(r.fecha),
+    loteria: rifa?.loteria_ref ? `${rifa.loteria_ref}${hora12(rifa.hora) ? ` · ${hora12(rifa.hora)}` : ''}` : null,
+    numero: r.numero, premio: rifa?.premio, vendido_por: r.vendido_por, descripcion: r.descripcion,
+  });
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -57,7 +101,7 @@ function subirACloudinary(buffer) {
   });
 }
 
-const COLUMNAS = `id, titulo, descripcion, rifa_id, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, visible, enviado_grupo, created_at`;
+const COLUMNAS = `id, titulo, descripcion, rifa_id, TO_CHAR(fecha, 'YYYY-MM-DD') AS fecha, imagen_url, visible, enviado_grupo, created_at, numero, vendido_por, mensaje`;
 const ORDEN = `ORDER BY fecha DESC NULLS LAST, created_at DESC`;
 
 const limpio = (v, max) => { const t = String(v ?? '').trim().slice(0, max); return t || null; };
@@ -68,7 +112,7 @@ const esVerdadero = (v) => v === true || v === 'true' || v === '1';
 // El bot publica la imagen en el grupo. Devuelve { ok, error? } y marca cuándo salió.
 async function enviarAlGrupo(r) {
   try {
-    await grupo.enviarResultado(r);
+    await grupo.enviarResultado(r, await textoParaGrupo(r));
     const u = await pool.query(`UPDATE resultados_publicados SET enviado_grupo = NOW() WHERE id = $1 RETURNING ${COLUMNAS}`, [r.id]);
     return { ok: true, resultado: u.rows[0] };
   } catch (e) {
@@ -85,6 +129,32 @@ router.get('/', async (req, res) => {
     res.json(r.rows);
   } catch (err) {
     console.error('[Resultados] Error listando:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+// ── GET /api/resultados/sugerencia?rifa_id=&numero= ─────────
+// Para el panel: el número con las cifras de la rifa y quién lo vendió
+router.get('/sugerencia', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    const rifa = (await pool.query(`SELECT id, COALESCE(cifras, 3) AS cifras FROM rifas WHERE id = $1`, [uuidValido(req.query.rifa_id)])).rows[0];
+    const crudo = String(req.query.numero || '').replace(/\D/g, '');
+    if (!rifa || !crudo || crudo.length > Number(rifa.cifras)) return res.json({ numero: null, vendido_por: null, opciones: [] });
+    const numero = crudo.padStart(Number(rifa.cifras), '0');
+    const q = await resultadosSvc.quienTiene(rifa.id, numero);
+    // Quién lo vendió: el vendedor que lo tenía o la venta en línea con su comprador
+    const opciones = [...new Set([
+      ...q.ventas_registradas.map((v) => v.vendedor).filter(Boolean),
+      ...q.vendedores.map((v) => v.vendedor).filter(Boolean),
+      ...q.compradores_en_linea.map((c) => `${c.canal === 'whatsapp' ? 'Venta por WhatsApp' : 'Venta en línea'}${c.nombre ? ` (${c.nombre})` : ''}`),
+    ])];
+    res.json({
+      numero, vendido_por: opciones[0] || null, opciones,
+      comprador: q.ventas_registradas[0]?.nombre || q.compradores_en_linea[0]?.nombre || null,
+      libre: !opciones.length && !q.reservas_en_curso.length,
+    });
+  } catch (err) {
+    console.error('[Resultados] Error sugiriendo:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
@@ -113,10 +183,11 @@ router.post('/', authMiddleware, soloDueno, recibirImagen, async (req, res) => {
     await tablaLista;
     url = await subirACloudinary(req.file.buffer);
     const r = await pool.query(
-      `INSERT INTO resultados_publicados (titulo, descripcion, rifa_id, fecha, imagen_url, visible)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING ${COLUMNAS}`,
+      `INSERT INTO resultados_publicados (titulo, descripcion, rifa_id, fecha, imagen_url, visible, numero, vendido_por, mensaje)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ${COLUMNAS}`,
       [titulo, limpio(req.body.descripcion, 600), uuidValido(req.body.rifa_id), fechaValida(req.body.fecha), url,
-       req.body.visible === undefined ? true : esVerdadero(req.body.visible)]);
+       req.body.visible === undefined ? true : esVerdadero(req.body.visible),
+       limpio(req.body.numero, 8), limpio(req.body.vendido_por, 120), limpio(req.body.mensaje, 1000)]);
     let resultado = r.rows[0];
     let grupoInfo = null;
     if (esVerdadero(req.body.enviar_grupo)) {
@@ -162,10 +233,12 @@ router.put('/:id', authMiddleware, soloDueno, recibirImagen, async (req, res) =>
     const r = await pool.query(
       `UPDATE resultados_publicados
           SET titulo = $1, descripcion = $2, rifa_id = $3, fecha = $4,
-              imagen_url = COALESCE($5, imagen_url), visible = $6
+              imagen_url = COALESCE($5, imagen_url), visible = $6,
+              numero = $8, vendido_por = $9, mensaje = $10
         WHERE id = $7 RETURNING ${COLUMNAS}`,
       [titulo, limpio(req.body.descripcion, 600), uuidValido(req.body.rifa_id), fechaValida(req.body.fecha),
-       urlNueva, esVerdadero(req.body.visible), req.params.id]);
+       urlNueva, esVerdadero(req.body.visible), req.params.id,
+       limpio(req.body.numero, 8), limpio(req.body.vendido_por, 120), limpio(req.body.mensaje, 1000)]);
     if (urlNueva) await eliminarImagen(extraerPublicId(actual.rows[0].imagen_url));
     res.json(r.rows[0]);
   } catch (err) {
@@ -205,4 +278,5 @@ router.delete('/:id', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
+router.textoParaGrupo = textoParaGrupo;   // para las pruebas
 module.exports = router;

@@ -638,9 +638,15 @@ router.post('/reservar', async (req, res) => {
 
   try {
     await client.query('BEGIN');
+    // Lo que el cliente vio y escribió en el formulario: ayuda a verificar el pago en Reservas
+    const refCliente = String(req.body.referencia || '').replace(/[^\dA-Za-z]/g, '').slice(0, 20);
+    const montoTexto = String(req.body.monto_texto || '').slice(0, 40);
+    const comprobante_datos = refCliente || montoTexto
+      ? { metodo: metodo_pago || null, ...(montoTexto ? { monto_esperado: montoTexto } : {}), ...(refCliente ? { referencia_cliente: refCliente } : {}) }
+      : null;
     const r = await crearReservasTx(client, {
       rifa_id, numeros, nombre_cliente, cedula, correo, telefono, metodo_pago,
-      comprobanteUrl, comprobante_nombre, origen: 'web', pagador,
+      comprobanteUrl, comprobante_nombre, origen: 'web', pagador, comprobante_datos,
     });
     if (!r.ok) {
       await client.query('ROLLBACK');

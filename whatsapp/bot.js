@@ -568,7 +568,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
         case 'enviar_resultado_publicado': {
           const p = await publicaciones.porId(Number(args.publicacion_id));
           if (!p) return { error: 'Esa publicación no existe o está oculta. Responde con los datos de ver_resultados.' };
-          if (!prueba && yaAvisado(`resultado_pub_${p.id}`, jid, 6)) return { ok: true, nota: 'Esa publicación ya se la enviaste hace poco en este chat; no la repitas.' };
+          if (!prueba && !dueno.adminDe(jid, cfg) && yaAvisado(`resultado_pub_${p.id}`, jid, 6)) return { ok: true, nota: 'Esa publicación ya se la enviaste hace poco en este chat; no la repitas.' };
           // Por privado sale la plantilla "respuesta privada" (sin el nombre de quien lo vendió)
           efectos.fotos = [...(efectos.fotos || []), { url: p.imagen_url, caption: await publicaciones.textoPrivado(p) }];
           efectos.fotosPrimero = true;
@@ -886,6 +886,7 @@ QUÉ PUEDES HACER
 - Decirle qué vendedores tiene, los números fijos de cada uno y en qué rifas participa (dueno_vendedores).
 - Decirle cómo están repartidos los números de una rifa entre los vendedores y cuáles tiene cada uno (dueno_numeros_vendedores).
 - Consultar rifas, números disponibles y resultados, y mandarle la foto de un ganador (enviar_foto_ganador).
+- RESULTADOS: si te pregunta qué cayó o te pide el resultado de un sorteo, usa ver_resultados y, si ese sorteo tiene publicacion_id, mándale SIEMPRE la publicación oficial con enviar_resultado_publicado (la imagen con el mismo mensaje que recibe un cliente cuando pregunta). En tu texto, corto, puedes agregarle lo interno que no va en esa publicación (quién tenía el número). Si no tiene publicación, dale el número y dile que puede publicarla en el panel, módulo Resultados.
 Asignar, quitar o mover números entre vendedores todavía NO lo puedes hacer desde aquí: eso se hace en el panel (Rifas / Números Fijos). Dilo así si te lo pide, sin inventar que lo hiciste.
 Para saber el rifa_id usa dueno_rifas. Si menciona una rifa por nombre o día ("la del miércoles"), búscala ahí; si hay duda entre dos, pregúntale cuál.
 
@@ -1480,4 +1481,22 @@ async function probarConversacion(mensajesPrueba, estadoPrevio = null) {
   return { respuesta: texto, partes, llamadas, estado_compra: chatFalso.estado_compra };
 }
 
-module.exports = { cuentasPedidas, metodosEnTexto, atajoCuentas, PROMETE_DATOS, init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };
+// Igual que probarConversacion pero como si escribiera el dueño (no envía nada ni escribe en la BD)
+async function probarConversacionDueno(mensajesPrueba) {
+  const cfg = await obtenerConfig({ fresca: true });
+  const jidDueno = `${String(cfg.dueno?.telefono || '').replace(/\D/g, '')}@s.whatsapp.net`;
+  const admin = dueno.adminDe(jidDueno, cfg);
+  const chatFalso = { jid: jidDueno, nombre: 'Dueño (prueba)', telefono: null, estado_compra: null };
+  const llamadas = [];
+  const efectos = {};
+  const ejecutarReal = crearEjecutor(jidDueno, chatFalso, cfg, efectos, { prueba: true });
+  const ejecutar = async (nombre, args) => {
+    const r = await ejecutarReal(nombre, args);   // el ejecutor ya atiende también las herramientas del dueño
+    llamadas.push({ nombre, args, resultado: r });
+    return r;
+  };
+  const { texto } = await ia.chatConHerramientas(cfg, { system: construirSistemaDueno(cfg, admin), mensajes: mensajesPrueba, herramientas: HERRAMIENTAS_PARA_DUENO(), ejecutar, maxPasos: 5 });
+  return { respuesta: texto, fotos: efectos.fotos || [], llamadas, esDueno: !!admin };
+}
+
+module.exports = { probarConversacionDueno, cuentasPedidas, metodosEnTexto, atajoCuentas, PROMETE_DATOS, init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };

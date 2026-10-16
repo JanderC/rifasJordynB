@@ -53,6 +53,14 @@ const DEFECTO = {
     mensaje: '',                // texto propio con variables ({nombre}, {numeros}, {falta}…); vacío = el automático
     con_imagen: false,          // se envía con la foto principal de la rifa
   },
+  // Mensajes del resultado de un sorteo (módulo Resultados del panel). Variables:
+  // {titulo} {sorteo} {fecha} {hora} {loteria} {numero} {premio} {vendido_por} {descripcion}
+  // ({TITULO} en mayúsculas). Una línea con una variable vacía no se envía.
+  mensajes_resultado: {
+    grupo: '🎉 *{TITULO}* 🎉\n\n🎟️ Sorteo: *{sorteo}*\n📅 {fecha}\n⏰ {hora}\n🎰 Lotería: {loteria}\n\n🔢 Número ganador: *{numero}*\n🏆 Premio: {premio}\n🤝 Vendido por: *{vendido_por}*\n\n{descripcion}\n\n¡Felicidades al ganador y gracias a todos por participar! 🍀',
+    // Lo que el bot le manda a quien pregunta: sin el nombre de quien lo vendió
+    privado: '🎉 *{TITULO}* 🎉\n\n🎟️ Sorteo: *{sorteo}*\n📅 {fecha}\n⏰ {hora}\n🎰 Lotería: {loteria}\n\n🔢 Número ganador: *{numero}*\n🏆 Premio: {premio}\n\n{descripcion}\n\n¡Gracias por participar! 🍀 Pronto viene el próximo sorteo.',
+  },
   // El bot en el grupo de WhatsApp del negocio (avisos automáticos y respuestas si lo mencionan)
   grupo: {
     activo: true,

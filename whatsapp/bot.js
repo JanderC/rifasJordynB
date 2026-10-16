@@ -386,7 +386,7 @@ const HERRAMIENTAS = [
   },
   {
     nombre: 'enviar_resultado_publicado',
-    descripcion: 'Envía la PUBLICACIÓN OFICIAL del resultado de un sorteo (la imagen con el mensaje completo: sorteo, número ganador, premio, quién lo vendió). La manda el SISTEMA. Úsala cuando pregunten por el resultado de un sorteo que tenga publicacion_id en ver_resultados (o por "el último resultado" sin decir cuál). Nunca mandes la de otro sorteo distinto al que preguntan.',
+    descripcion: 'Envía la PUBLICACIÓN OFICIAL del resultado de un sorteo (la imagen con el mensaje completo: sorteo, número ganador, premio). La manda el SISTEMA. Úsala cuando pregunten por el resultado de un sorteo que tenga publicacion_id en ver_resultados (o por "el último resultado" sin decir cuál). Nunca mandes la de otro sorteo distinto al que preguntan.',
     parametros: {
       type: 'object',
       properties: { publicacion_id: { type: 'integer', description: 'El publicacion_id que trae ver_resultados' } },
@@ -569,7 +569,8 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           const p = await publicaciones.porId(Number(args.publicacion_id));
           if (!p) return { error: 'Esa publicación no existe o está oculta. Responde con los datos de ver_resultados.' };
           if (!prueba && yaAvisado(`resultado_pub_${p.id}`, jid, 6)) return { ok: true, nota: 'Esa publicación ya se la enviaste hace poco en este chat; no la repitas.' };
-          efectos.fotos = [...(efectos.fotos || []), { url: p.imagen_url, caption: await publicaciones.textoParaGrupo(p) }];
+          // Por privado sale la plantilla "respuesta privada" (sin el nombre de quien lo vendió)
+          efectos.fotos = [...(efectos.fotos || []), { url: p.imagen_url, caption: await publicaciones.textoPrivado(p) }];
           efectos.fotosPrimero = true;
           return { ok: true, nota: 'El SISTEMA le acaba de enviar la imagen con el mensaje oficial del resultado (sale ANTES de tu texto). Escribe solo una frase corta que la acompañe (ej: "¡Ahí lo tienes! Felicidades al ganador 🎉"), sin repetir el número ni los datos.' };
         }

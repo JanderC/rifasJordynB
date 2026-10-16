@@ -35,7 +35,9 @@ const tablaLista = (async () => {
   } catch (e) { console.error('[resultados] esquema:', e.message); }
 })();
 
-const { textoParaGrupo } = require('../services/publicacionesResultado');
+const publicacionesSvc = require('../services/publicacionesResultado');
+const { textoParaGrupo } = publicacionesSvc;
+const { guardarConfig, DEFECTO } = require('../whatsapp/botConfig');
 
 // El número de la publicación pasa a ser el resultado del sorteo: así el bot, la búsqueda
 // de ganadores y todo lo demás usan lo que se cargó aquí (una sola fuente).
@@ -106,6 +108,23 @@ router.get('/', async (req, res) => {
     console.error('[Resultados] Error listando:', err);
     res.status(500).json({ error: 'Error del servidor' });
   }
+});
+
+// ── GET/PUT /api/resultados/plantillas ─────────────────────
+// Las plantillas del mensaje del resultado: grupo y respuesta privada del bot
+router.get('/plantillas', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    res.json({ ...(await publicacionesSvc.plantillas()), defecto: DEFECTO.mensajes_resultado, variables: publicacionesSvc.VARIABLES });
+  } catch (err) { console.error('[Resultados] plantillas:', err); res.status(500).json({ error: 'Error del servidor' }); }
+});
+router.put('/plantillas', authMiddleware, soloDueno, async (req, res) => {
+  const grupo = String(req.body?.grupo ?? '').slice(0, 1500);
+  const privado = String(req.body?.privado ?? '').slice(0, 1500);
+  if (!grupo.trim() || !privado.trim()) return res.status(400).json({ error: 'Las dos plantillas deben tener texto' });
+  try {
+    await guardarConfig({ mensajes_resultado: { grupo, privado } });
+    res.json({ ...(await publicacionesSvc.plantillas()), defecto: DEFECTO.mensajes_resultado, variables: publicacionesSvc.VARIABLES });
+  } catch (err) { console.error('[Resultados] guardar plantillas:', err); res.status(500).json({ error: 'Error del servidor' }); }
 });
 
 // ── GET /api/resultados/sugerencia?rifa_id=&numero= ─────────

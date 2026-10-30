@@ -826,6 +826,40 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       }
     });
 
+    // Qué números de cada vendedor siguen libres (la imagen "Números disponibles").
+    // Las ventas no guardan la serie: la venta del propio vendedor consume una de sus
+    // series de ese número, y la de quien no lo tiene asignado (cliente por la página,
+    // el dueño) se le descuenta a quien lo tiene: mejor esconder uno libre que ofrecer
+    // uno vendido.
+    const maxVeces = esSimultanea ? 2 : 1;
+    const ventasPorVend = (await pool.query(
+      `SELECT numero, vendedor_id, COUNT(*)::int AS veces FROM ventas
+        WHERE rifa_id = $1 GROUP BY numero, vendedor_id`,
+      [rifa_id]
+    )).rows;
+    const asignados = {};
+    vendR.rows.forEach(v => (v.numeros_fijos || []).forEach(n => {
+      (asignados[n.numero] ||= new Set()).add(v.vendedor_id);
+    }));
+    const vecesTotal = {}, propias = {}, ajenas = {};
+    ventasPorVend.forEach(({ numero, vendedor_id, veces }) => {
+      vecesTotal[numero] = (vecesTotal[numero] || 0) + veces;
+      if (asignados[numero]?.has(vendedor_id)) propias[`${vendedor_id}|${numero}`] = veces;
+      else ajenas[numero] = (ajenas[numero] || 0) + veces;
+    });
+    reservR.rows.forEach(({ numero, veces }) => {
+      vecesTotal[numero] = (vecesTotal[numero] || 0) + veces;
+      ajenas[numero] = (ajenas[numero] || 0) + veces;
+    });
+    vendR.rows.forEach(v => {
+      const gastados = {};
+      (v.numeros_fijos || []).forEach(n => {
+        const gastar = (propias[`${v.vendedor_id}|${n.numero}`] || 0) + (ajenas[n.numero] || 0);
+        gastados[n.numero] = (gastados[n.numero] || 0) + 1;
+        n.disponible = (vecesTotal[n.numero] || 0) < maxVeces && gastados[n.numero] > gastar;
+      });
+    });
+
     for (let i = 0; i < 10 ** cifras; i++) {
       const numero   = String(i).padStart(cifras, '0');
       const ocupadas = ocupadasPorNum[numero] || new Set();

@@ -190,7 +190,7 @@ router.get('/directorio', authMiddleware, soloDueno, async (req, res) => {
 router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const [userR, numerosR, rifasR, ventasR] = await Promise.all([
-      pool.query('SELECT id,nombre,usuario,cedula,rol,activo,created_at FROM users WHERE id=$1', [req.params.id]),
+      pool.query('SELECT id,nombre,usuario,cedula,telefono,rol,activo,created_at FROM users WHERE id=$1', [req.params.id]),
       pool.query(`SELECT cvn.categoria_id, cg.nombre AS categoria_nombre, cg.tipo,
                   JSON_AGG(DISTINCT cvn.numero ORDER BY cvn.numero) AS numeros
                   FROM cat_vendedor_numeros cvn JOIN categorias_globales cg ON cg.id=cvn.categoria_id
@@ -209,9 +209,14 @@ router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, password, activo, cedula } = req.body;
+  const { nombre, password, activo, cedula, telefono } = req.body;
   try {
     const fields=[]; const params=[]; let i=1;
+    if (telefono!==undefined) {
+      const tel = String(telefono||'').replace(/\D/g,'');
+      if (tel && (tel.length<10 || tel.length>15)) return res.status(400).json({ error: 'Teléfono inválido. Ejemplo: 04121234567 o 573001234567' });
+      fields.push(`telefono=$${i++}`); params.push(tel||null);
+    }
     if (nombre)                     { fields.push(`nombre=$${i++}`);   params.push(nombre); }
     if (typeof activo==='boolean')  { fields.push(`activo=$${i++}`);   params.push(activo); }
     if (cedula!==undefined)         { fields.push(`cedula=$${i++}`);   params.push(cedula||null); }
@@ -221,7 +226,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     }
     if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
     params.push(req.params.id);
-    const r = await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING id,nombre,usuario,cedula,rol,activo`, params);
+    const r = await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING id,nombre,usuario,cedula,telefono,rol,activo`, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
     res.json({ message: 'Vendedor actualizado', vendedor: r.rows[0] });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }

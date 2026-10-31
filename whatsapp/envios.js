@@ -46,6 +46,10 @@ const tablaLista = (async () => {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_wa_envios_pendientes ON wa_envios (estado, proximo_at)`,
     `CREATE INDEX IF NOT EXISTS idx_wa_envios_reservas ON wa_envios USING GIN (reserva_ids)`,
+    // Imagen con los números de un vendedor (tipo 'numeros_vendedor')
+    `ALTER TABLE wa_envios ADD COLUMN IF NOT EXISTS rifa_id UUID`,
+    `ALTER TABLE wa_envios ADD COLUMN IF NOT EXISTS vendedor_id UUID`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS telefono VARCHAR(20)`,
   ];
   for (const sql of sqls) {
     try { await pool.query(sql); } catch (e) { console.error('[envios] esquema:', e.message); }
@@ -79,6 +83,10 @@ async function actualizar(id, cambios) {
 // Texto corto y natural para la foto (varía para no parecer plantilla)
 function textoTicket(envio, i, total) {
   const nombre = String(envio.nombre || '').trim().split(/\s+/)[0] || '';
+  if (envio.tipo === 'numeros_vendedor') {
+    const saludo = elegir([`¡Hola${nombre ? ' ' + nombre : ''}!`, `Hola${nombre ? ' ' + nombre : ''} 👋`, `¡Epa${nombre ? ' ' + nombre : ''}!`]);
+    return `${saludo} ${elegir([`Estos son tus números disponibles de *${envio.rifa}*.`, `Te paso tus números disponibles de *${envio.rifa}*.`])} ${elegir(['¡Buenas ventas! 🍀', '¡Mucho éxito con las ventas! 🙌'])}`;
+  }
   const num = envio.numeros[i] || envio.numeros[0];
   if (i > 0) return total > 1 ? `🎟️ ${num}` : '';
   const varios = envio.numeros.length > 1;
@@ -112,6 +120,34 @@ async function encolarTicket({ reservas, tickets = [], nota = null, destino }) {
   emitir(ins.rows[0]);
   despertar();
   return ins.rows[0];
+}
+
+// Imagen con los números de un vendedor. Pasa por la misma cola que los tickets.
+// Si ya tenía una sin salir, se cambia la imagen en vez de mandarle dos.
+async function encolarNumerosVendedor({ rifaId, rifaNombre, vendedorId, nombre, destino, imagenUrl }) {
+  await tablaLista;
+  const jid = t?.toJID ? t.toJID(destino) : destino;
+  const frio = !(await esTibio(jid));
+  const pendiente = await pool.query(`
+    UPDATE wa_envios SET imagenes = $1, jid = $2, frio = $3, estado = 'en_cola', error = NULL, proximo_at = NOW()
+     WHERE tipo = 'numeros_vendedor' AND rifa_id = $4 AND vendedor_id = $5 AND estado IN ('en_cola', 'esperando_cliente')
+     RETURNING *`, [[imagenUrl], jid, frio, rifaId, vendedorId]);
+  const envio = pendiente.rows[0] || (await pool.query(`
+    INSERT INTO wa_envios (tipo, rifa_id, vendedor_id, jid, nombre, rifa, imagenes, frio)
+    VALUES ('numeros_vendedor', $1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+  [rifaId, vendedorId, jid, nombre, rifaNombre, [imagenUrl], frio])).rows[0];
+  emitir(envio);
+  despertar();
+  return envio;
+}
+
+// El último envío a cada vendedor de una rifa
+async function estadoNumerosVendedor(rifaId) {
+  await tablaLista;
+  const r = await pool.query(`
+    SELECT DISTINCT ON (vendedor_id) vendedor_id, estado, error, frio, enviado_at FROM wa_envios
+     WHERE tipo = 'numeros_vendedor' AND rifa_id = $1 ORDER BY vendedor_id, id DESC`, [rifaId]);
+  return r.rows;
 }
 
 // El cliente escribió: sus envíos pendientes salen ya (ahora es "tibio")
@@ -148,6 +184,9 @@ async function ciclo() {
     await tablaLista;
     if (!t?.conectado()) return;
     const ab = (await obtenerConfig()).antiban;
+
+    // Los que esperaban por el tope diario vuelven a la cola cuando se cumple su espera
+    await pool.query(`UPDATE wa_envios SET estado = 'en_cola' WHERE estado = 'esperando_cliente' AND proximo_at <= NOW()`);
 
     // Los tibios primero; los fríos solo si toca según el ritmo dinámico
     const r = await pool.query(`
@@ -219,4 +258,4 @@ async function enviar(envio, ab) {
 // Revisión periódica (por si se reinició el servidor o toca un reintento)
 setInterval(() => ciclo(), 30 * 1000).unref();
 
-module.exports = { init, encolarTicket, clienteEscribio, reintentar, porReservas, tablaLista };
+module.exports = { init, encolarTicket, encolarNumerosVendedor, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };

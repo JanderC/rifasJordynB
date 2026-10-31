@@ -48,6 +48,7 @@ const CARPETAS = {
   rifas:         'rifas-jordyn/rifas',
   ticketDesigns: 'rifas-jordyn/ticket-designs',
   comprobantes:  'rifas-jordyn/comprobantes',
+  numerosVendedor: 'rifas-jordyn/numeros-vendedor',
 };
 
 // Misma transformación que usa uploadRifa en config/cloudinary.js

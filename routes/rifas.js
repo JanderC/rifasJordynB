@@ -10,6 +10,7 @@ const pool    = require('../config/db');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const { subirSiEsBase64, reemplazarBase64EnJson, CARPETAS, TRANSFORM_RIFA } = require('../services/imagenes');
 const opciones = require('../services/rifaOpciones');
+const envios   = require('../whatsapp/envios');
 
 /* ── Helper: valida array de ofertas ─────────────────────── */
 function validarOfertas(ofertas) {
@@ -729,6 +730,7 @@ router.put('/:id/ticket-design', authMiddleware, soloDueno, async (req, res) => 
 router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, res) => {
   try {
     const rifa_id = req.params.id;
+    await envios.tablaLista;   // agrega users.telefono
 
     const rifaR = await pool.query(
       `SELECT id, nombre, COALESCE(tipo, 'sencilla') AS tipo, categoria_seleccionada_id,
@@ -761,6 +763,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
         u.id              AS vendedor_id,
         u.nombre          AS vendedor_nombre,
         u.cedula,
+        u.telefono,
         COALESCE(
           JSON_AGG(
             JSON_BUILD_OBJECT(
@@ -775,7 +778,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       FROM miembros m
       JOIN users u ON u.id = m.vendedor_id
       LEFT JOIN numeros_unidos nu ON nu.vendedor_id = u.id
-      GROUP BY u.id, u.nombre, u.cedula
+      GROUP BY u.id, u.nombre, u.cedula, u.telefono
       ORDER BY u.nombre
     `, [rifa_id]);
 
@@ -880,6 +883,39 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
   } catch (err) {
     console.error('Error boleteria-vendedores:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/rifas/:id/envios-vendedores ───────────────────
+// Cómo va el envío por WhatsApp de la imagen a cada vendedor
+router.get('/:id/envios-vendedores', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await envios.estadoNumerosVendedor(req.params.id)); }
+  catch (err) { console.error('Error envios-vendedores:', err); res.status(500).json({ error: err.message }); }
+});
+
+// ── POST /api/rifas/:id/vendedores/:vendedorId/enviar-numeros ──
+// Recibe la imagen hecha en el panel y la deja en la cola del WhatsApp del sistema
+router.post('/:id/vendedores/:vendedorId/enviar-numeros', authMiddleware, soloDueno, async (req, res) => {
+  const { imagen } = req.body;
+  if (!/^data:image\/jpeg;base64,/.test(String(imagen || ''))) return res.status(400).json({ error: 'Imagen inválida' });
+  try {
+    await envios.tablaLista;
+    const [rifaR, vendR] = await Promise.all([
+      pool.query(`SELECT nombre FROM rifas WHERE id = $1`, [req.params.id]),
+      pool.query(`SELECT nombre, telefono FROM users WHERE id = $1 AND rol = 'vendedor'`, [req.params.vendedorId]),
+    ]);
+    if (!rifaR.rows[0]) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (!vendR.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
+    if (!vendR.rows[0].telefono) return res.status(400).json({ error: 'Ese vendedor no tiene teléfono' });
+    const imagenUrl = await subirSiEsBase64(imagen, { folder: CARPETAS.numerosVendedor });
+    const envio = await envios.encolarNumerosVendedor({
+      rifaId: req.params.id, rifaNombre: rifaR.rows[0].nombre, vendedorId: req.params.vendedorId,
+      nombre: vendR.rows[0].nombre, destino: vendR.rows[0].telefono, imagenUrl,
+    });
+    res.json({ estado: envio.estado });
+  } catch (err) {
+    console.error('Error enviar-numeros:', err);
+    res.status(500).json({ error: 'No se pudo dejar en la cola de WhatsApp' });
   }
 });
 

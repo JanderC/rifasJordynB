@@ -49,7 +49,7 @@ function dentroDeHorario(h) {
   const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   return hhmm >= (h.desde || '00:00') && hhmm <= (h.hasta || '23:59');
 }
-const fmtMonto = (n, cfg) => `${Number(n || 0).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
+const fmtMonto = (n, cfg, moneda) => `${Number(n || 0).toLocaleString('es-CO')} ${moneda === 'USD' ? 'dólares' : cfg.moneda || 'pesos'}`;
 const fmtFechaVE = () => ahoraVE().toLocaleString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' });
 
 // ── Estado en memoria (se reconstruye solo) ──────────────────
@@ -255,6 +255,9 @@ async function enviarCuentas(jid, chat, metodos, cfg) {
   const ec = chat.estado_compra;
   const efectos = {};
   let monto = null;
+  // Las rifas en dólares no se cobran por las cuentas en pesos
+  metodos = metodos.filter((m) => metodosPago.admiteMetodo(m, ec.moneda));
+  if (!metodos.length) metodos = metodosPago.metodosDeRifa(ec.moneda);
   for (const m of metodos) monto = await prepararPago(m, ec, efectos);
   const uno = metodos.length === 1 ? metodos[0] : null;
   const nuevo = { ...ec, metodo: uno, monto: uno ? monto : null, cuentas_enviadas: [...new Set([...(ec.cuentas_enviadas || []), ...metodos])] };
@@ -445,7 +448,7 @@ const HERRAMIENTAS = [
     parametros: {
       type: 'object',
       properties: {
-        monto: { type: 'number', description: 'Cuánto va a abonar ahora, en la moneda de los precios (pesos). Ej: 20000' },
+        monto: { type: 'number', description: 'Cuánto va a abonar ahora, en la moneda del precio de la rifa. Ej: 20000' },
         metodo_pago: { type: 'string', description: 'Método con el que paga, si ya lo dijo' },
         pagador: { type: 'string', description: 'Nombre de quien envía el pago, SOLO si el cliente ya lo dijo. Nunca lo pidas antes de enviar la cuenta' },
       },
@@ -483,7 +486,7 @@ async function prepararPago(metodo, ec, efectos) {
   if (!metodosPago.METODOS_PAGO[metodo]) throw new Error(`El método de pago "${metodo}" ya no está disponible`);
   const tasas = await metodosPago.obtenerTasas();
   // Si va a abonar una parte se cobra ese monto; si no, todo lo que falta
-  const monto = metodosPago.montoEnMetodo(ec.abono_monto || ec.total, metodo, tasas);
+  const monto = metodosPago.montoEnMetodo(ec.abono_monto || ec.total, metodo, tasas, ec.moneda);
   let msg = metodosPago.mensajeDePago(metodo, monto, { numeros: ec.numeros, rifa: ec.rifa_nombre });
   // Zelle y similares: hace falta saber quién envía, pero se le pide junto con la captura (no antes de darle la cuenta)
   if (metodosPago.pideTitular(metodo) && !ec.pagador) msg += '\n✍️ Con la captura dime también el nombre y apellido de quien envía el pago.';
@@ -589,10 +592,11 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
         case 'ver_rifas': {
           const rifas = await reservas.rifasEnVenta();
           if (!rifas.length) return { rifas: [], nota: 'No hay rifas en venta ahora mismo.' };
+          const tasasHoy = await metodosPago.obtenerTasas();
           return {
             rifas: rifas.map((r) => ({
-              rifa_id: r.id, nombre: r.nombre, premio: r.premio, precio_por_numero: fmtMonto(r.precio, cfg),
-              ofertas: (r.ofertas || []).map((o) => `${o.cantidad} números por ${fmtMonto(o.precio_total, cfg)}`),
+              rifa_id: r.id, nombre: r.nombre, premio: r.premio, precio_por_numero: fmtMonto(r.precio, cfg, r.moneda) + (r.moneda === 'USD' && tasasHoy.bsdUsd ? ` (hoy ${metodosPago.montoEnMetodo(Number(r.precio), Object.keys(metodosPago.METODOS_PAGO).find((m) => metodosPago.METODOS_PAGO[m].moneda === 'VES'), tasasHoy, 'USD').texto})` : ''),
+              ofertas: (r.ofertas || []).map((o) => `${o.cantidad} números por ${fmtMonto(o.precio_total, cfg, r.moneda)}`),
               sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' ') || 'por anunciar',
               loteria: r.loteria_ref || null,
               numeros_van_de: `${'0'.repeat(r.cifras)} a ${'9'.repeat(r.cifras)}`,
@@ -645,6 +649,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (metodo && metodosPago.METODOS_PAGO[metodo].presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
+          if (metodo && !metodosPago.admiteMetodo(metodo, rifa.moneda)) return { error: `Esta rifa está en dólares: se paga solo por ${metodosPago.metodosDeRifa(rifa.moneda).join(', ')}.` };
           const tit = metodo ? titularDelPago(metodo, args, chat.estado_compra) : { pagador: null };
           if (tit.error) return tit;
 
@@ -691,7 +696,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           const previo = ecPrevio?.paso === 'comprobante_sin_compra' ? ecPrevio.comprobante : null;
           let estado = {
             paso: 'esperando_comprobante',
-            rifa_id: rifa.id, rifa_nombre: rifa.nombre, numeros: nums,
+            rifa_id: rifa.id, rifa_nombre: rifa.nombre, moneda: rifa.moneda, numeros: nums,
             nombre: nombreCli, cedula: cedula || null, total, metodo,
             reservas: idsApartados, apartado_hasta: apartadoHasta.getTime(), desde: Date.now(),
             ...(diferido ? { diferido: true } : {}),
@@ -711,28 +716,28 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             efectos.comprobantePrevio = previo;
             delete efectos.mensajePago; delete efectos.mensajesPago;
             return {
-              ok: true, total_a_pagar: fmtMonto(total, cfg), numeros: nums,
+              ok: true, total_a_pagar: fmtMonto(total, cfg, rifa.moneda), numeros: nums,
               comprobante: 'El cliente YA envió una imagen de comprobante antes; el sistema la registrará automáticamente. Solo confírmale en una frase que ya la recibiste y que apenas se verifique el pago le llega su ticket.',
             };
           }
           if (diferido) {
             const hasta = opciones.fmtLimite(apartadoHasta);
             return {
-              ok: true, numeros_apartados_ahora: nums, todos_sus_apartados: estado.numeros, total: fmtMonto(total, cfg), puede_pagar_hasta: hasta,
+              ok: true, numeros_apartados_ahora: nums, todos_sus_apartados: estado.numeros, total: fmtMonto(total, cfg, rifa.moneda), puede_pagar_hasta: hasta,
               ...(metodo
                 ? { monto_en_su_metodo: estado.monto.texto, nota: notaPago(estado, minutos) }
                 : {
-                  metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial),
+                  metodos_disponibles: metodosPago.metodosDeRifa(rifa.moneda),
                   instruccion: `Quedaron APARTADOS sin pagar y puede pagar hasta el ${hasta}; si no paga a tiempo se liberan. Díselo en una o dos frases y pregúntale si quiere pagar de una vez (que te diga con qué método → elegir_metodo_pago) o después. Si paga después, dile que te escriba cuando vaya a pagar y que tú le recuerdas antes del sorteo.`,
                 }),
             };
           }
           if (metodo) {
-            return { ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg), monto_en_su_metodo: estado.monto.texto, nota: NOTA_PAGO_ENVIADO(minutos) };
+            return { ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg, rifa.moneda), monto_en_su_metodo: estado.monto.texto, nota: NOTA_PAGO_ENVIADO(minutos) };
           }
           return {
-            ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg),
-            metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial),
+            ok: true, numeros: nums, apartados_por: duracionTexto(minutos), total: fmtMonto(total, cfg, rifa.moneda),
+            metodos_disponibles: metodosPago.metodosDeRifa(rifa.moneda),
             instruccion: 'Ya quedaron apartados. Pregúntale con qué método va a pagar y luego usa elegir_metodo_pago.',
           };
         }
@@ -748,6 +753,7 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
           if (!enLinea.length) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere pagar en efectivo".' };
           }
+          if (enLinea.some((m) => !metodosPago.admiteMetodo(m, ec.moneda))) return { error: `Esta rifa está en dólares: se paga solo por ${metodosPago.metodosDeRifa(ec.moneda).join(', ')}.` };
           const tit = titularDelPago(enLinea[0], args, ec);
           // Elegir método sin hablar de abonar = paga todo lo que falta
           const base = { ...ec, abono_monto: null, pagador: tit.pagador };
@@ -788,24 +794,25 @@ function crearEjecutor(jid, chat, cfg, efectos, { prueba = false } = {}) {
             return { error: 'Los abonos solo aplican a números apartados para pagar después. Si es una compra normal, se paga completa.' };
           }
           const falta = Math.max(ec.total - (ec.por_confirmar || 0), 0);
-          const monto = Math.round(Number(args.monto));
+          const monto = Math.round(Number(args.monto) * 100) / 100;
           if (!(monto > 0)) return { error: 'Pregúntale cuánto va a abonar.' };
           if (falta <= 0) return { error: 'Ya envió el pago de todo lo que debía; está por confirmarse.' };
-          if (monto >= falta) return { error: `Ese monto cubre todo lo que le falta (${fmtMonto(falta, cfg)}): no es un abono. Usa elegir_metodo_pago para que pague el total pendiente.` };
+          if (monto >= falta) return { error: `Ese monto cubre todo lo que le falta (${fmtMonto(falta, cfg, ec.moneda)}): no es un abono. Usa elegir_metodo_pago para que pague el total pendiente.` };
           const metodo = args.metodo_pago ? metodosPago.normalizarMetodo(args.metodo_pago) : (ec.metodo || null);
           if (args.metodo_pago && !metodo) return { error: `Método no reconocido. Opciones: ${nombresMetodos.join(', ')}.` };
           if (metodo && metodosPago.METODOS_PAGO[metodo]?.presencial) {
             return { error: 'El pago en efectivo lo coordina una persona.', instruccion: 'Usa pasar_a_humano con motivo "Quiere abonar en efectivo".' };
           }
+          if (metodo && !metodosPago.admiteMetodo(metodo, ec.moneda)) return { error: `Esta rifa está en dólares: se paga solo por ${metodosPago.metodosDeRifa(ec.moneda).join(', ')}.` };
           const tit = metodo ? titularDelPago(metodo, args, ec) : { pagador: ec.pagador || null };
           const nuevo = { ...ec, abono_monto: monto, metodo: metodo || null, pagador: tit.pagador };
           if (metodo) nuevo.monto = await prepararPago(metodo, nuevo, efectos);
           if (!prueba) await chats.actualizarChat(jid, { estado_compra: nuevo });
           chat.estado_compra = nuevo;
-          const restante = fmtMonto(falta - monto, cfg);
+          const restante = fmtMonto(falta - monto, cfg, ec.moneda);
           return metodo
-            ? { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, nota: `${DATOS_YA_SALEN} (van con el monto del abono). Puedes agregar que después le quedarían ${restante} por pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.` }
-            : { ok: true, abono: fmtMonto(monto, cfg), le_quedaria_por_pagar: restante, metodos_disponibles: nombresMetodos.filter((m) => !metodosPago.METODOS_PAGO[m].presencial), instruccion: 'Pregúntale con qué método va a hacer el abono y vuelve a llamar abonar_apartado con monto y metodo_pago.' };
+            ? { ok: true, abono: fmtMonto(monto, cfg, ec.moneda), le_quedaria_por_pagar: restante, nota: `${DATOS_YA_SALEN} (van con el monto del abono). Puedes agregar que después le quedarían ${restante} por pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}.` }
+            : { ok: true, abono: fmtMonto(monto, cfg, ec.moneda), le_quedaria_por_pagar: restante, metodos_disponibles: metodosPago.metodosDeRifa(ec.moneda), instruccion: 'Pregúntale con qué método va a hacer el abono y vuelve a llamar abonar_apartado con monto y metodo_pago.' };
         }
         case 'cancelar_compra': {
           // Con abonos confirmados hay dinero de por medio: no lo libera el bot
@@ -847,13 +854,13 @@ function describirEstado(ec, cfg) {
   if (!ec?.paso) return 'Sin compra en curso.';
   if (ec.paso === 'esperando_comprobante') {
     const quedan = ec.apartado_hasta ? Math.max(0, Math.round((ec.apartado_hasta - Date.now()) / 60000)) : null;
-    return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg)}` +
+    return `Números APARTADOS esperando el comprobante: rifa "${ec.rifa_nombre}", números ${ec.numeros.join(', ')}, a nombre de ${ec.nombre}, total ${fmtMonto(ec.total, cfg, ec.moneda)}` +
       (ec.metodo ? `, paga por ${ec.metodo} (${ec.monto?.texto}); los datos de pago ya se le enviaron`
         : ec.cuentas_enviadas?.length ? `; ya se le enviaron los datos de pago de ${ec.cuentas_enviadas.join(', ')} (no le vuelvas a preguntar el método: paga con el que prefiera)`
         : ', todavía no dijo con qué método paga (pregúntale y usa elegir_metodo_pago)') +
       (ec.cuentas_enviadas?.length ? ` Si pide los datos de otro método o que se los repitas, llama elegir_metodo_pago otra vez.` : '') +
       (ec.diferido
-        ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan.${ec.abonado > 0 ? ` YA ABONÓ ${fmtMonto(ec.abonado, cfg)} de ${fmtMonto(ec.total_rifa, cfg)}: el "total" de arriba es lo que le FALTA` : ''}${ec.por_confirmar > 0 ? ` Tiene un abono de ${fmtMonto(ec.por_confirmar, cfg)} enviado que el equipo está por confirmar` : ''}${ec.abono_monto ? ` Dijo que ahora va a abonar ${fmtMonto(ec.abono_monto, cfg)}: espera la captura de ese abono` : ''}. Puede pagar todo lo que falta o ABONAR UNA PARTE (abonar_apartado) y el resto después. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
+        ? `. Son números APARTADOS PARA PAGAR DESPUÉS: puede pagar hasta el ${opciones.fmtLimite(new Date(ec.apartado_hasta))}; si no paga a tiempo se liberan.${ec.abonado > 0 ? ` YA ABONÓ ${fmtMonto(ec.abonado, cfg, ec.moneda)} de ${fmtMonto(ec.total_rifa, cfg, ec.moneda)}: el "total" de arriba es lo que le FALTA` : ''}${ec.por_confirmar > 0 ? ` Tiene un abono de ${fmtMonto(ec.por_confirmar, cfg, ec.moneda)} enviado que el equipo está por confirmar` : ''}${ec.abono_monto ? ` Dijo que ahora va a abonar ${fmtMonto(ec.abono_monto, cfg, ec.moneda)}: espera la captura de ese abono` : ''}. Puede pagar todo lo que falta o ABONAR UNA PARTE (abonar_apartado) y el resto después. No lo presiones: si quiere pagar ahora, que diga el método y mande la captura; si quiere apartar más números de esa rifa, usa preparar_compra (se suman a estos)`
         : (quedan != null ? `. Le quedan ${duracionTexto(quedan)} de apartado` : '')) + '. Si pregunta, recuérdale que mande la captura del pago.';
   }
   if (ec.paso === 'esperando_confirmacion')
@@ -904,7 +911,7 @@ function construirSistema(cfg, chat, notaDueno = null, compras = null) {
   const nombreCliente = chat.nombre_guardado || chat.nombre;
   return `${cfg.personalidad}
 
-Trabajas para "${cfg.nombre_negocio}". Los precios de los números están en ${cfg.moneda || 'pesos'}: nunca digas otra moneda (ni Bs ni USD) para los precios; el premio dilo tal como viene.${cfg.nombre_asistente ? ` Te llamas ${cfg.nombre_asistente}.` : ''}
+Trabajas para "${cfg.nombre_negocio}". Los precios de los números están en ${cfg.moneda || 'pesos'}, salvo las rifas que tus herramientas muestren en dólares: esas están ancladas al dólar, se pagan solo en bolívares o dólares y los Bs cambian cada día con la tasa. Di cada precio tal como viene en la herramienta, sin convertirlo tú; el premio dilo tal como viene.${cfg.nombre_asistente ? ` Te llamas ${cfg.nombre_asistente}.` : ''}
 
 CÓMO VENDER
 - Cuando el cliente pregunte por rifas o números, consulta con tus herramientas antes de responder. Si hay una sola rifa en venta, asume esa sin preguntar.
@@ -1162,7 +1169,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
         try {
           abonoCreado = await abonos.crear(pool, {
             g, jid, monto, metodo: ec.metodo || null, comprobanteUrl: url, origen: 'whatsapp', pagador: ec.pagador || null,
-            datos: { ...(datos || {}), metodo: ec.metodo || null, monto_declarado: monto, monto_esperado: ec.monto?.texto || fmtMonto(monto, cfg), total: g.total, abonado_antes: g.abonado },
+            datos: { ...(datos || {}), metodo: ec.metodo || null, monto_declarado: monto, monto_esperado: ec.monto?.texto || fmtMonto(monto, cfg, ec.moneda), total: g.total, abonado_antes: g.abonado },
           });
         } catch (e) {
           console.error('❌ [Bot] Error registrando abono:', e.message);
@@ -1175,11 +1182,11 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
         bus.emit('wa:reserva', { jid, numeros: g.numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: monto });
         await chats.guardarMensaje({
           jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-          texto: `💵 Abono recibido: ${fmtMonto(monto, cfg)} · ${ec.rifa_nombre} · números ${g.numeros.join(', ')}. Por confirmar en Reservas → Abonos.`,
+          texto: `💵 Abono recibido: ${fmtMonto(monto, cfg, ec.moneda)} · ${ec.rifa_nombre} · números ${g.numeros.join(', ')}. Por confirmar en Reservas → Abonos.`,
         });
         if (!silencioso) {
           await responder(jid, (restante > 0
-            ? `Recibí tu abono de *${fmtMonto(monto, cfg)}* ✅\n\nApenas lo verifiquemos te confirmo. Te quedarían ${fmtMonto(restante, cfg)} por pagar hasta el ${opciones.fmtLimite(g.limite)}.`
+            ? `Recibí tu abono de *${fmtMonto(monto, cfg, ec.moneda)}* ✅\n\nApenas lo verifiquemos te confirmo. Te quedarían ${fmtMonto(restante, cfg, ec.moneda)} por pagar hasta el ${opciones.fmtLimite(g.limite)}.`
             : `Recibí tu comprobante ✅ Con este pago completas el total.\n\nApenas lo verifiquemos te llega tu ticket por aquí.`) + (faltaPagador ? PREGUNTA_PAGADOR : ''), cfg);
         }
         return { ok: true, abono: true, numeros: g.numeros, rifa: ec.rifa_nombre, conflictos: [] };
@@ -1188,7 +1195,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
   }
 
   // Lo que el sistema le pidió pagar queda junto al comprobante para revisarlo en Reservas
-  datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg), ...(ec.pagador ? { enviado_por: ec.pagador } : {}) };
+  datos = { ...(datos || {}), metodo: ec.metodo || null, monto_esperado: ec.monto?.texto || fmtMonto(ec.total, cfg, ec.moneda), ...(ec.pagador ? { enviado_por: ec.pagador } : {}) };
   if (Number(datos.monto) && ec.monto?.valor && ec.monto.moneda === (/usd|\$/i.test(datos.moneda || '') ? 'USD' : /bs|ves|bol/i.test(datos.moneda || '') ? 'VES' : 'COP')) {
     datos.diferencia = +(Number(datos.monto) - Number(ec.monto.valor)).toFixed(2);
   }
@@ -1240,7 +1247,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
   const numeros = r.reservas.map((x) => String(x.numero).trim());
   await chats.actualizarChat(jid, {
     estado_compra: {
-      paso: 'esperando_confirmacion', rifa_id: ec.rifa_id, rifa_nombre: ec.rifa_nombre,
+      paso: 'esperando_confirmacion', rifa_id: ec.rifa_id, rifa_nombre: ec.rifa_nombre, moneda: ec.moneda,
       numeros, nombre: ec.nombre, total: ec.total, reservas: r.reservas.map((x) => x.id), desde: Date.now(),
       ...(faltaPagador ? { falta_pagador: true } : {}),
     },
@@ -1248,7 +1255,7 @@ async function procesarComprobante(jid, chat, imagen, cfg, { silencioso = false,
   bus.emit('wa:reserva', { jid, numeros, rifa: ec.rifa_nombre, nombre: ec.nombre, total: ec.total });
   await chats.guardarMensaje({
     jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-    texto: `🧾 Reserva creada: ${ec.rifa_nombre} · números ${numeros.join(', ')} · total ${fmtMonto(ec.total, cfg)}${datos?.referencia ? ` · ref ${datos.referencia}` : ''}. Pendiente de aprobar en Reservas.`,
+    texto: `🧾 Reserva creada: ${ec.rifa_nombre} · números ${numeros.join(', ')} · total ${fmtMonto(ec.total, cfg, ec.moneda)}${datos?.referencia ? ` · ref ${datos.referencia}` : ''}. Pendiente de aprobar en Reservas.`,
   });
 
   if (!silencioso) {
@@ -1329,7 +1336,7 @@ bus.on('abono:aprobado', async (info) => {
     if (!jid) return;
     const chat = await chats.obtenerChat(jid);
     if (chat) {
-      await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `✅ Abono confirmado · ${fmtMonto(info.abono.monto, cfg)} · números ${info.numeros.join(', ')}${info.completo ? ' · pago COMPLETO' : ` · falta ${fmtMonto(info.saldo, cfg)}`}` });
+      await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `✅ Abono confirmado · ${fmtMonto(info.abono.monto, cfg, info.rifa?.moneda)} · números ${info.numeros.join(', ')}${info.completo ? ' · pago COMPLETO' : ` · falta ${fmtMonto(info.saldo, cfg, info.rifa?.moneda)}`}` });
       // El chat queda con las cuentas al día (o esperando la aprobación final)
       if (info.completo) {
         await chats.actualizarChat(jid, { estado_compra: { paso: 'esperando_confirmacion', rifa_id: info.rifa.id, rifa_nombre: info.rifa.nombre, numeros: info.numeros, nombre: info.abono.nombre_cliente, total: info.total, reservas: info.abono.reserva_ids, desde: Date.now() } });
@@ -1340,8 +1347,8 @@ bus.on('abono:aprobado', async (info) => {
     if (!transporte?.conectado() || info.abono.origen === 'panel' && !chat) return;
     const primer = String(info.abono.nombre_cliente || '').split(' ')[0];
     await responder(jid, info.completo
-      ? `${primer ? `${primer}, c` : 'C'}onfirmamos tu pago de *${fmtMonto(info.abono.monto, cfg)}* ✅ Con eso completaste ${info.numeros.length > 1 ? 'los números' : 'el número'} ${info.numeros.join(', ')} de ${info.rifa.nombre}.\n\nEn un momento te llega tu ticket por aquí 🎟️`
-      : `${primer ? `${primer}, c` : 'C'}onfirmamos tu abono de *${fmtMonto(info.abono.monto, cfg)}* ✅\n\nLlevas abonado ${fmtMonto(info.abonado, cfg)} de ${fmtMonto(info.total, cfg)}. Te faltan *${fmtMonto(info.saldo, cfg)}*${info.limite ? ` y tienes hasta el ${opciones.fmtLimite(info.limite)}` : ''}.`, cfg);
+      ? `${primer ? `${primer}, c` : 'C'}onfirmamos tu pago de *${fmtMonto(info.abono.monto, cfg, info.rifa?.moneda)}* ✅ Con eso completaste ${info.numeros.length > 1 ? 'los números' : 'el número'} ${info.numeros.join(', ')} de ${info.rifa.nombre}.\n\nEn un momento te llega tu ticket por aquí 🎟️`
+      : `${primer ? `${primer}, c` : 'C'}onfirmamos tu abono de *${fmtMonto(info.abono.monto, cfg, info.rifa?.moneda)}* ✅\n\nLlevas abonado ${fmtMonto(info.abonado, cfg, info.rifa?.moneda)} de ${fmtMonto(info.total, cfg, info.rifa?.moneda)}. Te faltan *${fmtMonto(info.saldo, cfg, info.rifa?.moneda)}*${info.limite ? ` y tienes hasta el ${opciones.fmtLimite(info.limite)}` : ''}.`, cfg);
   } catch (e) { console.error('❌ [Bot] aviso de abono:', e.message); }
 });
 
@@ -1352,11 +1359,11 @@ bus.on('abono:rechazado', async (info) => {
     if (!jid) return;
     const chat = await chats.obtenerChat(jid);
     if (!chat) return;
-    await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `❌ Abono rechazado · ${fmtMonto(info.abono.monto, cfg)}${info.abono.nota_admin ? ` · ${info.abono.nota_admin}` : ''}` });
+    await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', texto: `❌ Abono rechazado · ${fmtMonto(info.abono.monto, cfg, info.rifa?.moneda)}${info.abono.nota_admin ? ` · ${info.abono.nota_admin}` : ''}` });
     await recordatorios.vincularApartados(jid, chat).catch(() => {});
     if (!cfg.avisar_rechazo || !transporte?.conectado()) return;
     const primer = String(info.abono.nombre_cliente || '').split(' ')[0];
-    await responder(jid, `Hola${primer ? ' ' + primer : ''}, no pudimos verificar tu abono de ${fmtMonto(info.abono.monto, cfg)} 😕${info.abono.nota_admin ? `\n\n${info.abono.nota_admin}` : ''}\n\nSi crees que es un error, escríbeme por aquí y lo revisamos.`, cfg);
+    await responder(jid, `Hola${primer ? ' ' + primer : ''}, no pudimos verificar tu abono de ${fmtMonto(info.abono.monto, cfg, info.rifa?.moneda)} 😕${info.abono.nota_admin ? `\n\n${info.abono.nota_admin}` : ''}\n\nSi crees que es un error, escríbeme por aquí y lo revisamos.`, cfg);
   } catch (e) { console.error('❌ [Bot] aviso de abono rechazado:', e.message); }
 });
 
@@ -1434,7 +1441,7 @@ Te mencionaron en el grupo${nombre ? ` (${nombre})` : ''}. Responde SOLO a lo qu
 REGLAS DEL GRUPO
 - Máximo 2 o 3 frases, en un solo mensaje, tono cercano. Sin listas ni títulos. Usa *un asterisco* para resaltar algo.
 - Solo información pública: rifas en venta, premios, precios, fechas de sorteo, si un número está libre, resultados y ganadores. Consúltala SIEMPRE con tus herramientas; nunca la inventes.
-- Los precios están en ${cfg.moneda || 'pesos'}.
+- Los precios están en ${cfg.moneda || 'pesos'}, salvo las rifas que tus herramientas muestren en dólares.
 - En el grupo NO se compra: no apartes números, no pidas nombre ni cédula y no des datos de pago ni cuentas. Si quiere comprar o apartar, dile que te escriba por privado y con gusto lo atiendes.
 - Nunca des datos de otros clientes (teléfonos, cédulas, nombres completos) ni información interna (vendedores, ventas, montos recaudados).
 - Reclamos, pagos o premios: dile que te escriba por privado.

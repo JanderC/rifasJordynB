@@ -11,6 +11,7 @@ const express = require('express');
 const router  = express.Router();
 const bcrypt  = require('bcryptjs');
 const pool    = require('../config/db');
+const { ventaEnPesos } = require('../services/metodosPago');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 const vendedoresSvc = require('../services/vendedores');
 
@@ -167,11 +168,12 @@ router.get('/', authMiddleware, soloDueno, async (req, res) => {
     const r = await pool.query(`
       SELECT u.id, u.nombre, u.usuario, u.cedula, u.rol, u.activo, u.created_at,
         COUNT(DISTINCT v.id)::int AS total_ventas,
-        COALESCE(SUM(v.precio_venta),0) AS total_ingresos,
+        COALESCE(SUM(${ventaEnPesos('v', 'rv')}),0) AS total_ingresos,
         COUNT(DISTINCT cvn.numero||cvn.categoria_id::text)::int AS numeros_count,
         COUNT(DISTINCT cvn.categoria_id)::int AS categorias_count
       FROM users u
       LEFT JOIN ventas v ON v.vendedor_id=u.id
+      LEFT JOIN rifas rv ON rv.id=v.rifa_id
       LEFT JOIN cat_vendedor_numeros cvn ON cvn.vendedor_id=u.id
       WHERE u.rol='vendedor'
       GROUP BY u.id,u.nombre,u.usuario,u.cedula,u.rol,u.activo,u.created_at

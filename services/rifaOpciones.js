@@ -14,6 +14,8 @@ const { eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 const esquemaListo = (async () => {
   const sqls = [
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS publicada BOOLEAN NOT NULL DEFAULT TRUE`,
+    // Moneda del precio: 'COP' o 'USD' (anclada al dólar). Precio, ofertas, ventas, abonos y caja van en esa moneda.
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS moneda VARCHAR(3) NOT NULL DEFAULT 'COP'`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premios_extra JSONB NOT NULL DEFAULT '[]'::jsonb`,
     // Más fotos de la rifa (además de la principal, imagen_url): se ven como carrusel en la página
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes JSONB NOT NULL DEFAULT '[]'::jsonb`,
@@ -71,7 +73,7 @@ const COLUMNAS = (a = 'r') => `
   ${a}.premio_segundo, ${a}.premio_tercero, COALESCE(${a}.imagenes, '[]'::jsonb) AS imagenes,
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros,
   COALESCE(${a}.recordatorios_programados, '[]'::jsonb) AS recordatorios_programados, COALESCE(${a}.cerrada_visible, FALSE) AS cerrada_visible,
-  COALESCE(${a}.venta_minima, 1)::int AS venta_minima`;
+  COALESCE(${a}.venta_minima, 1)::int AS venta_minima, ${a}.moneda`;
 
 // Momentos válidos, sin repetir y en orden (máximo 12)
 function limpiarProgramados(lista) {
@@ -98,6 +100,7 @@ async function guardar(db, rifaId, body = {}) {
   const vals = [];
   const poner = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
   if (typeof body.publicada === 'boolean') poner('publicada', body.publicada);
+  if (body.moneda === 'COP' || body.moneda === 'USD') poner('moneda', body.moneda);
   if (body.premios_extra !== undefined) poner('premios_extra', JSON.stringify(limpiarPremios(body.premios_extra)));
   if (body.imagenes !== undefined) {
     // Solo URLs ya subidas a Cloudinary (el panel las sube una por una); máximo 10
@@ -121,7 +124,7 @@ async function guardar(db, rifaId, body = {}) {
   const r = await db.query(
     `UPDATE rifas SET ${sets.join(', ')} WHERE id = $${vals.length}
      RETURNING publicada, premios_extra, imagenes, premio_segundo, premio_tercero, pago_diferido, diferido_limite_horas, diferido_max_numeros,
-               recordatorios_programados, cerrada_visible, venta_minima`, vals);
+               recordatorios_programados, cerrada_visible, venta_minima, moneda`, vals);
   return r.rows[0] || null;
 }
 

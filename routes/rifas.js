@@ -515,6 +515,20 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // Con ventas, reservas o caja la moneda no cambia: esos montos quedarían en la moneda equivocada
+    if (req.body.moneda === 'COP' || req.body.moneda === 'USD') {
+      const m = await client.query(`
+        SELECT moneda,
+               EXISTS (SELECT 1 FROM ventas WHERE rifa_id = rifas.id)
+               OR EXISTS (SELECT 1 FROM reservas_cliente WHERE rifa_id = rifas.id)
+               OR EXISTS (SELECT 1 FROM caja_semanas WHERE rifa_id = rifas.id) AS con_movimientos
+          FROM rifas WHERE id = $1`, [req.params.id]);
+      if (m.rows[0]?.con_movimientos && m.rows[0].moneda !== req.body.moneda) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Esta rifa ya tiene ventas o reservas: no se le puede cambiar la moneda. Crea una rifa nueva en esa moneda.' });
+      }
+    }
+
     // ✅ FIX: fecha_sorteo::text en RETURNING para evitar desfase UTC
     const result = await client.query(
       `UPDATE rifas SET

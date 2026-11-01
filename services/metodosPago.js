@@ -5,8 +5,10 @@
 //  Las cuentas se guardan en la BD (tabla metodos_pago) y el dueño las
 //  edita en el panel (Cuentas bancarias). METODOS_PAGO es la copia en
 //  memoria de las cuentas ACTIVAS: se recarga al guardar y cada minuto.
-//  Montos: los precios de las rifas están en pesos (COP); Pago Móvil
-//  se cobra en Bs y Zelle en USD con las tasas de config_tasas.
+//  Montos: los precios de las rifas están en pesos (COP) o en dólares
+//  (rifas ancladas al dólar, moneda = 'USD'); Pago Móvil se cobra en Bs
+//  y Zelle en USD con las tasas de config_tasas. Las rifas en dólares se
+//  pagan solo en bolívares o dólares, a la tasa del día.
 // ============================================================
 const pool = require('../config/db');
 
@@ -138,21 +140,43 @@ async function obtenerTasas() {
   return { copUsd, copUsdBs: t.COP_POR_USD_BS || copUsd, bsdUsd: t.BSD_POR_USD || 0 };
 }
 
-// Monto en la moneda del método, igual que calcularPrecioMetodo de la pantalla del cliente
-function montoEnMetodo(totalCOP, metodo, tasas) {
+// Monto en la moneda del método, igual que calcularPrecioMetodo de la pantalla del cliente.
+// total viene en la moneda de la rifa.
+function montoEnMetodo(total, metodo, tasas, monedaRifa = 'COP') {
   const m = METODOS_PAGO[metodo];
+  const enDolares = monedaRifa === 'USD';
   const fmtCOP = (n) => `${Math.round(n).toLocaleString('es-CO')} pesos`;
+  const totalCOP = enDolares ? total * tasas.copUsd : total;
   if (!m || m.moneda === 'COP') return { moneda: 'COP', valor: totalCOP, texto: fmtCOP(totalCOP) };
-  const usd = totalCOP / tasas.copUsd;
+  const usd = enDolares ? total : total / tasas.copUsd;
   if (m.moneda === 'USD') return { moneda: 'USD', valor: +usd.toFixed(2), texto: `$${usd.toFixed(2)} USD` };
-  if (!tasas.bsdUsd) return { moneda: 'COP', valor: totalCOP, texto: fmtCOP(totalCOP), sinTasa: true };
-  // Regla de tres con su propia tasa de pesos: pesos ÷ (pesos por dólar para Bs) × (Bs por dólar)
-  const bs = (totalCOP / (tasas.copUsdBs || tasas.copUsd)) * tasas.bsdUsd;
+  if (!tasas.bsdUsd) return enDolares
+    ? { moneda: 'USD', valor: +usd.toFixed(2), texto: `$${usd.toFixed(2)} USD`, sinTasa: true }
+    : { moneda: 'COP', valor: total, texto: fmtCOP(total), sinTasa: true };
+  // Anclada al dólar: dólares × Bs por dólar. En pesos, regla de tres con su propia
+  // tasa de pesos: pesos ÷ (pesos por dólar para Bs) × (Bs por dólar)
+  const bs = enDolares ? total * tasas.bsdUsd : (total / (tasas.copUsdBs || tasas.copUsd)) * tasas.bsdUsd;
   return {
     moneda: 'VES', valor: +bs.toFixed(2),
     texto: `Bs. ${bs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
   };
 }
+
+// Las rifas en dólares no se cobran por las cuentas en pesos (el efectivo lo coordina una persona)
+const admiteMetodo = (metodo, monedaRifa) => {
+  const m = METODOS_PAGO[metodo];
+  return !!m && (monedaRifa !== 'USD' || m.moneda !== 'COP' || !!m.presencial);
+};
+const metodosDeRifa = (monedaRifa) => Object.keys(METODOS_PAGO).filter((m) => !METODOS_PAGO[m].presencial && admiteMetodo(m, monedaRifa));
+
+// Un monto de una rifa con su moneda, en palabras
+const fmtEnMoneda = (n, monedaRifa, nombrePesos = 'pesos') => (monedaRifa === 'USD'
+  ? `${Number(n || 0).toLocaleString('es-CO')} dólares`
+  : `${Math.round(Number(n) || 0).toLocaleString('es-CO')} ${nombrePesos}`);
+
+// Para los totales que suman varias rifas: las ventas en dólares se pasan a pesos con la tasa de hoy
+const ventaEnPesos = (v = 'v', r = 'r') =>
+  `${v}.precio_venta * CASE WHEN ${r}.moneda = 'USD' THEN COALESCE((SELECT valor FROM config_tasas WHERE clave = 'COP_POR_USD'), 1) ELSE 1 END`;
 
 // Normaliza lo que diga el cliente o la IA ("pago movil", "zelle"…) al nombre oficial
 const plano = (txt) => String(txt || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim();
@@ -193,4 +217,4 @@ function mensajeDePago(metodo, monto, { numeros, rifa }) {
     '📸 Cuando pagues, envíame la captura del comprobante por aquí.';
 }
 
-module.exports = { METODOS_PAGO, MONEDAS, tablaLista, recargar, metodosActivos, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago, pideTitular };
+module.exports = { METODOS_PAGO, MONEDAS, tablaLista, recargar, metodosActivos, obtenerTasas, montoEnMetodo, normalizarMetodo, mensajeDePago, pideTitular, admiteMetodo, metodosDeRifa, fmtEnMoneda, ventaEnPesos };

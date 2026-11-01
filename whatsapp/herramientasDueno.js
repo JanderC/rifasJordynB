@@ -6,6 +6,7 @@
 //  reenviar la imagen de un ticket y ver el reparto de números por vendedor.
 // ============================================================
 const pool = require('../config/db');
+const metodosPago = require('../services/metodosPago');
 const chats = require('../services/waChats');
 const reservas = require('../services/reservas');
 const resultados = require('../services/resultados');
@@ -99,7 +100,7 @@ const haceCuanto = (f) => {
   const h = Math.round(min / 60);
   return h < 24 ? `hace ${h} h` : `hace ${Math.round(h / 24)} d`;
 };
-const pesos = (n) => `${Math.round(Number(n) || 0).toLocaleString('es-CO')} pesos`;
+const pesos = (n, moneda) => metodosPago.fmtEnMoneda(n, moneda);
 
 async function resumenDe(rifa) {
   const [asig, onl, pend, libres] = await Promise.all([
@@ -115,10 +116,10 @@ async function resumenDe(rifa) {
   const est = Object.fromEntries(pend.rows.map((x) => [x.estado, x.n]));
   return {
     rifa: rifa.nombre, sorteo: [rifa.fecha_sorteo, rifa.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' '),
-    precio: pesos(rifa.precio),
+    precio: pesos(rifa.precio, rifa.moneda),
     vendedores: asig.rows[0].vendedores, numeros_con_vendedores: asig.rows[0].n,
-    vendidos_por_whatsapp: { numeros: por.whatsapp?.n || 0, monto: pesos(por.whatsapp?.monto) },
-    vendidos_por_la_pagina: { numeros: por.web?.n || 0, monto: pesos(por.web?.monto) },
+    vendidos_por_whatsapp: { numeros: por.whatsapp?.n || 0, monto: pesos(por.whatsapp?.monto, rifa.moneda) },
+    vendidos_por_la_pagina: { numeros: por.web?.n || 0, monto: pesos(por.web?.monto, rifa.moneda) },
     pagos_por_aprobar: est.pendiente || 0, apartados_esperando_pago: est.apartado || 0,
     numeros_libres: libres.totalLibres,
   };
@@ -151,7 +152,7 @@ async function ejecutar(nombre, args, ctx = {}) {
       const sorteadas = await resultados.sorteosRecientes(21);
       const ids = new Set(enVenta.map((r) => r.id));
       return {
-        en_venta: enVenta.map((r) => ({ rifa_id: r.id, nombre: r.nombre, sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' '), precio: pesos(r.precio) })),
+        en_venta: enVenta.map((r) => ({ rifa_id: r.id, nombre: r.nombre, sorteo: [r.fecha_sorteo, r.hora_sorteo?.slice(0, 5)].filter(Boolean).join(' '), precio: pesos(r.precio, r.moneda) })),
         sorteadas_recientes: sorteadas.filter((r) => r.ya_sorteo || !ids.has(r.id)).map((r) => ({
           rifa_id: r.id, nombre: r.nombre, sorteo: r.fecha_sorteo, ya_sorteo: r.ya_sorteo,
           resultados: r.resultados.length ? r.resultados.map((x) => `${x.premio}: ${x.numero}${x.ganador ? ` (${x.ganador})` : ''}`) : 'sin cargar',
@@ -211,15 +212,16 @@ async function ejecutar(nombre, args, ctx = {}) {
     case 'dueno_ventas_en_linea': {
       const dias = Math.min(60, Math.max(1, Number(args.dias) || 1));
       const r = await pool.query(`
-        SELECT TRIM(v.numero) AS numero, v.nombre_comprador AS nombre, v.telefono, v.origen AS canal, v.precio_venta, v.created_at, r.nombre AS rifa
+        SELECT TRIM(v.numero) AS numero, v.nombre_comprador AS nombre, v.telefono, v.origen AS canal, v.precio_venta, v.created_at, r.nombre AS rifa, r.moneda
           FROM ventas v JOIN rifas r ON r.id = v.rifa_id
          WHERE v.origen IN ('web', 'whatsapp')
            AND v.created_at >= (date_trunc('day', NOW() AT TIME ZONE 'America/Caracas') - ($1::int - 1) * INTERVAL '1 day') AT TIME ZONE 'America/Caracas'
          ORDER BY v.created_at DESC LIMIT 60`, [dias]);
-      const total = r.rows.reduce((s, x) => s + Number(x.precio_venta || 0), 0);
+      const sumar = (moneda) => r.rows.filter((x) => x.moneda === moneda).reduce((s, x) => s + Number(x.precio_venta || 0), 0);
+      const total = [['COP', sumar('COP')], ['USD', sumar('USD')]].filter(([, n]) => n > 0).map(([m, n]) => pesos(n, m)).join(' y ') || pesos(0);
       return {
-        periodo: dias === 1 ? 'hoy' : `últimos ${dias} días`, numeros_vendidos: r.rows.length, total: pesos(total),
-        ventas: r.rows.slice(0, 25).map((x) => ({ rifa: x.rifa, numero: x.numero, cliente: x.nombre, telefono: x.telefono, canal: x.canal, monto: pesos(x.precio_venta), cuando: haceCuanto(x.created_at) })),
+        periodo: dias === 1 ? 'hoy' : `últimos ${dias} días`, numeros_vendidos: r.rows.length, total,
+        ventas: r.rows.slice(0, 25).map((x) => ({ rifa: x.rifa, numero: x.numero, cliente: x.nombre, telefono: x.telefono, canal: x.canal, monto: pesos(x.precio_venta, x.moneda), cuando: haceCuanto(x.created_at) })),
       };
     }
     case 'dueno_pagos_por_aprobar': {

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const { ventaEnPesos } = require('../services/metodosPago');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
 
 // ── GET /api/reportes/dashboard ───────────────────────────
@@ -23,16 +24,17 @@ router.get('/dashboard', authMiddleware, soloDueno, async (req, res) => {
 
     // Ventas de hoy
     const hoyResult = await pool.query(
-      `SELECT COUNT(*) AS ventas_hoy, COALESCE(SUM(precio_venta), 0) AS ingresos_hoy
-       FROM ventas
-       WHERE DATE(created_at) = CURRENT_DATE`
+      `SELECT COUNT(*) AS ventas_hoy, COALESCE(SUM(${ventaEnPesos()}), 0) AS ingresos_hoy
+       FROM ventas v JOIN rifas r ON r.id = v.rifa_id
+       WHERE DATE(v.created_at) = CURRENT_DATE`
     );
 
     // Top 5 vendedores del mes
     const topVendedoresResult = await pool.query(
-      `SELECT u.nombre, COUNT(v.id) AS ventas, COALESCE(SUM(v.precio_venta), 0) AS ingresos
+      `SELECT u.nombre, COUNT(v.id) AS ventas, COALESCE(SUM(${ventaEnPesos()}), 0) AS ingresos
        FROM users u
        JOIN ventas v ON v.vendedor_id = u.id
+       JOIN rifas r ON r.id = v.rifa_id
        WHERE DATE_TRUNC('month', v.created_at) = DATE_TRUNC('month', CURRENT_DATE)
        GROUP BY u.id, u.nombre
        ORDER BY ventas DESC
@@ -82,8 +84,8 @@ router.get('/vendedor-dashboard', authMiddleware, async (req, res) => {
   try {
     // Sus ventas totales
     const ventasResult = await pool.query(
-      `SELECT COUNT(*) AS total_ventas, COALESCE(SUM(precio_venta), 0) AS total_ingresos
-       FROM ventas WHERE vendedor_id = $1`,
+      `SELECT COUNT(*) AS total_ventas, COALESCE(SUM(${ventaEnPesos()}), 0) AS total_ingresos
+       FROM ventas v JOIN rifas r ON r.id = v.rifa_id WHERE v.vendedor_id = $1`,
       [req.user.id]
     );
 

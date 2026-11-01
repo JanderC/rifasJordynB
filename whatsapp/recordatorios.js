@@ -47,7 +47,7 @@ function jidDe(telefono) {
 function estadoDeApartado(g) {
   return {
     paso: 'esperando_comprobante', diferido: true,
-    rifa_id: g.rifa.id, rifa_nombre: g.rifa.nombre, numeros: g.numeros,
+    rifa_id: g.rifa.id, rifa_nombre: g.rifa.nombre, moneda: g.rifa.moneda, numeros: g.numeros,
     // total = lo que le FALTA pagar (el precio menos los abonos confirmados)
     nombre: g.nombre, cedula: g.cedula || null, total: g.saldo ?? g.total, metodo: null,
     total_rifa: g.total, abonado: g.abonado || 0, por_confirmar: g.por_confirmar || 0,
@@ -151,13 +151,13 @@ function textoRecordatorio(etapa, g, cfg) {
   const nombre = String(g.nombre || '').trim().split(/\s+/)[0] || '';
   const varios = g.numeros.length > 1;
   const nums = `${varios ? 'los números' : 'el número'} *${g.numeros.join(', ')}*`;
-  const pesos = (n) => `${Math.round(n).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
+  const pesos = (n) => metodosPago.fmtEnMoneda(n, g.rifa.moneda, cfg.moneda || 'pesos');
   // Con abonos se le recuerda lo que FALTA, no el precio completo
   const abonado = Number(g.abonado) || 0;
   const total = pesos(g.saldo ?? g.total);
   const cuenta = abonado > 0 ? `Llevas abonado ${pesos(abonado)}. Te falta: *${total}*` : null;
   const limite = opciones.fmtLimite(g.limite);
-  const metodos = Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial);
+  const metodos = metodosPago.metodosDeRifa(g.rifa.moneda);
   const comoPagar = `¿Con qué vas a pagar? ${metodos.length ? `Tenemos ${metodos.join(', ')}. ` : ''}Dime y te paso los datos 👇`;
   const hora = g.limite.toLocaleTimeString('es-VE', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Caracas' });
   if (etapa === 'final') {
@@ -179,8 +179,8 @@ function textoRecordatorio(etapa, g, cfg) {
 // ── Mensaje propio del dueño ─────────────────────────────────
 // Variables que se pueden usar en el texto configurado (las mismas que muestra el panel)
 function variablesDe(g, cfg) {
-  const pesos = (n) => `${Math.round(n).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
-  const metodos = Object.keys(metodosPago.METODOS_PAGO).filter((m) => !metodosPago.METODOS_PAGO[m].presencial);
+  const pesos = (n) => metodosPago.fmtEnMoneda(n, g.rifa.moneda, cfg.moneda || 'pesos');
+  const metodos = metodosPago.metodosDeRifa(g.rifa.moneda);
   return {
     nombre: String(g.nombre || '').trim().split(/\s+/)[0] || '',
     numeros: g.numeros.join(', '),

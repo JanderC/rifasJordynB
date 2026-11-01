@@ -15,7 +15,7 @@ const {
   crearReservasTx, aprobarReservasTx, rechazarReservasTx,
   avisarAprobadas, avisarRechazadas,
 } = require('../services/reservas');
-const { metodosActivos, obtenerTasas, pideTitular } = require('../services/metodosPago');
+const { metodosActivos, obtenerTasas, pideTitular, fmtEnMoneda, admiteMetodo, metodosDeRifa } = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const reservasSvc = require('../services/reservas');
 const abonos = require('../services/abonos');
@@ -424,6 +424,8 @@ async function apartarSinPago(req, res, numeros) {
   try {
     const rifa = await reservasSvc.infoRifa(pool, rifa_id);
     if (!rifa) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (metodo_pago && !admiteMetodo(metodo_pago, rifa.moneda))
+      return res.status(400).json({ error: `Esta rifa está en dólares: se paga solo por ${metodosDeRifa(rifa.moneda).join(', ')}` });
     if (!opciones.puedeApartarse(rifa))
       return res.status(403).json({ error: 'Esta rifa ya no permite apartar sin pagar. Puedes comprar enviando tu comprobante.', sin_apartado: true });
     const limite = opciones.limiteDePago(rifa);
@@ -481,7 +483,7 @@ router.get('/apartados', async (req, res) => {
   try {
     const grupos = (await reservasSvc.apartadosDe({ telefono })).filter((g) => mismaCedula(g.cedula, cedula));
     res.json(grupos.map((g) => ({
-      rifa_id: g.rifa.id, rifa: g.rifa.nombre, premio: g.rifa.premio, numeros: g.numeros, nombre: g.nombre,
+      rifa_id: g.rifa.id, rifa: g.rifa.nombre, moneda: g.rifa.moneda, premio: g.rifa.premio, numeros: g.numeros, nombre: g.nombre,
       total: g.total, pago_hasta: g.limite.toISOString(), pago_hasta_texto: opciones.fmtLimite(g.limite),
       // Abonos: lo confirmado, lo enviado sin confirmar y lo que falta por pagar
       abonado: g.abonado, por_confirmar: g.por_confirmar, saldo: g.saldo,
@@ -533,7 +535,7 @@ router.post('/apartados/pagar', async (req, res) => {
       return res.json({
         ok: true, abono: true, id: a.id, monto, restante, numeros: grupo.numeros,
         mensaje: restante > 0
-          ? `¡Abono recibido! Apenas lo verifiquemos te confirmamos por WhatsApp. Te quedarían ${restante.toLocaleString('es-CO')} pesos por pagar antes del ${opciones.fmtLimite(grupo.limite)}.`
+          ? `¡Abono recibido! Apenas lo verifiquemos te confirmamos por WhatsApp. Te quedarían ${fmtEnMoneda(restante, grupo.rifa.moneda)} por pagar antes del ${opciones.fmtLimite(grupo.limite)}.`
           : '¡Comprobante recibido! Con este pago completas el total. Apenas lo verifiquemos te llega tu ticket por WhatsApp.',
       });
     }
@@ -541,7 +543,7 @@ router.post('/apartados/pagar', async (req, res) => {
     await client.query('BEGIN');
     const filas = await reservasSvc.confirmarApartadoTx(client, grupo.ids, {
       comprobanteUrl: url, metodo_pago: metodo_pago || null, comprobante_nombre: 'comprobante-web', pagador,
-      comprobante_datos: { metodo: metodo_pago || null, monto_esperado: `${Math.round(grupo.total).toLocaleString('es-CO')} pesos` },
+      comprobante_datos: { metodo: metodo_pago || null, monto_esperado: fmtEnMoneda(grupo.total, grupo.rifa.moneda) },
     });
     if (!filas.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Esos números ya no están apartados.' }); }
     await client.query('COMMIT');
@@ -710,7 +712,7 @@ router.get('/reserva/:id', authMiddleware, soloDueno, async (req, res) => {
     const r = await pool.query(
       `SELECT rc.id, rc.numero, rc.nombre_cliente, rc.cedula, rc.correo,
               rc.estado, rc.nota_admin, rc.created_at, rc.updated_at,
-              r.nombre AS rifa_nombre, r.premio, r.precio,
+              r.nombre AS rifa_nombre, r.premio, r.precio, r.moneda,
               ${FECHA_SQL('r')},
               COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
        FROM reservas_cliente rc
@@ -737,7 +739,7 @@ router.get('/reservas-cliente', authMiddleware, soloDueno, async (req, res) => {
     const r = await pool.query(`
       SELECT rc.id, rc.numero, rc.nombre_cliente, rc.cedula, rc.correo,
              rc.estado, rc.nota_admin, rc.created_at, rc.updated_at,
-             r.nombre AS rifa_nombre, r.premio, r.precio,
+             r.nombre AS rifa_nombre, r.premio, r.precio, r.moneda,
              ${FECHA_SQL('r')},
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas
       FROM reservas_cliente rc
@@ -759,7 +761,7 @@ router.get('/admin/reservas', authMiddleware, soloDueno, async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT rc.*,
-             r.nombre AS rifa_nombre, r.precio, r.premio,
+             r.nombre AS rifa_nombre, r.precio, r.premio, r.moneda,
              ${FECHA_SQL('r')},
              COALESCE(r.ofertas, '[]'::jsonb) AS ofertas,
              env.id AS envio_id, env.estado AS envio_estado, env.error AS envio_error,
@@ -867,7 +869,7 @@ router.put('/admin/reservas-a-abono', authMiddleware, soloDueno, async (req, res
     const rifa = await reservasSvc.infoRifa(pool, f.rifa_id);
     const idsOk = filas.rows.map((x) => x.id);
     const total = reservasSvc.calcularPrecioReal(idsOk.length, rifa.ofertas, Number(rifa.precio));
-    if (monto >= total) return res.status(400).json({ error: `Ese monto cubre el total (${total.toLocaleString('es-CO')} pesos): apruébalo como pago completo` });
+    if (monto >= total) return res.status(400).json({ error: `Ese monto cubre el total (${fmtEnMoneda(total, rifa.moneda)}): apruébalo como pago completo` });
     // Vuelven a apartado hasta el límite de la rifa (o un día más si ya pasó)
     const limiteRifa = opciones.limiteDePago(rifa);
     const limite = limiteRifa && limiteRifa > new Date() ? limiteRifa : new Date(Date.now() + 24 * 3600000);

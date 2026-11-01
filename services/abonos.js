@@ -12,9 +12,10 @@
 //     para aprobarlos como cualquier reserva: ahí se crea la venta por el
 //     total y sale el ticket. En ese momento los abonos quedan "aplicados"
 //     y Caja deja de contarlos aparte (ya están dentro de la venta).
-//  Los montos van en la moneda de las rifas (pesos).
+//  Los montos van en la moneda de cada rifa (pesos o dólares).
 // ============================================================
 const pool = require('../config/db');
+const { fmtEnMoneda } = require('./metodosPago');
 const bus  = require('./waBus');
 const opciones = require('./rifaOpciones');
 const reservas = require('./reservas');
@@ -94,8 +95,8 @@ async function aprobar(id, { monto = null, nota = null } = {}) {
                 comprobante_datos = $4, nota_admin = $5, updated_at = NOW()
           WHERE id = ANY($1) AND estado = 'apartado'`,
         [antes.ids, abono.comprobante_url, abono.metodo_pago,
-         JSON.stringify({ metodo: abono.metodo_pago, pagado_con_abonos: true, total_abonado: abonado, monto_esperado: `${antes.total.toLocaleString('es-CO')} pesos` }),
-         `Pagado con abonos (${abonado.toLocaleString('es-CO')} pesos en total)`]);
+         JSON.stringify({ metodo: abono.metodo_pago, pagado_con_abonos: true, total_abonado: abonado, monto_esperado: fmtEnMoneda(antes.total, antes.rifa.moneda) }),
+         `Pagado con abonos (${fmtEnMoneda(abonado, antes.rifa.moneda)} en total)`]);
       await client.query(`UPDATE reserva_abonos SET aplicado = TRUE, updated_at = NOW() WHERE reserva_ids && $1::uuid[] AND estado = 'aprobado'`, [antes.ids]);
     }
     await client.query('COMMIT');

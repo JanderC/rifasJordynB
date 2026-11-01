@@ -58,7 +58,7 @@ function horaVE() {
 // De noche no se escribe en el grupo (los avisos programados esperan a la mañana)
 const deDia = () => { const h = horaVE(); return h >= '07:00' && h < '22:00'; };
 
-const fmtMonto = (n, cfg) => `${Number(n || 0).toLocaleString('es-CO')} ${cfg.moneda || 'pesos'}`;
+const fmtMonto = (n, cfg, moneda) => `${Number(n || 0).toLocaleString('es-CO')} ${moneda === 'USD' ? 'dólares' : cfg.moneda || 'pesos'}`;
 function fmtFecha(f) {
   const d = new Date(`${String(f).slice(0, 10)}T12:00:00-04:00`);
   return isNaN(d.getTime()) ? String(f) : d.toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Caracas' });
@@ -198,7 +198,7 @@ async function revisarProgramados() {
         `🏆 ${rifa.premio}\n` +
         (cerrada || !totalLibres
           ? '\nYa no quedan números a la venta. ¡Mucha suerte a todos! 🍀'
-          : `🎟️ ${totalLibres === 1 ? 'Queda *1* número' : `Quedan *${totalLibres}* números`} a ${fmtMonto(rifa.precio, cfg)}\n\n¡Todavía estás a tiempo! 👇\n${comoComprar(cfg)}`);
+          : `🎟️ ${totalLibres === 1 ? 'Queda *1* número' : `Quedan *${totalLibres}* números`} a ${fmtMonto(rifa.precio, cfg, rifa.moneda)}\n\n¡Todavía estás a tiempo! 👇\n${comoComprar(cfg)}`);
       await publicar({ clave: `previo:${rifa.id}:${rifa.fecha_sorteo}`, tipo: 'previo', texto });
       await sleep(20000);
     }
@@ -215,14 +215,14 @@ async function revisarProgramados() {
          AND NOT EXISTS (SELECT 1 FROM wa_grupo_envios e WHERE e.clave = 'nueva:' || rifas.id::text)`);
     for (const { id, imagen_url } of r.rows) {
       const rifa = await reservas.infoRifa(pool, id);
-      const ofertas = (rifa.ofertas || []).map((o) => `${o.cantidad} por ${fmtMonto(o.precio_total, cfg)}`);
+      const ofertas = (rifa.ofertas || []).map((o) => `${o.cantidad} por ${fmtMonto(o.precio_total, cfg, rifa.moneda)}`);
       const texto =
         `🚨 *¡Nueva rifa!* ${rifa.nombre}\n\n` +
         `🏆 Premio: ${rifa.premio}\n` +
         (rifa.premio_segundo ? `🥈 2.º premio: ${rifa.premio_segundo}\n` : '') +
         (rifa.premio_tercero ? `🥉 3.er premio: ${rifa.premio_tercero}\n` : '') +
         (opcionesRifa.especialesVigentes(rifa).length ? `🎁 Premios especiales: ${opcionesRifa.especialesVigentes(rifa).map((p) => p.nombre).join(' · ')}\n` : '') +
-        `💰 ${fmtMonto(rifa.precio, cfg)} por número${ofertas.length ? `\n🔥 Ofertas: ${ofertas.join(' · ')}` : ''}\n` +
+        `💰 ${fmtMonto(rifa.precio, cfg, rifa.moneda)} por número${ofertas.length ? `\n🔥 Ofertas: ${ofertas.join(' · ')}` : ''}\n` +
         (rifa.fecha_sorteo ? `📅 Sorteo: ${fmtFecha(rifa.fecha_sorteo)}${fmtHora(rifa.hora_sorteo) ? ` a las ${fmtHora(rifa.hora_sorteo)}` : ''}\n` : '') +
         `\nAparta tu número 👇\n${comoComprar(cfg)}`;
       await publicar({ clave: `nueva:${rifa.id}`, tipo: 'nueva', texto, imagen: /^https?:\/\//.test(imagen_url || '') ? imagen_url : null });

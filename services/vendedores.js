@@ -6,6 +6,7 @@
 //  Lo usan el panel (Vendedores) y el bot cuando pregunta el dueño.
 // ============================================================
 const pool = require('../config/db');
+const { ventaEnPesos } = require('./metodosPago');
 
 // Rifas que se muestran: las activas y las sorteadas en los últimos días
 const DIAS_RIFAS_PASADAS = 30;
@@ -22,10 +23,11 @@ async function directorio({ texto = '' } = {}) {
   const filtro = String(texto || '').trim();
   const usuarios = await pool.query(`
     SELECT u.id, u.nombre, u.usuario, u.cedula, u.activo, u.created_at,
-           COUNT(v.id)::int AS total_ventas, COALESCE(SUM(v.precio_venta), 0) AS total_ingresos,
+           COUNT(v.id)::int AS total_ventas, COALESCE(SUM(${ventaEnPesos('v', 'rv')}), 0) AS total_ingresos,
            MAX(v.created_at) AS ultima_venta
       FROM users u
       LEFT JOIN ventas v ON v.vendedor_id = u.id AND COALESCE(v.origen, 'vendedor') = 'vendedor'
+      LEFT JOIN rifas rv ON rv.id = v.rifa_id
      WHERE u.rol = 'vendedor'
        AND ($1 = '' OR u.nombre ILIKE '%' || $1 || '%' OR u.usuario ILIKE '%' || $1 || '%' OR COALESCE(u.cedula, '') ILIKE '%' || $1 || '%')
      GROUP BY u.id

@@ -80,8 +80,8 @@ const DEFINICIONES = [
   },
   {
     nombre: 'dueno_vendedores',
-    descripcion: 'Directorio de vendedores. Sin "vendedor": la lista de todos con cuántos números fijos tienen, en qué rifas participan y cuánto han vendido. Con "vendedor" (nombre, usuario o cédula): su ficha completa con sus números fijos por categoría y los números que tiene en cada rifa. Úsala para "qué vendedores tengo", "qué números fijos tiene X", "en qué rifas está X".',
-    parametros: { type: 'object', properties: { vendedor: { type: 'string', description: 'Nombre, usuario o cédula (o parte), opcional' } }, required: [] },
+    descripcion: 'Directorio de vendedores. Sin "vendedor": la lista de todos con cuántos números fijos tienen, en qué rifas participan y cuánto han vendido. Con "vendedor" (nombre, usuario, cédula o ciudad): su ficha completa o los de esa ciudad con sus números fijos por categoría y los números que tiene en cada rifa. Úsala para "qué vendedores tengo", "qué números fijos tiene X", "en qué rifas está X".',
+    parametros: { type: 'object', properties: { vendedor: { type: 'string', description: 'Nombre, usuario, cédula o ciudad (o parte), opcional' } }, required: [] },
   },
   {
     nombre: 'dueno_numeros_vendedores',
@@ -305,7 +305,7 @@ async function ejecutar(nombre, args, ctx = {}) {
       if (filtro && lista.length <= 3) {
         return {
           vendedores: lista.map((v) => ({
-            nombre: v.nombre, usuario: v.usuario, cedula: v.cedula || 'sin cédula', estado: v.activo ? 'activo' : 'inactivo',
+            nombre: v.nombre, usuario: v.usuario, cedula: v.cedula || 'sin cédula', ubicacion: v.ubicacion || 'sin ubicación', estado: v.activo ? 'activo' : 'inactivo',
             ventas_registradas: v.total_ventas, total_vendido: pesos(v.total_ingresos),
             ultima_venta: v.ultima_venta ? haceCuanto(v.ultima_venta) : 'nunca',
             numeros_fijos: v.numeros_fijos.length
@@ -323,7 +323,7 @@ async function ejecutar(nombre, args, ctx = {}) {
       return {
         total: lista.length, activos: lista.filter((v) => v.activo).length,
         vendedores: lista.slice(0, 60).map((v) => ({
-          nombre: v.nombre, estado: v.activo ? 'activo' : 'inactivo', numeros_fijos: v.total_numeros_fijos,
+          nombre: v.nombre, ubicacion: v.ubicacion || 'sin ubicación', estado: v.activo ? 'activo' : 'inactivo', numeros_fijos: v.total_numeros_fijos,
           categorias: v.numeros_fijos.map((c) => c.categoria),
           rifas: v.rifas.map((r) => `${r.rifa} (${r.cantidad} números${r.activa ? '' : ', ya sorteada'})`),
           ventas_registradas: v.total_ventas,

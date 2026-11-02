@@ -8,6 +8,29 @@
 const pool = require('../config/db');
 const { ventaEnPesos } = require('./metodosPago');
 
+// Ciudad o ubicación del vendedor (Rubio, San Cristóbal...)
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ubicacion VARCHAR(80)`)
+  .catch((e) => console.error('[vendedores] esquema:', e.message));
+
+const comparable = (t) => String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+async function ubicaciones() {
+  const r = await pool.query(`
+    SELECT ubicacion, COUNT(*)::int AS vendedores FROM users
+     WHERE rol = 'vendedor' AND ubicacion IS NOT NULL
+     GROUP BY ubicacion ORDER BY ubicacion`);
+  return r.rows;
+}
+
+// "rubio" y "Rubió" quedan como la que ya existe, para que no se separen
+async function normalizarUbicacion(valor) {
+  const t = String(valor || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (!t) return null;
+  const existente = (await ubicaciones()).find((u) => comparable(u.ubicacion) === comparable(t));
+  if (existente) return existente.ubicacion;
+  return t === t.toLowerCase() ? t.replace(/(^|\s)\p{L}/gu, (c) => c.toUpperCase()) : t;
+}
+
 // Rifas que se muestran: las activas y las sorteadas en los últimos días
 const DIAS_RIFAS_PASADAS = 30;
 
@@ -18,18 +41,18 @@ const porSerie = (filas) => {
   return out;
 };
 
-// texto: filtra por nombre, usuario o cédula (opcional)
+// texto: filtra por nombre, usuario, cédula o ubicación (opcional)
 async function directorio({ texto = '' } = {}) {
   const filtro = String(texto || '').trim();
   const usuarios = await pool.query(`
-    SELECT u.id, u.nombre, u.usuario, u.cedula, u.activo, u.created_at,
+    SELECT u.id, u.nombre, u.usuario, u.cedula, u.ubicacion, u.activo, u.created_at,
            COUNT(v.id)::int AS total_ventas, COALESCE(SUM(${ventaEnPesos('v', 'rv')}), 0) AS total_ingresos,
            MAX(v.created_at) AS ultima_venta
       FROM users u
       LEFT JOIN ventas v ON v.vendedor_id = u.id AND COALESCE(v.origen, 'vendedor') = 'vendedor'
       LEFT JOIN rifas rv ON rv.id = v.rifa_id
      WHERE u.rol = 'vendedor'
-       AND ($1 = '' OR u.nombre ILIKE '%' || $1 || '%' OR u.usuario ILIKE '%' || $1 || '%' OR COALESCE(u.cedula, '') ILIKE '%' || $1 || '%')
+       AND ($1 = '' OR u.nombre ILIKE '%' || $1 || '%' OR u.usuario ILIKE '%' || $1 || '%' OR COALESCE(u.cedula, '') ILIKE '%' || $1 || '%' OR COALESCE(u.ubicacion, '') ILIKE '%' || $1 || '%')
      GROUP BY u.id
      ORDER BY u.activo DESC, u.nombre`, [filtro]);
   if (!usuarios.rows.length) return [];
@@ -108,7 +131,7 @@ async function directorio({ texto = '' } = {}) {
       .sort((a, b) => Number(b.activa) - Number(a.activa) || String(b.fecha_sorteo || '').localeCompare(String(a.fecha_sorteo || '')));
 
     return {
-      id: u.id, nombre: u.nombre, usuario: u.usuario, cedula: u.cedula, activo: u.activo, created_at: u.created_at,
+      id: u.id, nombre: u.nombre, usuario: u.usuario, cedula: u.cedula, ubicacion: u.ubicacion, activo: u.activo, created_at: u.created_at,
       total_ventas: u.total_ventas, total_ingresos: Number(u.total_ingresos), ultima_venta: u.ultima_venta,
       total_numeros_fijos: numeros_fijos.reduce((s, c) => s + c.cantidad, 0),
       numeros_fijos, rifas: listaRifas,
@@ -116,4 +139,4 @@ async function directorio({ texto = '' } = {}) {
   });
 }
 
-module.exports = { directorio };
+module.exports = { directorio, ubicaciones, normalizarUbicacion };

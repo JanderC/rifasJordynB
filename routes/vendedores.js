@@ -189,10 +189,15 @@ router.get('/directorio', authMiddleware, soloDueno, async (req, res) => {
   catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
 });
 
+router.get('/ubicaciones', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await vendedoresSvc.ubicaciones()); }
+  catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
+});
+
 router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
   try {
     const [userR, numerosR, rifasR, ventasR] = await Promise.all([
-      pool.query('SELECT id,nombre,usuario,cedula,telefono,rol,activo,created_at FROM users WHERE id=$1', [req.params.id]),
+      pool.query('SELECT id,nombre,usuario,cedula,telefono,ubicacion,rol,activo,created_at FROM users WHERE id=$1', [req.params.id]),
       pool.query(`SELECT cvn.categoria_id, cg.nombre AS categoria_nombre, cg.tipo,
                   JSON_AGG(DISTINCT cvn.numero ORDER BY cvn.numero) AS numeros
                   FROM cat_vendedor_numeros cvn JOIN categorias_globales cg ON cg.id=cvn.categoria_id
@@ -211,7 +216,7 @@ router.get('/:id', authMiddleware, soloDueno, async (req, res) => {
 });
 
 router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
-  const { nombre, password, activo, cedula, telefono } = req.body;
+  const { nombre, password, activo, cedula, telefono, ubicacion } = req.body;
   try {
     const fields=[]; const params=[]; let i=1;
     if (telefono!==undefined) {
@@ -219,6 +224,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
       if (tel && (tel.length<10 || tel.length>15)) return res.status(400).json({ error: 'Teléfono inválido. Ejemplo: 04121234567 o 573001234567' });
       fields.push(`telefono=$${i++}`); params.push(tel||null);
     }
+    if (ubicacion!==undefined)      { fields.push(`ubicacion=$${i++}`); params.push(await vendedoresSvc.normalizarUbicacion(ubicacion)); }
     if (nombre)                     { fields.push(`nombre=$${i++}`);   params.push(nombre); }
     if (typeof activo==='boolean')  { fields.push(`activo=$${i++}`);   params.push(activo); }
     if (cedula!==undefined)         { fields.push(`cedula=$${i++}`);   params.push(cedula||null); }
@@ -228,7 +234,7 @@ router.put('/:id', authMiddleware, soloDueno, async (req, res) => {
     }
     if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
     params.push(req.params.id);
-    const r = await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING id,nombre,usuario,cedula,telefono,rol,activo`, params);
+    const r = await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING id,nombre,usuario,cedula,telefono,ubicacion,rol,activo`, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Vendedor no encontrado' });
     res.json({ message: 'Vendedor actualizado', vendedor: r.rows[0] });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Error del servidor' }); }
@@ -721,8 +727,8 @@ catRouter.post('/:id/vendedores', authMiddleware, soloDueno, async (req, res) =>
       if (existeR.rows[0]) { await client.query('ROLLBACK'); return res.status(409).json({ error: `Usuario "${creds.usuario}" ya existe` }); }
       const hash = await bcrypt.hash(creds.password, 10);
       const nR = await client.query(
-        `INSERT INTO users (nombre,cedula,usuario,password,rol,activo) VALUES ($1,$2,$3,$4,'vendedor',true) RETURNING id,nombre,usuario,cedula`,
-        [nombreLimpio, cedula||null, creds.usuario, hash]
+        `INSERT INTO users (nombre,cedula,usuario,password,rol,activo,ubicacion) VALUES ($1,$2,$3,$4,'vendedor',true,$5) RETURNING id,nombre,usuario,cedula,ubicacion`,
+        [nombreLimpio, cedula||null, creds.usuario, hash, await vendedoresSvc.normalizarUbicacion(req.body.ubicacion)]
       );
       vendedorFinal = nR.rows[0];
       credencialesGeneradas = { usuario: creds.usuario, password: creds.password };

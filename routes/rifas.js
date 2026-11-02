@@ -778,6 +778,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
         u.nombre          AS vendedor_nombre,
         u.cedula,
         u.telefono,
+        u.ubicacion,
         COALESCE(
           JSON_AGG(
             JSON_BUILD_OBJECT(
@@ -792,7 +793,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
       FROM miembros m
       JOIN users u ON u.id = m.vendedor_id
       LEFT JOIN numeros_unidos nu ON nu.vendedor_id = u.id
-      GROUP BY u.id, u.nombre, u.cedula, u.telefono
+      GROUP BY u.id, u.nombre, u.cedula, u.telefono, u.ubicacion
       ORDER BY u.nombre
     `, [rifa_id]);
 

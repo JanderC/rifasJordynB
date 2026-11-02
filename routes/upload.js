@@ -5,7 +5,7 @@ const router   = express.Router();
 const pool     = require('../config/db');
 const multer   = require('multer');
 const { authMiddleware, soloDueno } = require('../middleware/auth');
-const { uploadRifa, eliminarImagen, extraerPublicId, cloudinary } = require('../config/cloudinary');
+const { uploadRifa, uploadDecoracion, eliminarImagen, extraerPublicId, cloudinary } = require('../config/cloudinary');
 
 // Storage en memoria para tickets (no necesitan guardarse en BD)
 const uploadMemoria = multer({
@@ -68,6 +68,18 @@ router.post(
 router.post('/rifa-foto', authMiddleware, soloDueno, (req, res) => {
   uploadRifa.single('imagen')(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'La foto pesa más de 5MB' : err.message });
+    if (!req.file) return res.status(400).json({ error: 'No se recibió ninguna imagen' });
+    res.json({ ok: true, url: req.file.path });
+  });
+});
+
+/* ── POST /api/upload/decoracion ───────────────────────────
+   Sube una imagen de la decoración de la página del cliente.
+   Form-data: campo "imagen". Devuelve: { ok, url }
+────────────────────────────────────────────────────────────*/
+router.post('/decoracion', authMiddleware, soloDueno, (req, res) => {
+  uploadDecoracion.single('imagen')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'La imagen pesa más de 8MB' : err.message });
     if (!req.file) return res.status(400).json({ error: 'No se recibió ninguna imagen' });
     res.json({ ok: true, url: req.file.path });
   });

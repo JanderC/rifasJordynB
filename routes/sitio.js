@@ -33,4 +33,21 @@ router.put('/config', authMiddleware, soloDueno, async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── GET /api/sitio/decoracion ──────────────────────────────
+// Dueño: las decoraciones por fecha y cuál se ve hoy
+router.get('/decoracion', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await sitio.obtenerDecoracion()); }
+  catch (err) {
+    console.error('[Sitio] Error decoración:', err);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+// ── PUT /api/sitio/decoracion ──────────────────────────────
+// Body: { modo: 'auto' | 'apagada' | id, lista: [decoraciones] }
+router.put('/decoracion', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await sitio.guardarDecoracion(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 module.exports = router;

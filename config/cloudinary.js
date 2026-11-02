@@ -33,6 +33,29 @@ const uploadRifa = multer({
   },
 });
 
+// ── Imágenes de la decoración de la página ────────────────
+// Sin recortar al tamaño de las rifas: hay banners anchos y PNG con transparencia
+const storageDecoracion = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder:         'rifas-jordyn/decoracion',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+    transformation: [{ width: 2400, height: 2400, crop: 'limit', quality: 'auto' }],
+  },
+});
+
+const uploadDecoracion = multer({
+  storage: storageDecoracion,
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se permiten imágenes'), false);
+    }
+  },
+});
+
 // ── Eliminar imagen de Cloudinary por su public_id ────────
 async function eliminarImagen(public_id) {
   try {
@@ -55,4 +78,4 @@ function extraerPublicId(url) {
   }
 }
 
-module.exports = { cloudinary, uploadRifa, eliminarImagen, extraerPublicId };
+module.exports = { cloudinary, uploadRifa, uploadDecoracion, eliminarImagen, extraerPublicId };

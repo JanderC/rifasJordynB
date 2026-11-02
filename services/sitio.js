@@ -5,11 +5,13 @@
 // ============================================================
 const pool = require('../config/db');
 const { nombreCorto } = require('./resultados');
+const decoracion = require('./decoracion');
 
 const DEFECTO = {
   grupo_whatsapp: 'https://chat.whatsapp.com/Ek5kcDvEPVn8ObjyzqWdEl',
   grupo_activo: true,            // mostrar la burbuja del grupo
   top_compradores_activo: true,  // mostrar el top de compradores
+  decoracion: { modo: 'auto', lista: [] },   // decoraciones por fecha (services/decoracion.js)
 };
 const TOP_CANTIDAD = 5;
 
@@ -40,6 +42,12 @@ function limpiarEnlace(url) {
   return `${u.origin}${u.pathname}`.replace(/\/$/, '');
 }
 
+async function escribirConfig(nueva) {
+  await pool.query(
+    `INSERT INTO config_sitio (id, config, updated_at) VALUES (1, $1, NOW())
+     ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`, [JSON.stringify(nueva)]);
+}
+
 async function guardarConfig(cambios) {
   const actual = await obtenerConfig();
   const nueva = { ...actual };
@@ -51,11 +59,20 @@ async function guardarConfig(cambios) {
   for (const k of ['grupo_activo', 'top_compradores_activo']) {
     if (k in cambios) nueva[k] = cambios[k] === true;
   }
-  await pool.query(
-    `INSERT INTO config_sitio (id, config, updated_at) VALUES (1, $1, NOW())
-     ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`, [JSON.stringify(nueva)]);
+  await escribirConfig(nueva);
   topCache = null;
   return nueva;
+}
+
+async function obtenerDecoracion() {
+  return decoracion.resumen((await obtenerConfig()).decoracion);
+}
+
+async function guardarDecoracion(cambios) {
+  const actual = await obtenerConfig();
+  const nueva = decoracion.limpiarConfig(cambios);
+  await escribirConfig({ ...actual, decoracion: nueva });
+  return decoracion.resumen(nueva);
 }
 
 // Los que más números han comprado en las rifas que están en venta.
@@ -84,7 +101,8 @@ async function datosPublicos() {
   return {
     grupo_whatsapp: cfg.grupo_activo && cfg.grupo_whatsapp ? cfg.grupo_whatsapp : null,
     top_compradores: cfg.top_compradores_activo ? await topCompradores() : [],
+    decoracion: decoracion.vigente(cfg.decoracion),
   };
 }
 
-module.exports = { obtenerConfig, guardarConfig, topCompradores, datosPublicos };
+module.exports = { obtenerConfig, guardarConfig, obtenerDecoracion, guardarDecoracion, topCompradores, datosPublicos };

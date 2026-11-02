@@ -320,7 +320,7 @@ async function revisar() {
   const generales = rc.activo !== false;   // apagarlos no toca las fechas que el dueño puso en cada rifa
   const esDeDia = deDia();   // los automáticos solo de día; los de fecha y hora propias, a la hora que puso el dueño
   const finalHoras = Math.min(12, Math.max(1, Number(rc.final_horas) || 2));
-  const cadaHoras = rc.frecuencia === 'cada' ? Math.min(72, Math.max(1, Number(rc.cada_horas) || 12)) : 0;
+  const cadaHoras = rc.frecuencia === 'cada' ? Math.min(72, Math.max(6, Number(rc.cada_horas) || 12)) : 0;   // menos de 6 h arriesga el número
   const porDias = rc.frecuencia === 'dias';
   const dias = (Array.isArray(rc.dias) ? rc.dias : []).map(Number).filter((n) => n >= 0 && n <= 6);
   const hora = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(rc.hora || '')) ? rc.hora : '10:00';

@@ -80,10 +80,13 @@ async function actualizar(id, cambios) {
   return r.rows[0];
 }
 
+const CAPTION_MAX = 900;   // el texto programado a vendedores, si es más largo, va aparte de la foto
+
 // Texto corto y natural para la foto (varía para no parecer plantilla)
 function textoTicket(envio, i, total) {
   const nombre = String(envio.nombre || '').trim().split(/\s+/)[0] || '';
   if (envio.tipo === 'numeros_vendedor') {
+    if (envio.nota && envio.nota.length <= CAPTION_MAX) return envio.nota;
     const saludo = elegir([`¡Hola${nombre ? ' ' + nombre : ''}!`, `Hola${nombre ? ' ' + nombre : ''} 👋`, `¡Epa${nombre ? ' ' + nombre : ''}!`]);
     return `${saludo} ${elegir([`Estos son tus números disponibles de *${envio.rifa}*.`, `Te paso tus números disponibles de *${envio.rifa}*.`])} ${elegir(['¡Buenas ventas! 🍀', '¡Mucho éxito con las ventas! 🙌'])}`;
   }
@@ -124,21 +127,33 @@ async function encolarTicket({ reservas, tickets = [], nota = null, destino }) {
 
 // Imagen con los números de un vendedor. Pasa por la misma cola que los tickets.
 // Si ya tenía una sin salir, se cambia la imagen en vez de mandarle dos.
-async function encolarNumerosVendedor({ rifaId, rifaNombre, vendedorId, nombre, destino, imagenUrl }) {
+async function encolarNumerosVendedor({ rifaId, rifaNombre, vendedorId, nombre, destino, imagenUrl, nota = null }) {
   await tablaLista;
   const jid = t?.toJID ? t.toJID(destino) : destino;
   const frio = !(await esTibio(jid));
   const pendiente = await pool.query(`
-    UPDATE wa_envios SET imagenes = $1, jid = $2, frio = $3, estado = 'en_cola', error = NULL, proximo_at = NOW()
+    UPDATE wa_envios SET imagenes = $1, jid = $2, frio = $3, nota = $6, estado = 'en_cola', error = NULL, proximo_at = NOW()
      WHERE tipo = 'numeros_vendedor' AND rifa_id = $4 AND vendedor_id = $5 AND estado IN ('en_cola', 'esperando_cliente')
-     RETURNING *`, [[imagenUrl], jid, frio, rifaId, vendedorId]);
+     RETURNING *`, [[imagenUrl], jid, frio, rifaId, vendedorId, nota]);
   const envio = pendiente.rows[0] || (await pool.query(`
-    INSERT INTO wa_envios (tipo, rifa_id, vendedor_id, jid, nombre, rifa, imagenes, frio)
-    VALUES ('numeros_vendedor', $1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-  [rifaId, vendedorId, jid, nombre, rifaNombre, [imagenUrl], frio])).rows[0];
+    INSERT INTO wa_envios (tipo, rifa_id, vendedor_id, jid, nombre, rifa, imagenes, frio, nota)
+    VALUES ('numeros_vendedor', $1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+  [rifaId, vendedorId, jid, nombre, rifaNombre, imagenUrl ? [imagenUrl] : [], frio, nota])).rows[0];
   emitir(envio);
   despertar();
   return envio;
+}
+
+// Prueba del dueño: mismo envío, sin rifa ni vendedor para no mezclarse con sus estados
+async function encolarPrueba({ destino, imagenUrl, nota, rifaNombre }) {
+  await tablaLista;
+  const jid = t?.toJID ? t.toJID(destino) : destino;
+  const frio = !(await esTibio(jid));
+  const ins = await pool.query(`
+    INSERT INTO wa_envios (tipo, jid, rifa, imagenes, frio, nota) VALUES ('numeros_vendedor', $1, $2, $3, $4, $5) RETURNING *`,
+  [jid, rifaNombre, [imagenUrl], frio, nota]);
+  emitir(ins.rows[0]);
+  despertar();
 }
 
 // El último envío a cada vendedor de una rifa
@@ -213,6 +228,11 @@ async function ciclo() {
         SELECT COUNT(DISTINCT jid)::int n FROM wa_envios
          WHERE frio AND estado = 'enviado' AND enviado_at >= date_trunc('day', NOW() AT TIME ZONE 'America/Caracas') AT TIME ZONE 'America/Caracas'`);
       if (hoy.rows[0].n >= (ab.max_chats_nuevos_dia || 30)) {
+        // El mensaje a vendedores dice "hoy juega": mañana ya estaría viejo
+        if (envio.tipo === 'numeros_vendedor' && envio.nota) {
+          await actualizar(envio.id, { estado: 'error', error: 'Tope diario de contactos nuevos: pídele que le escriba una vez a este WhatsApp' });
+          return;
+        }
         await actualizar(envio.id, { estado: 'esperando_cliente', proximo_at: new Date(Date.now() + 6 * 3600000), error: 'Tope diario de contactos nuevos: sale cuando el cliente escriba o mañana' });
         return;
       }
@@ -240,6 +260,10 @@ async function enviar(envio, ab) {
     } else {
       await t.enviarTexto(envio.jid, textoTicket(envio, 0, 1), { autor: 'sistema' });
     }
+    if (envio.tipo === 'numeros_vendedor' && envio.nota?.length > CAPTION_MAX) {
+      await sleep(azar(1200, 2800));
+      await t.enviarTexto(envio.jid, envio.nota, { autor: 'sistema' });
+    }
     if (envio.frio) ultimoFrio = Date.now();
     await actualizar(envio.id, { estado: 'enviado', enviado_at: new Date(), error: null });
   } catch (e) {
@@ -258,4 +282,7 @@ async function enviar(envio, ab) {
 // Revisión periódica (por si se reinició el servidor o toca un reintento)
 setInterval(() => ciclo(), 30 * 1000).unref();
 
-module.exports = { init, encolarTicket, encolarNumerosVendedor, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };
+const conectado = () => !!t?.conectado();
+const aJid = (telefono) => (t?.toJID ? t.toJID(telefono) : telefono);
+
+module.exports = { init, conectado, aJid, encolarTicket, encolarNumerosVendedor, encolarPrueba, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };

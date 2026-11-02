@@ -16,6 +16,9 @@ const esquemaListo = (async () => {
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS publicada BOOLEAN NOT NULL DEFAULT TRUE`,
     // Moneda del precio: 'COP' o 'USD' (anclada al dólar). Precio, ofertas, ventas, abonos y caja van en esa moneda.
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS moneda VARCHAR(3) NOT NULL DEFAULT 'COP'`,
+    // Publicidad según la ciudad del vendedor y mensaje programado a los vendedores
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes_ubicacion JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS recordatorio_vendedores JSONB NOT NULL DEFAULT '{}'::jsonb`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premios_extra JSONB NOT NULL DEFAULT '[]'::jsonb`,
     // Más fotos de la rifa (además de la principal, imagen_url): se ven como carrusel en la página
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes JSONB NOT NULL DEFAULT '[]'::jsonb`,

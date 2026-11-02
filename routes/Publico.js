@@ -899,6 +899,28 @@ router.post('/admin/apartados/recordar', authMiddleware, soloDueno, async (req, 
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+/* ── Recordatorios por rifa (Reservas → Apartados sin pagar) ─
+   GET  /admin/recordatorios                  → rifas con apartados, fechas y resultado
+   PUT  /admin/recordatorios/:rifaId/programados { programados: [momentos ISO] }
+   POST /admin/recordatorios/:rifaId/enviar   → a todos sus apartados, ya
+────────────────────────────────────────────────────────── */
+router.get('/admin/recordatorios', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await require('../whatsapp/recordatorios').panel()); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Error del servidor' }); }
+});
+
+router.put('/admin/recordatorios/:rifaId/programados', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    await require('../whatsapp/recordatorios').guardarProgramados(req.params.rifaId, req.body?.programados);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.post('/admin/recordatorios/:rifaId/enviar', authMiddleware, soloDueno, async (req, res) => {
+  try { res.json(await require('../whatsapp/recordatorios').enviarAhoraRifa(req.params.rifaId)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 /* ── DELETE /api/publico/admin/apartados ──────────────────
    Libera números apartados sin pagar. Body: { ids: [] }
 ────────────────────────────────────────────────────────── */

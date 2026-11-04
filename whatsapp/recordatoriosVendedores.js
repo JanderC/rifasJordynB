@@ -1,9 +1,10 @@
 // ============================================================
 //  recordatoriosVendedores.js — Mensaje diario a los vendedores
-//  En cada rifa el dueño elige días y horas. A esa hora, hasta el
-//  sorteo, a cada vendedor con teléfono y números libres le llega la
-//  publicidad de su ciudad con sus números, y el texto con el día que
-//  juega, la tasa y las cuentas. Sale por la cola de envíos (anti-bloqueo).
+//  Al crear o editar la rifa el dueño elige días y horas. A esa hora,
+//  hasta el sorteo, a cada vendedor con teléfono y números libres le llega
+//  la publicidad de su ciudad para ese día ("juega el sábado", "mañana" u
+//  "hoy") con sus números, y el texto con la tasa y las cuentas.
+//  Sale por la cola de envíos (anti-bloqueo).
 // ============================================================
 const pool = require('../config/db');
 const { cloudinary } = require('../config/cloudinary');
@@ -13,10 +14,10 @@ const { datosBoleteria } = require('../services/boleteria');
 const metodosPago = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const envios = require('./envios');
+const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe } = require('../services/vendedoresRifa');
 
 const TZ = 'America/Caracas';
 const VENTANA_MIN = 30;   // si el servidor o WhatsApp estuvieron caídos, una hora atrasada ya no sale
-const DEMAS = '*';        // imagen de "todas las demás ciudades"
 
 const MENSAJE_DEFECTO = '¡Hola {nombre}! {cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: {tasa}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌';
 
@@ -40,30 +41,6 @@ function ahoraVE(d = new Date()) {
   };
 }
 
-function limpiarConfig(c) {
-  const dias = [...new Set((Array.isArray(c?.dias) ? c.dias : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6))].sort();
-  const horas = [...new Set((Array.isArray(c?.horas) ? c.horas : []).filter((h) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(h))))].sort().slice(0, 4);
-  return { activo: c?.activo === true, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
-}
-
-function limpiarImagenes(lista) {
-  const propias = (url) => {
-    try { const u = new URL(String(url)); return u.protocol === 'https:' && u.hostname === 'res.cloudinary.com'; } catch { return false; }
-  };
-  return (Array.isArray(lista) ? lista : [])
-    .map((x) => ({ ubicacion: String(x?.ubicacion || '').trim().slice(0, 80), imagen: String(x?.imagen || '').trim() }))
-    .filter((x) => x.ubicacion && propias(x.imagen));
-}
-
-const igual = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
-
-// La publicidad de un vendedor: la de su ciudad, la de "las demás" o la de la rifa
-function imagenDe(rifa, ubicacion) {
-  const lista = rifa.imagenes_ubicacion || [];
-  const propia = ubicacion && lista.find((x) => igual(x.ubicacion, ubicacion));
-  return propia?.imagen || lista.find((x) => x.ubicacion === DEMAS)?.imagen || rifa.imagen_url || null;
-}
-
 // Sus números libres de menor a mayor. Si tiene uno en las dos series, sale dos veces.
 function numerosLibres(v, dig) {
   const series = {};
@@ -76,12 +53,11 @@ function numerosLibres(v, dig) {
 
 const digitos = (rifa) => ([2, 4].includes(Number(rifa.cifras)) ? Number(rifa.cifras) : 3);
 
-function cuandoJuega(fechaSorteo, hoy) {
-  const dias = Math.round((new Date(`${fechaSorteo}T12:00:00Z`) - new Date(`${hoy}T12:00:00Z`)) / 86400000);
-  if (dias <= 0) return 'Hoy';
-  if (dias === 1) return 'Mañana';
-  const nombre = new Date(`${fechaSorteo}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', timeZone: 'UTC' });
-  return `El ${nombre}`;
+// Lo que dice el mensaje según la imagen que toca: "Hoy", "Mañana" o "El sábado"
+function cuandoJuega(momento, fechaSorteo) {
+  if (momento === 'hoy') return 'Hoy';
+  if (momento === 'manana') return 'Mañana';
+  return `El ${new Date(`${String(fechaSorteo).slice(0, 10)}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', timeZone: 'UTC' })}`;
 }
 
 function textoCuentas(moneda) {
@@ -92,13 +68,14 @@ function textoCuentas(moneda) {
     .join('\n\n');
 }
 
-function armarTexto({ config, rifa, vendedor, hoy, tasas, libres }) {
+function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
   const fmt = (n, d = 2) => new Intl.NumberFormat('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
   const fecha = String(rifa.fecha_sorteo).slice(0, 10);
   const v = {
     nombre: String(vendedor.vendedor_nombre || '').trim().split(/\s+/)[0],
     rifa: rifa.nombre,
-    cuando: cuandoJuega(fecha, hoy),
+    cuando: cuandoJuega(momento, fecha),
+    precio: metodosPago.fmtEnMoneda(Number(rifa.precio) || 0, rifa.moneda, 'pesos'),
     fecha: new Date(`${fecha}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }),
     tasa: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',
     tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos por dólar` : '',
@@ -109,7 +86,7 @@ function armarTexto({ config, rifa, vendedor, hoy, tasas, libres }) {
 }
 
 const leerRifa = async (id) => (await pool.query(`
-  SELECT id, nombre, imagen_url, cifras, moneda, fecha_sorteo::text AS fecha_sorteo, hora_sorteo, activa,
+  SELECT id, nombre, imagen_url, cifras, moneda, precio, fecha_sorteo::text AS fecha_sorteo, hora_sorteo, activa,
          COALESCE(imagenes_ubicacion, '[]'::jsonb) AS imagenes_ubicacion,
          COALESCE(recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores
     FROM rifas WHERE id = $1`, [id])).rows[0];
@@ -127,8 +104,9 @@ async function encolarVendedor({ rifa, v, config, hoy, tasas }) {
   const dig = digitos(rifa);
   const numeros = numerosLibres(v, dig);
   if (!numeros.length || !v.telefono) return false;
-  let nota = armarTexto({ config, rifa, vendedor: v, hoy, tasas, libres: numeros.length });
-  const flyer = imagenDe(rifa, v.ubicacion);
+  const momento = momentoDe(rifa.fecha_sorteo, hoy);
+  let nota = armarTexto({ config, rifa, vendedor: v, momento, tasas, libres: numeros.length });
+  const flyer = imagenDe(rifa, v.ubicacion, momento);
   let imagenUrl = flyer;
   try {
     imagenUrl = await subir(await generarImagenVendedor({ numeros, dig, imagen: flyer }), rifa.id, v.vendedor_id);
@@ -195,10 +173,6 @@ async function panel(rifaId) {
   const jids = conNumeros.filter((v) => v.telefono).map((v) => envios.aJid(v.telefono));
   const escribieron = jids.length ? (await pool.query(`SELECT DISTINCT jid FROM wa_chat_mensajes WHERE jid = ANY($1) AND NOT de_mi`, [jids])).rowCount : 0;
   return {
-    config: limpiarConfig(rifa.recordatorio_vendedores),
-    mensaje_defecto: MENSAJE_DEFECTO,
-    imagen_rifa: rifa.imagen_url,
-    imagenes_ubicacion: rifa.imagenes_ubicacion,
     ubicaciones: [...new Set(conNumeros.map((v) => v.ubicacion).filter(Boolean))].sort(),
     con_telefono: jids.length,
     sin_telefono: conNumeros.length - jids.length,
@@ -209,28 +183,24 @@ async function panel(rifaId) {
   };
 }
 
-async function guardar(rifaId, { config, imagenes_ubicacion: imagenes }) {
-  await opciones.esquemaListo;
-  const r = await pool.query(`UPDATE rifas SET recordatorio_vendedores = $1, imagenes_ubicacion = $2 WHERE id = $3 RETURNING id`,
-    [JSON.stringify(limpiarConfig(config)), JSON.stringify(limpiarImagenes(imagenes)), rifaId]);
-  return !!r.rows[0];
-}
-
-// El vendedor de ejemplo: el de esa ciudad, o el primero con números
-async function ejemplo(rifaId, { config, imagenes_ubicacion: imagenes, ubicacion }) {
+// El vendedor de ejemplo: el de esa ciudad, o el primero con números.
+// momento: la imagen que se quiere ver ('dia', 'manana' u 'hoy'); sin él, la de hoy.
+async function ejemplo(rifaId, { config, imagenes_ubicacion: imagenes, ubicacion, momento }) {
   const rifa = await leerRifa(rifaId);
   if (!rifa) throw new Error('Rifa no encontrada');
   const prueba = { ...rifa, imagenes_ubicacion: limpiarImagenes(imagenes) };
   const [bol, tasas] = await Promise.all([datosBoleteria(rifaId), metodosPago.obtenerTasas()]);
   const dig = digitos(rifa);
   const lista = (bol?.vendedores || []).filter((v) => numerosLibres(v, dig).length);
+  const igual = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
   const v = lista.find((x) => (ubicacion === DEMAS ? !prueba.imagenes_ubicacion.some((i) => igual(i.ubicacion, x.ubicacion)) : igual(x.ubicacion, ubicacion))) || lista[0];
-  if (!v) throw new Error('Esta rifa no tiene vendedores con números disponibles');
+  if (!v) throw new Error('Esta rifa no tiene vendedores con números asignados todavía');
+  const cual = ['dia', 'manana', 'hoy'].includes(momento) ? momento : momentoDe(rifa.fecha_sorteo, ahoraVE().fecha);
   const numeros = numerosLibres(v, dig);
-  const jpeg = await generarImagenVendedor({ numeros, dig, imagen: imagenDe(prueba, ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion) });
+  const jpeg = await generarImagenVendedor({ numeros, dig, imagen: imagenDe(prueba, ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion, cual) });
   return {
     vendedor: v.vendedor_nombre, jpeg, numeros: numeros.length,
-    texto: armarTexto({ config: limpiarConfig(config), rifa, vendedor: v, hoy: ahoraVE().fecha, tasas, libres: numeros.length }),
+    texto: armarTexto({ config: limpiarConfig(config), rifa, vendedor: v, momento: cual, tasas, libres: numeros.length }),
   };
 }
 
@@ -257,4 +227,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Vendedores]', e.message)).finally(() => { corriendo = false; });
 }, 60000).unref();
 
-module.exports = { revisar, panel, guardar, ejemplo, enviarPrueba, imagenDe, numerosLibres, cuandoJuega, armarTexto, limpiarConfig, limpiarImagenes, ahoraVE, MENSAJE_DEFECTO };
+module.exports = { revisar, panel, ejemplo, enviarPrueba, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };

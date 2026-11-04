@@ -9,6 +9,7 @@
 //     se libera. El bot le va recordando por WhatsApp.
 // ============================================================
 const pool = require('../config/db');
+const vendedoresRifa = require('./vendedoresRifa');
 const { eliminarImagen, extraerPublicId } = require('../config/cloudinary');
 
 const esquemaListo = (async () => {
@@ -76,7 +77,8 @@ const COLUMNAS = (a = 'r') => `
   ${a}.premio_segundo, ${a}.premio_tercero, COALESCE(${a}.imagenes, '[]'::jsonb) AS imagenes,
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros,
   COALESCE(${a}.recordatorios_programados, '[]'::jsonb) AS recordatorios_programados, COALESCE(${a}.cerrada_visible, FALSE) AS cerrada_visible,
-  COALESCE(${a}.venta_minima, 1)::int AS venta_minima, ${a}.moneda`;
+  COALESCE(${a}.venta_minima, 1)::int AS venta_minima, ${a}.moneda,
+  COALESCE(${a}.imagenes_ubicacion, '[]'::jsonb) AS imagenes_ubicacion, COALESCE(${a}.recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores`;
 
 // Momentos válidos, sin repetir y en orden (máximo 12)
 function limpiarProgramados(lista) {
@@ -120,6 +122,8 @@ async function guardar(db, rifaId, body = {}) {
   if (body.diferido_max_numeros !== undefined) poner('diferido_max_numeros', Math.min(50, Math.max(1, Math.round(Number(body.diferido_max_numeros)) || 10)));
   if (body.venta_minima !== undefined) poner('venta_minima', Math.min(50, Math.max(1, Math.round(Number(body.venta_minima)) || 1)));
   if (body.recordatorios_programados !== undefined) poner('recordatorios_programados', JSON.stringify(limpiarProgramados(body.recordatorios_programados)));
+  if (body.imagenes_ubicacion !== undefined) poner('imagenes_ubicacion', JSON.stringify(vendedoresRifa.limpiarImagenes(body.imagenes_ubicacion)));
+  if (body.recordatorio_vendedores !== undefined) poner('recordatorio_vendedores', JSON.stringify(vendedoresRifa.limpiarConfig(body.recordatorio_vendedores)));
   // Al volver a activarla deja de ser una rifa "cerrada a la vista"
   if (body.activa === true) poner('cerrada_visible', false);
   if (!sets.length) return null;

@@ -754,6 +754,12 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
   }
 });
 
+// ── GET /api/rifas/vendedores-config/defecto ─────────────
+// El texto que sale si el dueño no escribe uno propio
+router.get('/vendedores-config/defecto', authMiddleware, soloDueno, (req, res) => {
+  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO });
+});
+
 // ── /api/rifas/:id/vendedores-config ───────────────────────
 // Imagen por ciudad y mensaje programado a los vendedores
 router.get('/:id/vendedores-config', authMiddleware, soloDueno, async (req, res) => {
@@ -761,13 +767,6 @@ router.get('/:id/vendedores-config', authMiddleware, soloDueno, async (req, res)
     const datos = await recVendedores.panel(req.params.id);
     if (!datos) return res.status(404).json({ error: 'Rifa no encontrada' });
     res.json(datos);
-  } catch (err) { console.error('Error vendedores-config:', err); res.status(500).json({ error: 'Error del servidor' }); }
-});
-
-router.put('/:id/vendedores-config', authMiddleware, soloDueno, async (req, res) => {
-  try {
-    if (!(await recVendedores.guardar(req.params.id, req.body || {}))) return res.status(404).json({ error: 'Rifa no encontrada' });
-    res.json(await recVendedores.panel(req.params.id));
   } catch (err) { console.error('Error vendedores-config:', err); res.status(500).json({ error: 'Error del servidor' }); }
 });
 

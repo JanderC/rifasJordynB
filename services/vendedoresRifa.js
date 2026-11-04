@@ -1,0 +1,59 @@
+// ============================================================
+//  vendedoresRifa.js — Publicidad por ciudad y mensaje a los vendedores
+//  Se guardan con la rifa (al crearla o editarla). Cada ciudad tiene tres
+//  imágenes: "juega el sábado", "juega mañana" y "juega hoy"; según el día
+//  se usa la que toca. Aquí solo se valida y se elige: lo usan rifaOpciones
+//  (al guardar) y whatsapp/recordatoriosVendedores (al enviar).
+// ============================================================
+const MOMENTOS = ['dia', 'manana', 'hoy'];
+const DEMAS = '*';   // "todas las demás ciudades"
+
+const esPropia = (url) => {
+  try { const u = new URL(String(url)); return u.protocol === 'https:' && u.hostname === 'res.cloudinary.com'; } catch { return false; }
+};
+
+function limpiarConfig(c) {
+  const dias = [...new Set((Array.isArray(c?.dias) ? c.dias : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6))].sort();
+  const horas = [...new Set((Array.isArray(c?.horas) ? c.horas : []).filter((h) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(h))))].sort().slice(0, 4);
+  return { activo: c?.activo === true, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
+}
+
+// [{ ubicacion, dia, manana, hoy }]. Las guardadas antes con una sola imagen la usan como "dia".
+function limpiarImagenes(lista) {
+  const vistas = new Set();
+  return (Array.isArray(lista) ? lista : [])
+    .map((x) => {
+      const fila = { ubicacion: String(x?.ubicacion || '').trim().slice(0, 80) };
+      for (const m of MOMENTOS) {
+        const url = String(x?.[m] || (m === 'dia' ? x?.imagen : '') || '').trim();
+        if (esPropia(url)) fila[m] = url;
+      }
+      return fila;
+    })
+    .filter((x) => {
+      const clave = x.ubicacion.toLowerCase();
+      if (!x.ubicacion || vistas.has(clave) || !MOMENTOS.some((m) => x[m])) return false;
+      vistas.add(clave);
+      return true;
+    });
+}
+
+// 'hoy', 'manana' o 'dia' según cuánto falta para el sorteo
+function momentoDe(fechaSorteo, hoy) {
+  const dias = Math.round((new Date(`${String(fechaSorteo).slice(0, 10)}T12:00:00Z`) - new Date(`${hoy}T12:00:00Z`)) / 86400000);
+  return dias <= 0 ? 'hoy' : dias === 1 ? 'manana' : 'dia';
+}
+
+const igual = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+const primera = (fila, momento) => fila && (fila[momento] || MOMENTOS.map((m) => fila[m]).find(Boolean));
+
+// La de su ciudad para ese día; si falta, otra de su misma ciudad (trae su precio y su
+// premio); luego la de "las demás" y por último la foto de la rifa.
+function imagenDe(rifa, ubicacion, momento = 'dia') {
+  const lista = rifa.imagenes_ubicacion || [];
+  const suya = ubicacion ? lista.find((x) => igual(x.ubicacion, ubicacion)) : null;
+  const demas = lista.find((x) => x.ubicacion === DEMAS);
+  return (suya && primera(suya, momento)) || primera(demas, momento) || rifa.imagen_url || null;
+}
+
+module.exports = { MOMENTOS, DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe };

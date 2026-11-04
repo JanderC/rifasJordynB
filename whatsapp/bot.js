@@ -88,6 +88,17 @@ async function reservasDelCliente(chat) {
   return r.rows.map((x) => `${x.numero} en "${x.rifa}": ${txt[x.estado]}`).join('; ');
 }
 
+// ¿Ese chat es de un vendedor? (por los últimos 10 dígitos de su teléfono)
+async function vendedorDe(jid) {
+  const n = String(jid).split('@')[0].replace(/\D/g, '');
+  if (!String(jid).endsWith('@s.whatsapp.net') || n.length < 10) return null;
+  const r = await pool.query(`
+    SELECT nombre, ubicacion FROM users
+     WHERE rol = 'vendedor' AND activo AND RIGHT(regexp_replace(COALESCE(telefono, ''), '\\D', '', 'g'), 10) = RIGHT($1, 10)
+     LIMIT 1`, [n]);
+  return r.rows[0] || null;
+}
+
 // Un cliente necesita a una persona: se marca en el panel y se le avisa al dueño
 async function marcarAtencion(jid, motivo, { pausarBot = false, notificar = true } = {}) {
   await chats.actualizarChat(jid, {
@@ -117,6 +128,15 @@ async function alRecibir(item) {
   if (dueno.esDueno(mensaje.jid, cfg)) {
     const esOrden = mensaje.texto ? await dueno.alRecibirDueno(mensaje.texto).catch((e) => { console.error('❌ [Dueño]', e.message); return true; }) : false;
     if (esOrden) return;
+  }
+  // Un vendedor que escribe (le llegan sus números por aquí): lo atiende una persona.
+  // El bot no le vende ni toma sus capturas como compras suyas.
+  if (!dueno.adminDe(mensaje.jid, cfg)) {
+    const vend = await vendedorDe(mensaje.jid).catch(() => null);
+    if (vend) {
+      await marcarAtencion(mensaje.jid, `Vendedor: ${vend.nombre}${vend.ubicacion ? ` (${vend.ubicacion})` : ''}`, { notificar: !yaAvisado('vendedor', mensaje.jid, 6) });
+      return;
+    }
   }
   // "Hola, reservé el 045 (reserva #AB12CD34)" desde la página: se une su reserva a este chat
   if (mensaje.texto) await vincularReservaWeb(mensaje.jid, mensaje.texto).catch((e) => console.error('❌ [Bot] vincular reserva:', e.message));
@@ -1507,4 +1527,4 @@ async function probarConversacionDueno(mensajesPrueba) {
   return { respuesta: texto, fotos: efectos.fotos || [], llamadas, esDueno: !!admin };
 }
 
-module.exports = { probarConversacionDueno, cuentasPedidas, metodosEnTexto, atajoCuentas, PROMETE_DATOS, init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };
+module.exports = { vendedorDe, probarConversacionDueno, cuentasPedidas, metodosEnTexto, atajoCuentas, PROMETE_DATOS, init, alRecibir, alRecibirPropio, atenderConBot, registrarComprobanteManual, probarConversacion, responderEnGrupo, revisarApartadosVencidos, HERRAMIENTAS };

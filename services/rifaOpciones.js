@@ -20,6 +20,8 @@ const esquemaListo = (async () => {
     // Publicidad según la ciudad del vendedor y mensaje programado a los vendedores
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes_ubicacion JSONB NOT NULL DEFAULT '[]'::jsonb`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS recordatorio_vendedores JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    // Diseños de ticket por ciudad (para imprimir): [{ ubicacion, template_id }]; el principal es ticket_template_id
+    `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS tickets_ubicacion JSONB NOT NULL DEFAULT '[]'::jsonb`,
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS premios_extra JSONB NOT NULL DEFAULT '[]'::jsonb`,
     // Más fotos de la rifa (además de la principal, imagen_url): se ven como carrusel en la página
     `ALTER TABLE rifas ADD COLUMN IF NOT EXISTS imagenes JSONB NOT NULL DEFAULT '[]'::jsonb`,
@@ -78,7 +80,8 @@ const COLUMNAS = (a = 'r') => `
   ${a}.pago_diferido, ${a}.diferido_limite_horas, ${a}.diferido_max_numeros,
   COALESCE(${a}.recordatorios_programados, '[]'::jsonb) AS recordatorios_programados, COALESCE(${a}.cerrada_visible, FALSE) AS cerrada_visible,
   COALESCE(${a}.venta_minima, 1)::int AS venta_minima, ${a}.moneda,
-  COALESCE(${a}.imagenes_ubicacion, '[]'::jsonb) AS imagenes_ubicacion, COALESCE(${a}.recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores`;
+  COALESCE(${a}.imagenes_ubicacion, '[]'::jsonb) AS imagenes_ubicacion, COALESCE(${a}.recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores,
+  COALESCE(${a}.tickets_ubicacion, '[]'::jsonb) AS tickets_ubicacion`;
 
 // Momentos válidos, sin repetir y en orden (máximo 12)
 function limpiarProgramados(lista) {
@@ -96,6 +99,15 @@ function limpiarPremios(lista) {
     }))
     .filter((p) => p.nombre)
     .slice(0, 12);
+}
+
+// Una ciudad por diseño, sin repetir la ciudad (máximo 8)
+function limpiarTicketsUbicacion(lista) {
+  const vistas = new Set();
+  return (Array.isArray(lista) ? lista : [])
+    .map((x) => ({ ubicacion: String(x?.ubicacion || '').replace(/\s+/g, ' ').trim().slice(0, 80), template_id: Number(x?.template_id) }))
+    .filter((x) => x.ubicacion && Number.isInteger(x.template_id) && x.template_id > 0 && !vistas.has(x.ubicacion.toLowerCase()) && vistas.add(x.ubicacion.toLowerCase()))
+    .slice(0, 8);
 }
 
 // Guarda las opciones que vengan en el body (las que no vienen no se tocan)
@@ -123,6 +135,7 @@ async function guardar(db, rifaId, body = {}) {
   if (body.venta_minima !== undefined) poner('venta_minima', Math.min(50, Math.max(1, Math.round(Number(body.venta_minima)) || 1)));
   if (body.recordatorios_programados !== undefined) poner('recordatorios_programados', JSON.stringify(limpiarProgramados(body.recordatorios_programados)));
   if (body.imagenes_ubicacion !== undefined) poner('imagenes_ubicacion', JSON.stringify(vendedoresRifa.limpiarImagenes(body.imagenes_ubicacion)));
+  if (body.tickets_ubicacion !== undefined) poner('tickets_ubicacion', JSON.stringify(limpiarTicketsUbicacion(body.tickets_ubicacion)));
   if (body.recordatorio_vendedores !== undefined) poner('recordatorio_vendedores', JSON.stringify(vendedoresRifa.limpiarConfig(body.recordatorio_vendedores)));
   // Al volver a activarla deja de ser una rifa "cerrada a la vista"
   if (body.activa === true) poner('cerrada_visible', false);

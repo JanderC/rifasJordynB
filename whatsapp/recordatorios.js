@@ -26,6 +26,7 @@ const reservas = require('../services/reservas');
 const opciones = require('../services/rifaOpciones');
 const metodosPago = require('../services/metodosPago');
 const { obtenerConfig } = require('./botConfig');
+const personal = require('./numeroPersonal');
 
 let t = null;   // { enviar(jid, texto), enviarImagen(jid, url, texto), conectado() } — lo inyecta bot.js
 function init(transporte) { t = transporte; }
@@ -227,20 +228,33 @@ function mensajeRecordatorio(etapa, g, cfg) {
 
 // Envía el recordatorio: con la foto de la rifa (el texto va de pie de foto) si está
 // activado y la rifa tiene foto; si la foto falla, sale solo el texto.
+// Por dónde sale: el número personal del dueño si así lo eligió y está conectado (por el
+// teléfono del cliente), si no el del negocio. Devuelve 'personal' o 'negocio'.
+function salidaDe(jid, g) {
+  if (personal.listoParaRecordatorios()) {
+    const pj = jidDe(g.telefono) || (/@s\.whatsapp\.net$/.test(jid) ? jid : null);
+    if (pj) return { via: 'personal', jid: pj, enviar: (j, x) => personal.enviarTexto(j, x), enviarImagen: (j, u, x) => personal.enviarImagen(j, u, x) };
+  }
+  return { via: 'negocio', jid, enviar: t.enviar, enviarImagen: t.enviarImagen };
+}
+
 async function enviarRecordatorio(jid, etapa, g, cfg) {
   const texto = mensajeRecordatorio(etapa, g, cfg);
-  if (cfg.recordatorios_apartado?.con_imagen && t.enviarImagen) {
+  const s = salidaDe(jid, g);
+  if (cfg.recordatorios_apartado?.con_imagen && s.enviarImagen) {
     const url = (await pool.query(`SELECT imagen_url FROM rifas WHERE id = $1`, [g.rifa.id])).rows[0]?.imagen_url;
     if (url && texto.length <= 1000) {
-      try { await t.enviarImagen(jid, url, texto); return; }
+      try { await s.enviarImagen(s.jid, url, texto); return s.via; }
       catch (e) {
         if (/Límite/i.test(e.message)) throw e;
-        console.error(`⚠️ [Recordatorios] No se pudo enviar la foto a ${jid}: ${e.message}. Va solo el texto.`);
+        console.error(`⚠️ [Recordatorios] No se pudo enviar la foto a ${s.jid}: ${e.message}. Va solo el texto.`);
       }
     }
   }
-  await t.enviar(jid, texto);
+  await s.enviar(s.jid, texto);
+  return s.via;
 }
+const desdeTexto = (via) => (via === 'personal' ? ' · desde el número personal' : '');
 
 function registrar({ rifaId, momento, persona, nombre, telefono, estado, error }) {
   return pool.query(
@@ -274,7 +288,7 @@ async function enviarAPersona({ x, rifa, jid, toca, cfg, etiqueta, tibio }) {
     rifa, ids: x.ids, numeros: x.numeros, nombre: x.nombre, cedula: x.cedula, telefono: x.telefono, limite: new Date(x.limite),
     total, abonado, por_confirmar: porConfirmar, saldo: Math.max(total - abonado, 0),
   };
-  await enviarRecordatorio(jid, toca.etapa, g, cfg);
+  const via = await enviarRecordatorio(jid, toca.etapa, g, cfg);
   // De los "auto:<momento>" solo se guarda el último
   await pool.query(
     `UPDATE reservas_cliente
@@ -288,7 +302,7 @@ async function enviarAPersona({ x, rifa, jid, toca, cfg, etiqueta, tibio }) {
     await chats.actualizarChat(jid, { estado_compra: estadoDeApartado(g) });
   }
   await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-    texto: `🔔 Recordatorio de pago (${etiqueta}) · ${rifa.nombre} · números ${x.numeros.join(', ')}` });
+    texto: `🔔 Recordatorio de pago (${etiqueta}) · ${rifa.nombre} · números ${x.numeros.join(', ')}${desdeTexto(via)}` });
   return 'enviado';
 }
 
@@ -316,7 +330,7 @@ async function revisar() {
   await tablaLista;
   const cfg = await obtenerConfig();
   const rc = cfg.recordatorios_apartado || {};
-  if (!cfg.activo || !t?.conectado()) return;
+  if (!cfg.activo || !(t?.conectado() || personal.listoParaRecordatorios())) return;
   const generales = rc.activo !== false;   // apagarlos no toca las fechas que el dueño puso en cada rifa
   const esDeDia = deDia();   // los automáticos solo de día; los de fecha y hora propias, a la hora que puso el dueño
   const finalHoras = Math.min(12, Math.max(1, Number(rc.final_horas) || 2));
@@ -477,7 +491,7 @@ async function enviarAhoraRifa(rifaId) {
 // Lanza un error claro si no se puede (WhatsApp desconectado, sin teléfono, tope de chats nuevos…).
 async function recordarAhora(ids) {
   await opciones.esquemaListo;
-  if (!t?.conectado()) throw new Error('WhatsApp no está conectado.');
+  if (!t?.conectado() && !personal.listoParaRecordatorios()) throw new Error('WhatsApp no está conectado.');
   const filas = await pool.query(
     `SELECT id, rifa_id, telefono, wa_jid FROM reservas_cliente WHERE id = ANY($1) AND estado = 'apartado'`, [ids]);
   const f = filas.rows[0];
@@ -490,7 +504,7 @@ async function recordarAhora(ids) {
   if (!g) throw new Error('No se encontraron los números apartados de este cliente.');
   if (g.saldo - g.por_confirmar <= 0) throw new Error('Este cliente ya envió el pago de todo lo que debía; está por confirmarse en Abonos.');
   const cfg = await obtenerConfig();
-  await enviarRecordatorio(jid, 'manual', g, cfg);
+  const via = await enviarRecordatorio(jid, 'manual', g, cfg);
   await pool.query(
     `UPDATE reservas_cliente SET recordatorios = recordatorios || $2::jsonb, wa_jid = COALESCE(wa_jid, $3) WHERE id = ANY($1)`,
     [g.ids, JSON.stringify([`manual:${Date.now()}`]), jid]);
@@ -499,7 +513,7 @@ async function recordarAhora(ids) {
     await chats.actualizarChat(jid, { estado_compra: estadoDeApartado(g) });
   }
   await chats.guardarMensaje({ jid, deMi: true, autor: 'sistema', tipo: 'texto', estado: null,
-    texto: `🔔 Recordatorio de pago enviado a mano · ${g.rifa.nombre} · números ${g.numeros.join(', ')}` });
+    texto: `🔔 Recordatorio de pago enviado a mano · ${g.rifa.nombre} · números ${g.numeros.join(', ')}${desdeTexto(via)}` });
   return { ok: true, numeros: g.numeros, saldo: g.saldo };
 }
 

@@ -76,6 +76,7 @@ app.use("/api/sitio", require("./routes/sitio"));             // grupo de WhatsA
 app.use("/api/resultados", require("./routes/resultadosPublicados"));   // imágenes de resultados (página del cliente y grupo)
 app.use("/api/ganadores", require("./routes/ganadores"));   // galería de ganadores (pública + configuración)
 app.use("/api/baileys", require("./routes/wa-baileys"));
+app.use("/api/numero-personal", require("./routes/numeroPersonal"));
 app.use("/api/wa-chat", require("./routes/wa-chat"));      // panel de chats en tiempo real + bot/IA
 
 // ── WhatsApp Business ──────────────────────────────────────
@@ -118,6 +119,8 @@ app.listen(PORT, () => {
   // WA_AUTOSTART=false para no arrancarlo (p. ej. en local y no pelear la sesión).
   if (process.env.WA_AUTOSTART !== 'false') {
     startWhatsApp().catch((err) => console.error('❌ [WhatsApp] No se pudo iniciar:', err.message));
+    // El número personal solo se reconecta si ya estaba vinculado
+    require('./whatsapp/numeroPersonal').arrancar().catch((err) => console.error('❌ [Número personal] No se pudo iniciar:', err.message));
   }
 
   console.log("");

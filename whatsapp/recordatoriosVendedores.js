@@ -18,7 +18,29 @@ const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, mismaCiudad 
 const TZ = 'America/Caracas';
 const VENTANA_MIN = 30;   // si el servidor o WhatsApp estuvieron caídos, una hora atrasada ya no sale
 
-const MENSAJE_DEFECTO = '¡Hola {nombre}! 👋\n{cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: *{tasa}*\n🏛️ Dólar BCV: {tasa_bcv}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌';
+// La plantilla de Jordyn: con ella arranca toda rifa nueva
+const MENSAJE_DEFECTO = [
+  '‼️JUEGA {CUANDO}‼️',
+  '💎PRECIO DEL TICKET: {precio}',
+  '',
+  '💱TASAS DE CAMBIO:',
+  'BS: {tasa}',
+  'DOLAR POR ZELLE: {tasa_pesos}',
+  'DOLAR EN EFECTIVO: {tasa_efectivo}',
+  '',
+  '🏦 Cuentas disponibles:',
+  '{cuentas}',
+  '',
+  'LES DESEAMOS:',
+  '🙌EXITOS, BENDICIONES Y SUERTE🙌',
+].join('\n');
+// Plantillas anteriores del sistema: una rifa que quedó con una de estas usa la de Jordyn
+const MENSAJES_VIEJOS = [
+  '¡Hola {nombre}! {cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: {tasa}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌',
+  '¡Hola {nombre}! 👋\n{cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: *{tasa}*\n🏛️ Dólar BCV: {tasa_bcv}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌',
+];
+const plano = (x) => String(x || '').replace(/\r/g, '').trim();
+const mensajeDe = (config) => (!plano(config?.mensaje) || MENSAJES_VIEJOS.map(plano).includes(plano(config.mensaje)) ? MENSAJE_DEFECTO : config.mensaje);
 
 const tablaLista = pool.query(`
   CREATE TABLE IF NOT EXISTS wa_vendedores_turnos (
@@ -106,7 +128,7 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
   };
   const poner = (linea) => linea.replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? comoSeEscribio(k, v[k.toLowerCase()]) : todo));
   // Una línea cuyas variables quedaron todas vacías (p. ej. el BCV no respondió) no sale
-  return (config.mensaje || MENSAJE_DEFECTO).split('\n')
+  return mensajeDe(config).split('\n')
     .filter((linea) => {
       const vars = [...linea.matchAll(/\{(\w+)\}/g)].map((m) => m[1].toLowerCase()).filter((k) => k in v);
       return !vars.length || vars.some((k) => v[k]);
@@ -231,7 +253,9 @@ async function ultimaConfig() {
     SELECT recordatorio_vendedores AS c FROM rifas
      WHERE COALESCE(recordatorio_vendedores->>'mensaje', '') <> '' OR jsonb_array_length(COALESCE(recordatorio_vendedores->'horas', '[]'::jsonb)) > 0
      ORDER BY created_at DESC LIMIT 1`);
-  return r.rows[0] ? limpiarConfig(r.rows[0].c) : null;
+  if (!r.rows[0]) return null;
+  const c = limpiarConfig(r.rows[0].c);
+  return { ...c, mensaje: mensajeDe(c) };
 }
 
 let corriendo = false;

@@ -757,9 +757,10 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
 // ── GET /api/rifas/vendedores-config/defecto ─────────────
 // El texto modelo y lo último que el dueño usó (la rifa nueva arranca con eso)
 router.get('/vendedores-config/defecto', authMiddleware, soloDueno, async (req, res) => {
-  let ultimo = null;
+  let ultimo = null, ocupadas = [];
   try { ultimo = await recVendedores.ultimaConfig(); } catch (e) { console.error('vendedores-config/defecto:', e.message); }
-  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO, ultimo, viejos: recVendedores.MENSAJES_VIEJOS });
+  try { ocupadas = await recVendedores.ocupadas(); } catch (e) { console.error('vendedores-config/ocupadas:', e.message); }
+  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO, ultimo, viejos: recVendedores.MENSAJES_VIEJOS, ocupadas });
 });
 
 // ── /api/rifas/:id/vendedores-config ───────────────────────

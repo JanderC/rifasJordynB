@@ -15,7 +15,9 @@ const esPropia = (url) => {
 function limpiarConfig(c) {
   const dias = [...new Set((Array.isArray(c?.dias) ? c.dias : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6))].sort();
   const horas = [...new Set((Array.isArray(c?.horas) ? c.horas : []).filter((h) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(h))))].sort().slice(0, 4);
-  return { activo: c?.activo === true, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
+  // fechas: los días exactos del calendario (AAAA-MM-DD). Si hay, mandan sobre "dias" (de la semana, lo de antes)
+  const fechas = [...new Set((Array.isArray(c?.fechas) ? c.fechas : []).map(String).filter((f) => /^\d{4}-\d{2}-\d{2}$/.test(f)))].sort().slice(0, 120);
+  return { activo: c?.activo === true, fechas, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
 }
 
 // [{ ubicacion, dia, manana, hoy }]. Las guardadas antes con una sola imagen la usan como "dia".

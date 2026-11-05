@@ -180,8 +180,9 @@ async function revisar(cuando = new Date()) {
     const momento = opciones.momentoSorteo(rifa);
     if (momento && momento.getTime() <= cuando.getTime()) continue;
     const config = limpiarConfig(rifa.recordatorio_vendedores);
-    // Sin días marcados = todos los días
-    if (config.dias.length && !config.dias.includes(ve.dia)) continue;
+    // Los días del calendario; las rifas configuradas antes por día de la semana siguen igual
+    const toca = config.fechas.length ? config.fechas.includes(ve.fecha) : config.dias.includes(ve.dia);
+    if (!toca) continue;
     for (const hora of config.horas) {
       const [h, m] = hora.split(':').map(Number);
       const atraso = ve.minutos - (h * 60 + m);
@@ -255,7 +256,28 @@ async function ultimaConfig() {
      ORDER BY created_at DESC LIMIT 1`);
   if (!r.rows[0]) return null;
   const c = limpiarConfig(r.rows[0].c);
-  return { ...c, mensaje: mensajeDe(c) };
+  // Las fechas son de cada rifa: la nueva solo hereda el mensaje y las horas
+  return { ...c, fechas: [], dias: [], mensaje: mensajeDe(c) };
+}
+
+// Los días que ya tienen marcados las otras rifas activas (para no mandar doble el mismo día)
+async function ocupadas() {
+  await opciones.esquemaListo;
+  const hoy = ahoraVE().fecha;
+  const r = await pool.query(`
+    SELECT id, nombre, fecha_sorteo::text AS fecha_sorteo, recordatorio_vendedores AS c FROM rifas
+     WHERE activa AND fecha_sorteo >= $1::date AND (recordatorio_vendedores->>'activo') = 'true'`, [hoy]);
+  return r.rows.map((x) => {
+    const c = limpiarConfig(x.c);
+    let fechas = c.fechas.filter((f) => f >= hoy && f <= x.fecha_sorteo.slice(0, 10));
+    if (!c.fechas.length) {
+      fechas = [];
+      for (let d = new Date(`${hoy}T12:00:00Z`); d.toISOString().slice(0, 10) <= x.fecha_sorteo.slice(0, 10); d.setUTCDate(d.getUTCDate() + 1)) {
+        if (c.dias.includes(d.getUTCDay())) fechas.push(d.toISOString().slice(0, 10));
+      }
+    }
+    return { rifa_id: x.id, nombre: x.nombre, fechas };
+  }).filter((x) => x.fechas.length);
 }
 
 let corriendo = false;
@@ -265,4 +287,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Vendedores]', e.message)).finally(() => { corriendo = false; });
 }, 60000).unref();
 
-module.exports = { MENSAJES_VIEJOS, revisar, panel, ejemplo, enviarPrueba, ultimaConfig, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };
+module.exports = { MENSAJES_VIEJOS, ocupadas, revisar, panel, ejemplo, enviarPrueba, ultimaConfig, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };

@@ -19,6 +19,20 @@ const { obtenerConfig } = require('./botConfig');
 
 let t = null;   // transporte: { enviarImagen, enviarTexto, escribiendo, conectado, existeEnWhatsApp, toJID }
 function init(transporte) { t = transporte; }
+const personal = require('./numeroPersonal');
+
+// Por dónde sale un envío: por el número personal si el dueño lo puso como principal y está
+// conectado (solo a números de teléfono; un chat @lid es del número del negocio)
+function salida(envio) {
+  if (personal.esPrincipal() && /@s\.whatsapp\.net$/.test(envio.jid)) {
+    return {
+      escribiendo: async () => {},   // el personal ya hace "escribiendo…" antes de cada mensaje
+      enviarImagen: (jid, url, caption) => personal.enviarImagen(jid, url, caption, 'envio'),
+      enviarTexto: (jid, texto) => personal.enviarTexto(jid, texto, 'envio'),
+    };
+  }
+  return t;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const azar = (a, b) => Math.floor(a + Math.random() * Math.max(1, b - a));
@@ -215,7 +229,7 @@ async function ciclo() {
   trabajando = true;
   try {
     await tablaLista;
-    if (!t?.conectado()) return;
+    if (!t?.conectado() && !personal.esPrincipal()) return;
     const ab = (await obtenerConfig()).antiban;
 
     // Los que esperaban por el tope diario vuelven a la cola cuando se cumple su espera
@@ -266,6 +280,7 @@ async function ciclo() {
 
 async function enviar(envio, ab) {
   await actualizar(envio.id, { estado: 'enviando', intentos: envio.intentos + 1 });
+  const t = salida(envio);
   try {
     // "escribiendo…" como una persona antes de mandar
     await t.escribiendo(envio.jid, azar(1500, 3500));
@@ -300,7 +315,7 @@ async function enviar(envio, ab) {
 // Revisión periódica (por si se reinició el servidor o toca un reintento)
 setInterval(() => ciclo(), 30 * 1000).unref();
 
-const conectado = () => !!t?.conectado();
+const conectado = () => !!t?.conectado() || personal.esPrincipal();
 const aJid = (telefono) => (t?.toJID ? t.toJID(telefono) : telefono);
 
 module.exports = { init, conectado, aJid, encolarTicket, encolarNumerosVendedor, encolarPublicidadVendedor, encolarPrueba, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };

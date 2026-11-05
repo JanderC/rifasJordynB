@@ -10,7 +10,8 @@
 //     ni muestra sus chats.
 //   • Su sesión se respalda en su propia tabla (wa_personal_sesion_archivos)
 //     para sobrevivir a los despliegues.
-//   • El dueño elige si los recordatorios de pago salen por aquí.
+//   • El dueño puede ponerlo como PRINCIPAL: entonces todos los envíos del
+//     sistema (recordatorios, tickets, números y publicidad a vendedores) salen por aquí.
 // ============================================================
 const {
   default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers,
@@ -43,6 +44,9 @@ const tablaLista = pool.query(`
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`)
   .then(() => pool.query(`INSERT INTO wa_numero_personal (id) VALUES (1) ON CONFLICT DO NOTHING`))
+  // principal: todos los envíos salen por este número (antes solo los recordatorios)
+  .then(() => pool.query(`ALTER TABLE wa_numero_personal ADD COLUMN IF NOT EXISTS principal BOOLEAN`))
+  .then(() => pool.query(`UPDATE wa_numero_personal SET principal = recordatorios WHERE principal IS NULL`))
   .then(() => pool.query(`
     CREATE TABLE IF NOT EXISTS wa_personal_envios (
       id          BIGSERIAL PRIMARY KEY,
@@ -64,12 +68,12 @@ let conectadoDesde = null;
 let reintentos = 0;
 let timer = null;
 let vence = null;
-let usarEnRecordatorios = false;
+let principal = false;
 
 async function leerConfig() {
   await tablaLista;
   const r = (await pool.query(`SELECT * FROM wa_numero_personal WHERE id = 1`)).rows[0] || {};
-  usarEnRecordatorios = !!r.recordatorios;
+  principal = !!r.principal;
   return r;
 }
 
@@ -232,15 +236,15 @@ async function desvincular() {
   estado = 'desvinculado';
   codigo = null;
   conectadoDesde = null;
-  await pool.query(`UPDATE wa_numero_personal SET vinculado_at = NULL, recordatorios = FALSE, updated_at = NOW() WHERE id = 1`).catch(() => {});
-  usarEnRecordatorios = false;
+  await pool.query(`UPDATE wa_numero_personal SET vinculado_at = NULL, principal = FALSE, updated_at = NOW() WHERE id = 1`).catch(() => {});
+  principal = false;
   console.log('🔌 [Número personal] Desvinculado desde el panel.');
 }
 
-async function usarParaRecordatorios(si) {
+async function ponerPrincipal(si) {
   await tablaLista;
-  await pool.query(`UPDATE wa_numero_personal SET recordatorios = $1, updated_at = NOW() WHERE id = 1`, [!!si]);
-  usarEnRecordatorios = !!si;
+  await pool.query(`UPDATE wa_numero_personal SET principal = $1, updated_at = NOW() WHERE id = 1`, [!!si]);
+  principal = !!si;
 }
 
 async function panel() {
@@ -254,7 +258,7 @@ async function panel() {
     estado, conectado: estado === 'conectado', conectado_desde: conectadoDesde,
     codigo: vigente ? vigente.code : null, codigo_vence: vigente ? new Date(vigente.at + CODIGO_VENCE_MS) : null,
     ultimo_error: ultimoError,
-    recordatorios: !!cfg.recordatorios,
+    principal: !!cfg.principal,
     terminos_at: cfg.terminos_at || null, vinculado_at: cfg.vinculado_at || null,
     enviados_hoy: hoy.rows[0].enviados, errores_hoy: hoy.rows[0].errores, tope_dia: MAX_POR_DIA,
     en_cola: cola.length,
@@ -322,8 +326,9 @@ async function enviarPrueba(telefono) {
 }
 
 const conectado = () => estado === 'conectado' && !!sock;
-// Para recordatorios.js: si toca usar este número ahora
-const listoParaRecordatorios = () => usarEnRecordatorios && conectado();
+// Si los envíos tienen que salir por aquí ahora (principal y conectado)
+const esPrincipal = () => principal && conectado();
+const listoParaRecordatorios = esPrincipal;
 
 // Al arrancar: solo si ya había una sesión vinculada (sin sesión no se abre nada)
 async function arrancar() {
@@ -333,6 +338,6 @@ async function arrancar() {
 }
 
 module.exports = {
-  arrancar, panel, pedirCodigo, desvincular, usarParaRecordatorios, enviarPrueba,
-  enviarTexto, enviarImagen, conectado, listoParaRecordatorios, NUMERO,
+  arrancar, panel, pedirCodigo, desvincular, ponerPrincipal, enviarPrueba,
+  enviarTexto, enviarImagen, conectado, esPrincipal, listoParaRecordatorios, NUMERO,
 };

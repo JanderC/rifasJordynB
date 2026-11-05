@@ -75,7 +75,8 @@ async function tasasDelDia() {
     metodosPago.obtenerTasas(),
     tasasRuta.referencias().catch(() => ({})),
   ]);
-  return { ...t, bcv: ref?.bcv?.valor || 0 };
+  // Dólar en efectivo: el dólar de Colombia automático; si no responde, la tasa de pesos de los bolívares
+  return { ...t, bcv: ref?.bcv?.valor || 0, efectivo: ref?.oficial?.valor || t.copUsdBs || 0 };
 }
 
 function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
@@ -92,11 +93,18 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
     tasa: pesosPorBs ? fmt(pesosPorBs) : '',
     tasa_bcv: tasas.bcv ? `Bs. ${fmt(tasas.bcv)}` : '',
     tasa_dolar: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',
-    tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos` : '',   // el dólar por Zelle
+    tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos` : '',   // el dólar por Zelle (la que pone el dueño)
+    tasa_efectivo: tasas.efectivo ? `${fmt(tasas.efectivo, 0)} pesos` : '',
     cuentas: textoCuentas(),
     cantidad: String(libres),
   };
-  const poner = (linea) => linea.replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? v[k.toLowerCase()] : todo));
+  // Sale como se escribió la variable: {CUANDO} → "EL SÁBADO", {Cuando} → "El sábado"
+  const comoSeEscribio = (k, val) => {
+    if (k === k.toUpperCase()) return val.toLocaleUpperCase('es');
+    if (k[0] === k[0].toUpperCase()) return val.charAt(0).toLocaleUpperCase('es') + val.slice(1);
+    return val;
+  };
+  const poner = (linea) => linea.replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? comoSeEscribio(k, v[k.toLowerCase()]) : todo));
   // Una línea cuyas variables quedaron todas vacías (p. ej. el BCV no respondió) no sale
   return (config.mensaje || MENSAJE_DEFECTO).split('\n')
     .filter((linea) => {

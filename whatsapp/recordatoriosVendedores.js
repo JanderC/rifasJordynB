@@ -122,8 +122,9 @@ const leerRifa = async (id) => (await pool.query(`
 
 // Deja en la cola la publicidad de su ciudad con el mensaje. Devuelve si quedó en cola.
 async function encolarVendedor({ rifa, v, config, hoy, tasas }) {
+  // Va sin números: le llega a todo vendedor de la rifa con teléfono, tenga o no números
+  if (!v.telefono) return false;
   const numeros = numerosLibres(v, digitos(rifa));
-  if (!numeros.length || !v.telefono) return false;
   const momento = momentoDe(rifa.fecha_sorteo, hoy);
   await envios.encolarPublicidadVendedor({
     rifaId: rifa.id, rifaNombre: rifa.nombre, nombre: v.vendedor_nombre, destino: v.telefono,
@@ -180,7 +181,7 @@ async function panel(rifaId) {
   const rifa = await leerRifa(rifaId);
   if (!rifa) return null;
   const bol = await datosBoleteria(rifaId);
-  const conNumeros = (bol?.vendedores || []).filter((v) => numerosLibres(v, digitos(rifa)).length);
+  const conNumeros = bol?.vendedores || [];   // todos los de la rifa: la publicidad va sin números
   const turnos = await pool.query(`SELECT turno, enviados FROM wa_vendedores_turnos WHERE rifa_id = $1 ORDER BY turno DESC LIMIT 5`, [rifaId]);
   const jids = conNumeros.filter((v) => v.telefono).map((v) => envios.aJid(v.telefono));
   const escribieron = jids.length ? (await pool.query(`SELECT DISTINCT jid FROM wa_chat_mensajes WHERE jid = ANY($1) AND NOT de_mi`, [jids])).rowCount : 0;
@@ -203,7 +204,7 @@ async function ejemplo(rifaId, { config, imagenes_ubicacion: imagenes, ubicacion
   const prueba = { ...rifa, imagenes_ubicacion: limpiarImagenes(imagenes) };
   const [bol, tasas] = await Promise.all([datosBoleteria(rifaId), tasasDelDia()]);
   const dig = digitos(rifa);
-  const lista = (bol?.vendedores || []).filter((v) => numerosLibres(v, dig).length);
+  const lista = bol?.vendedores || [];
   const v = lista.find((x) => (ubicacion === DEMAS ? !prueba.imagenes_ubicacion.some((i) => mismaCiudad(i.ubicacion, x.ubicacion)) : mismaCiudad(x.ubicacion, ubicacion)))
     || lista[0] || { vendedor_nombre: 'Pedro', ubicacion: null, numeros_fijos: [] };
   const cual = ['dia', 'manana', 'hoy'].includes(momento) ? momento : momentoDe(rifa.fecha_sorteo, ahoraVE().fecha);

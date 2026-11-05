@@ -759,7 +759,7 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
 router.get('/vendedores-config/defecto', authMiddleware, soloDueno, async (req, res) => {
   let ultimo = null;
   try { ultimo = await recVendedores.ultimaConfig(); } catch (e) { console.error('vendedores-config/defecto:', e.message); }
-  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO, ultimo });
+  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO, ultimo, viejos: recVendedores.MENSAJES_VIEJOS });
 });
 
 // ── /api/rifas/:id/vendedores-config ───────────────────────

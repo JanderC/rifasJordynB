@@ -26,7 +26,7 @@ const MENSAJE_DEFECTO = [
   '💱TASAS DE CAMBIO:',
   'BS: {tasa}',
   'DOLAR POR ZELLE: {tasa_pesos}',
-  'DOLAR EN EFECTIVO: {tasa_efectivo}',
+  'DOLAR EN EFECTIVO:{tasa_efectivo}',
   '',
   '🏦 Cuentas disponibles:',
   '{cuentas}',
@@ -265,4 +265,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Vendedores]', e.message)).finally(() => { corriendo = false; });
 }, 60000).unref();
 
-module.exports = { revisar, panel, ejemplo, enviarPrueba, ultimaConfig, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };
+module.exports = { MENSAJES_VIEJOS, revisar, panel, ejemplo, enviarPrueba, ultimaConfig, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };

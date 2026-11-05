@@ -3,23 +3,22 @@
 //  Al crear o editar la rifa el dueño elige días y horas. A esa hora,
 //  hasta el sorteo, a cada vendedor con teléfono y números libres le llega
 //  la publicidad de su ciudad para ese día ("juega el sábado", "mañana" u
-//  "hoy") con sus números, y el texto con la tasa y las cuentas.
+//  "hoy"), tal cual (sin números: esos se mandan desde "Números por
+//  vendedor"), con el texto de la tasa y las cuentas.
 //  Sale por la cola de envíos (anti-bloqueo).
 // ============================================================
 const pool = require('../config/db');
-const { cloudinary } = require('../config/cloudinary');
-const { CARPETAS } = require('../services/imagenes');
-const { generarImagenVendedor } = require('../services/imagenVendedor');
 const { datosBoleteria } = require('../services/boleteria');
 const metodosPago = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const envios = require('./envios');
-const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe } = require('../services/vendedoresRifa');
+const tasasRuta = require('../routes/tasas');
+const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, mismaCiudad } = require('../services/vendedoresRifa');
 
 const TZ = 'America/Caracas';
 const VENTANA_MIN = 30;   // si el servidor o WhatsApp estuvieron caídos, una hora atrasada ya no sale
 
-const MENSAJE_DEFECTO = '¡Hola {nombre}! {cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: {tasa}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌';
+const MENSAJE_DEFECTO = '¡Hola {nombre}! 👋\n{cuando} juega *{rifa}* 🍀\n\n💱 Tasa del día: *{tasa}*\n🏛️ Dólar BCV: {tasa_bcv}\n\n🏦 Cuentas disponibles:\n{cuentas}\n\n¡Buenas ventas! 🙌';
 
 const tablaLista = pool.query(`
   CREATE TABLE IF NOT EXISTS wa_vendedores_turnos (
@@ -68,8 +67,19 @@ function textoCuentas(moneda) {
     .join('\n\n');
 }
 
+// Las tasas que van en el mensaje. Si la del BCV no responde, esa línea no sale.
+async function tasasDelDia() {
+  const [t, ref] = await Promise.all([
+    metodosPago.obtenerTasas(),
+    tasasRuta.referencias().catch(() => ({})),
+  ]);
+  return { ...t, bcv: ref?.bcv?.valor || 0 };
+}
+
 function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
   const fmt = (n, d = 2) => new Intl.NumberFormat('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
+  // "Se está recibiendo a 3,19": pesos por cada bolívar, con las mismas tasas con que se cobra el Pago Móvil
+  const pesosPorBs = tasas.bsdUsd ? (tasas.copUsdBs || tasas.copUsd) / tasas.bsdUsd : 0;
   const fecha = String(rifa.fecha_sorteo).slice(0, 10);
   const v = {
     nombre: String(vendedor.vendedor_nombre || '').trim().split(/\s+/)[0],
@@ -77,12 +87,21 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
     cuando: cuandoJuega(momento, fecha),
     precio: metodosPago.fmtEnMoneda(Number(rifa.precio) || 0, rifa.moneda, 'pesos'),
     fecha: new Date(`${fecha}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }),
-    tasa: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',
+    tasa: pesosPorBs ? fmt(pesosPorBs) : '',
+    tasa_bcv: tasas.bcv ? `Bs. ${fmt(tasas.bcv)}` : '',
+    tasa_dolar: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',
     tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos por dólar` : '',
     cuentas: textoCuentas(rifa.moneda),
     cantidad: String(libres),
   };
-  return (config.mensaje || MENSAJE_DEFECTO).replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? v[k.toLowerCase()] : todo)).trim();
+  const poner = (linea) => linea.replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? v[k.toLowerCase()] : todo));
+  // Una línea cuyas variables quedaron todas vacías (p. ej. el BCV no respondió) no sale
+  return (config.mensaje || MENSAJE_DEFECTO).split('\n')
+    .filter((linea) => {
+      const vars = [...linea.matchAll(/\{(\w+)\}/g)].map((m) => m[1].toLowerCase()).filter((k) => k in v);
+      return !vars.length || vars.some((k) => v[k]);
+    })
+    .map(poner).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 const leerRifa = async (id) => (await pool.query(`
@@ -91,39 +110,21 @@ const leerRifa = async (id) => (await pool.query(`
          COALESCE(recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores
     FROM rifas WHERE id = $1`, [id])).rows[0];
 
-// Sube una sola imagen por rifa y vendedor: la de cada día reemplaza a la anterior
-async function subir(buffer, rifaId, vendedorId) {
-  const r = await cloudinary.uploader.upload(`data:image/jpeg;base64,${buffer.toString('base64')}`, {
-    folder: CARPETAS.numerosVendedor, public_id: `${rifaId}_${vendedorId}`, overwrite: true, invalidate: true,
-  });
-  return r.secure_url;
-}
-
-// Prepara y deja en la cola el envío de un vendedor. Devuelve si quedó en cola.
+// Deja en la cola la publicidad de su ciudad con el mensaje. Devuelve si quedó en cola.
 async function encolarVendedor({ rifa, v, config, hoy, tasas }) {
-  const dig = digitos(rifa);
-  const numeros = numerosLibres(v, dig);
+  const numeros = numerosLibres(v, digitos(rifa));
   if (!numeros.length || !v.telefono) return false;
   const momento = momentoDe(rifa.fecha_sorteo, hoy);
-  let nota = armarTexto({ config, rifa, vendedor: v, momento, tasas, libres: numeros.length });
-  const flyer = imagenDe(rifa, v.ubicacion, momento);
-  let imagenUrl = flyer;
-  try {
-    imagenUrl = await subir(await generarImagenVendedor({ numeros, dig, imagen: flyer }), rifa.id, v.vendedor_id);
-  } catch (e) {
-    // Sin la imagen armada sale la publicidad sola, con los números en el texto
-    console.error(`⚠️ [Vendedores] Imagen de ${v.vendedor_nombre}: ${e.message}`);
-    nota += `\n\nTus números disponibles: ${numeros.join(', ')}`;
-  }
-  await envios.encolarNumerosVendedor({
-    rifaId: rifa.id, rifaNombre: rifa.nombre, vendedorId: v.vendedor_id, nombre: v.vendedor_nombre,
-    destino: v.telefono, imagenUrl, nota,
+  await envios.encolarPublicidadVendedor({
+    rifaId: rifa.id, rifaNombre: rifa.nombre, nombre: v.vendedor_nombre, destino: v.telefono,
+    imagenUrl: imagenDe(rifa, v.ubicacion, momento),
+    nota: armarTexto({ config, rifa, vendedor: v, momento, tasas, libres: numeros.length }),
   });
   return true;
 }
 
 async function lanzar(rifa, config, hoy) {
-  const [bol, tasas] = await Promise.all([datosBoleteria(rifa.id), metodosPago.obtenerTasas()]);
+  const [bol, tasas] = await Promise.all([datosBoleteria(rifa.id), tasasDelDia()]);
   let n = 0;
   for (const v of bol?.vendedores || []) {
     try { if (await encolarVendedor({ rifa, v, config, hoy, tasas })) n += 1; }
@@ -146,7 +147,8 @@ async function revisar(cuando = new Date()) {
     const momento = opciones.momentoSorteo(rifa);
     if (momento && momento.getTime() <= cuando.getTime()) continue;
     const config = limpiarConfig(rifa.recordatorio_vendedores);
-    if (!config.dias.includes(ve.dia)) continue;
+    // Sin días marcados = todos los días
+    if (config.dias.length && !config.dias.includes(ve.dia)) continue;
     for (const hora of config.horas) {
       const [h, m] = hora.split(':').map(Number);
       const atraso = ve.minutos - (h * 60 + m);
@@ -189,18 +191,17 @@ async function ejemplo(rifaId, { config, imagenes_ubicacion: imagenes, ubicacion
   const rifa = await leerRifa(rifaId);
   if (!rifa) throw new Error('Rifa no encontrada');
   const prueba = { ...rifa, imagenes_ubicacion: limpiarImagenes(imagenes) };
-  const [bol, tasas] = await Promise.all([datosBoleteria(rifaId), metodosPago.obtenerTasas()]);
+  const [bol, tasas] = await Promise.all([datosBoleteria(rifaId), tasasDelDia()]);
   const dig = digitos(rifa);
   const lista = (bol?.vendedores || []).filter((v) => numerosLibres(v, dig).length);
-  const igual = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
-  const v = lista.find((x) => (ubicacion === DEMAS ? !prueba.imagenes_ubicacion.some((i) => igual(i.ubicacion, x.ubicacion)) : igual(x.ubicacion, ubicacion))) || lista[0];
-  if (!v) throw new Error('Esta rifa no tiene vendedores con números asignados todavía');
+  const v = lista.find((x) => (ubicacion === DEMAS ? !prueba.imagenes_ubicacion.some((i) => mismaCiudad(i.ubicacion, x.ubicacion)) : mismaCiudad(x.ubicacion, ubicacion)))
+    || lista[0] || { vendedor_nombre: 'Pedro', ubicacion: null, numeros_fijos: [] };
   const cual = ['dia', 'manana', 'hoy'].includes(momento) ? momento : momentoDe(rifa.fecha_sorteo, ahoraVE().fecha);
-  const numeros = numerosLibres(v, dig);
-  const jpeg = await generarImagenVendedor({ numeros, dig, imagen: imagenDe(prueba, ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion, cual) });
+  const libres = numerosLibres(v, dig).length;
   return {
-    vendedor: v.vendedor_nombre, jpeg, numeros: numeros.length,
-    texto: armarTexto({ config: limpiarConfig(config), rifa, vendedor: v, momento: cual, tasas, libres: numeros.length }),
+    vendedor: v.vendedor_nombre,
+    imagen: imagenDe(prueba, ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion, cual),
+    texto: armarTexto({ config: limpiarConfig(config), rifa, vendedor: v, momento: cual, tasas, libres }),
   };
 }
 
@@ -209,16 +210,18 @@ async function enviarPrueba(rifaId, datos, telefono) {
   if (String(telefono || '').replace(/\D/g, '').length < 10) throw new Error('Escribe un teléfono válido');
   if (!envios.conectado()) throw new Error('WhatsApp no está conectado.');
   const e = await ejemplo(rifaId, datos);
-  const r = await cloudinary.uploader.upload(`data:image/jpeg;base64,${e.jpeg.toString('base64')}`, {
-    folder: CARPETAS.numerosVendedor, public_id: `${rifaId}_prueba`, overwrite: true, invalidate: true,
-  });
-  await envios.encolarPrueba({ destino: telefono, imagenUrl: r.secure_url, nota: e.texto, rifaNombre: (await leerRifa(rifaId)).nombre });
+  await envios.encolarPrueba({ destino: telefono, imagenUrl: e.imagen, nota: e.texto, rifaNombre: (await leerRifa(rifaId)).nombre });
 }
 
-// Al arrancar se comprueba que el servidor pueda armar la imagen
-generarImagenVendedor({ numeros: ['001'], dig: 3, imagen: null })
-  .then(() => console.log('✅ [Vendedores] Imagen de números lista'))
-  .catch((e) => console.error('❌ [Vendedores] No se puede armar la imagen:', e.message));
+// Lo último que el dueño configuró en una rifa: así la próxima arranca igual
+async function ultimaConfig() {
+  await opciones.esquemaListo;
+  const r = await pool.query(`
+    SELECT recordatorio_vendedores AS c FROM rifas
+     WHERE COALESCE(recordatorio_vendedores->>'mensaje', '') <> '' OR jsonb_array_length(COALESCE(recordatorio_vendedores->'horas', '[]'::jsonb)) > 0
+     ORDER BY created_at DESC LIMIT 1`);
+  return r.rows[0] ? limpiarConfig(r.rows[0].c) : null;
+}
 
 let corriendo = false;
 setInterval(() => {
@@ -227,4 +230,4 @@ setInterval(() => {
   revisar().catch((e) => console.error('❌ [Vendedores]', e.message)).finally(() => { corriendo = false; });
 }, 60000).unref();
 
-module.exports = { revisar, panel, ejemplo, enviarPrueba, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };
+module.exports = { revisar, panel, ejemplo, enviarPrueba, ultimaConfig, numerosLibres, cuandoJuega, armarTexto, ahoraVE, MENSAJE_DEFECTO };

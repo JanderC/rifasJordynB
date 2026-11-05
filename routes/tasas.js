@@ -203,3 +203,5 @@ router.put('/:clave', authMiddleware, soloDueno, async (req, res) => {
 });
 
 module.exports = router;
+// El mensaje a los vendedores lleva el dólar BCV
+module.exports.referencias = referencias;

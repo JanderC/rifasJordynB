@@ -755,9 +755,11 @@ router.get('/:id/boleteria-vendedores', authMiddleware, soloDueno, async (req, r
 });
 
 // ── GET /api/rifas/vendedores-config/defecto ─────────────
-// El texto que sale si el dueño no escribe uno propio
-router.get('/vendedores-config/defecto', authMiddleware, soloDueno, (req, res) => {
-  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO });
+// El texto modelo y lo último que el dueño usó (la rifa nueva arranca con eso)
+router.get('/vendedores-config/defecto', authMiddleware, soloDueno, async (req, res) => {
+  let ultimo = null;
+  try { ultimo = await recVendedores.ultimaConfig(); } catch (e) { console.error('vendedores-config/defecto:', e.message); }
+  res.json({ mensaje: recVendedores.MENSAJE_DEFECTO, ultimo });
 });
 
 // ── /api/rifas/:id/vendedores-config ───────────────────────
@@ -774,7 +776,7 @@ router.get('/:id/vendedores-config', authMiddleware, soloDueno, async (req, res)
 router.post('/:id/vendedores-config/ejemplo', authMiddleware, soloDueno, async (req, res) => {
   try {
     const e = await recVendedores.ejemplo(req.params.id, req.body || {});
-    res.json({ vendedor: e.vendedor, numeros: e.numeros, texto: e.texto, imagen: `data:image/jpeg;base64,${e.jpeg.toString('base64')}` });
+    res.json({ vendedor: e.vendedor, texto: e.texto, imagen: e.imagen });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 

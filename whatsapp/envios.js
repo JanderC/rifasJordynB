@@ -144,6 +144,24 @@ async function encolarNumerosVendedor({ rifaId, rifaNombre, vendedorId, nombre, 
   return envio;
 }
 
+// Publicidad programada de una rifa (imagen de su ciudad + texto). No lleva vendedor_id para
+// no pisar ni mezclarse con el envío de sus números. Si tenía una sin salir, se reemplaza.
+async function encolarPublicidadVendedor({ rifaId, rifaNombre, nombre, destino, imagenUrl, nota }) {
+  await tablaLista;
+  const jid = t?.toJID ? t.toJID(destino) : destino;
+  const frio = !(await esTibio(jid));
+  await pool.query(`
+    DELETE FROM wa_envios WHERE tipo = 'numeros_vendedor' AND rifa_id = $1 AND vendedor_id IS NULL AND jid = $2
+       AND estado IN ('en_cola', 'esperando_cliente')`, [rifaId, jid]);
+  const ins = await pool.query(`
+    INSERT INTO wa_envios (tipo, rifa_id, jid, nombre, rifa, imagenes, frio, nota)
+    VALUES ('numeros_vendedor', $1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+  [rifaId, jid, nombre, rifaNombre, imagenUrl ? [imagenUrl] : [], frio, nota]);
+  emitir(ins.rows[0]);
+  despertar();
+  return ins.rows[0];
+}
+
 // Prueba del dueño: mismo envío, sin rifa ni vendedor para no mezclarse con sus estados
 async function encolarPrueba({ destino, imagenUrl, nota, rifaNombre }) {
   await tablaLista;
@@ -151,7 +169,7 @@ async function encolarPrueba({ destino, imagenUrl, nota, rifaNombre }) {
   const frio = !(await esTibio(jid));
   const ins = await pool.query(`
     INSERT INTO wa_envios (tipo, jid, rifa, imagenes, frio, nota) VALUES ('numeros_vendedor', $1, $2, $3, $4, $5) RETURNING *`,
-  [jid, rifaNombre, [imagenUrl], frio, nota]);
+  [jid, rifaNombre, imagenUrl ? [imagenUrl] : [], frio, nota]);
   emitir(ins.rows[0]);
   despertar();
 }
@@ -161,7 +179,7 @@ async function estadoNumerosVendedor(rifaId) {
   await tablaLista;
   const r = await pool.query(`
     SELECT DISTINCT ON (vendedor_id) vendedor_id, estado, error, frio, enviado_at FROM wa_envios
-     WHERE tipo = 'numeros_vendedor' AND rifa_id = $1 ORDER BY vendedor_id, id DESC`, [rifaId]);
+     WHERE tipo = 'numeros_vendedor' AND rifa_id = $1 AND vendedor_id IS NOT NULL ORDER BY vendedor_id, id DESC`, [rifaId]);
   return r.rows;
 }
 
@@ -285,4 +303,4 @@ setInterval(() => ciclo(), 30 * 1000).unref();
 const conectado = () => !!t?.conectado();
 const aJid = (telefono) => (t?.toJID ? t.toJID(telefono) : telefono);
 
-module.exports = { init, conectado, aJid, encolarTicket, encolarNumerosVendedor, encolarPrueba, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };
+module.exports = { init, conectado, aJid, encolarTicket, encolarNumerosVendedor, encolarPublicidadVendedor, encolarPrueba, estadoNumerosVendedor, clienteEscribio, reintentar, porReservas, tablaLista };

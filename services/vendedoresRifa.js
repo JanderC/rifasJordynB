@@ -31,9 +31,9 @@ function limpiarImagenes(lista) {
       return fila;
     })
     .filter((x) => {
-      const clave = x.ubicacion.toLowerCase();
-      if (!x.ubicacion || vistas.has(clave) || !MOMENTOS.some((m) => x[m])) return false;
-      vistas.add(clave);
+      const k = clave(x.ubicacion);
+      if (!x.ubicacion || vistas.has(k) || !MOMENTOS.some((m) => x[m])) return false;
+      vistas.add(k);
       return true;
     });
 }
@@ -44,7 +44,10 @@ function momentoDe(fechaSorteo, hoy) {
   return dias <= 0 ? 'hoy' : dias === 1 ? 'manana' : 'dia';
 }
 
-const igual = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+// "SAN CRISTOBAL" y "San Cristóbal" son la misma ciudad
+const clave = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const mismaCiudad = (a, b) => clave(a) === clave(b);
+const igual = mismaCiudad;
 const primera = (fila, momento) => fila && (fila[momento] || MOMENTOS.map((m) => fila[m]).find(Boolean));
 
 // La de su ciudad para ese día; si falta, otra de su misma ciudad (trae su precio y su
@@ -56,4 +59,4 @@ function imagenDe(rifa, ubicacion, momento = 'dia') {
   return (suya && primera(suya, momento)) || primera(demas, momento) || rifa.imagen_url || null;
 }
 
-module.exports = { MOMENTOS, DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe };
+module.exports = { MOMENTOS, DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, mismaCiudad };

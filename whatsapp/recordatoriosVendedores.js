@@ -59,8 +59,10 @@ function cuandoJuega(momento, fechaSorteo) {
   return `El ${new Date(`${String(fechaSorteo).slice(0, 10)}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', timeZone: 'UTC' })}`;
 }
 
-function textoCuentas(moneda) {
-  return metodosPago.metodosDeRifa(moneda)
+// Todas las cuentas activas (también Nequi y Bancolombia en las rifas en dólares):
+// el vendedor ve dónde puede pagar su cliente
+function textoCuentas() {
+  return Object.keys(metodosPago.METODOS_PAGO)
     .map((titulo) => ({ titulo, ...metodosPago.METODOS_PAGO[titulo] }))
     .filter((m) => m.campos && !m.presencial)
     .map((m) => [`*${m.titulo}*`, ...m.campos.map((c) => `${c.label}: ${c.valor}`)].join('\n'))
@@ -90,8 +92,8 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
     tasa: pesosPorBs ? fmt(pesosPorBs) : '',
     tasa_bcv: tasas.bcv ? `Bs. ${fmt(tasas.bcv)}` : '',
     tasa_dolar: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',
-    tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos por dólar` : '',
-    cuentas: textoCuentas(rifa.moneda),
+    tasa_pesos: tasas.copUsd ? `${fmt(tasas.copUsd, 0)} pesos` : '',   // el dólar por Zelle
+    cuentas: textoCuentas(),
     cantidad: String(libres),
   };
   const poner = (linea) => linea.replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? v[k.toLowerCase()] : todo));

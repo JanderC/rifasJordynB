@@ -285,15 +285,24 @@ async function enviar(envio, ab) {
     // "escribiendo…" como una persona antes de mandar
     await t.escribiendo(envio.jid, azar(1500, 3500));
     const imgs = envio.imagenes.length ? envio.imagenes : [];
+    let notaEnviada = false;
     if (imgs.length) {
-      for (let i = 0; i < imgs.length; i++) {
-        await t.enviarImagen(envio.jid, imgs[i], textoTicket(envio, i, imgs.length), { autor: 'sistema', prioridad: envio.frio ? 'bot' : 'humano' });
-        if (i < imgs.length - 1) await sleep(azar(1200, 2800));
+      try {
+        for (let i = 0; i < imgs.length; i++) {
+          await t.enviarImagen(envio.jid, imgs[i], textoTicket(envio, i, imgs.length), { autor: 'sistema', prioridad: envio.frio ? 'bot' : 'humano' });
+          if (i < imgs.length - 1) await sleep(azar(1200, 2800));
+        }
+      } catch (e) {
+        // La imagen no se pudo descargar (p. ej. Cloudinary caído): el mensaje a vendedores sale solo con el texto
+        if (!(envio.tipo === 'numeros_vendedor' && envio.nota && /fetch stream|Failed to fetch|40[13]|disabled|ECONN|ETIMEDOUT/i.test(e.message))) throw e;
+        console.error(`⚠️ [Envíos] Sin imagen para ${envio.nombre || envio.jid} (${e.message.slice(0, 80)}): sale solo el texto`);
+        await t.enviarTexto(envio.jid, envio.nota, { autor: 'sistema' });
+        notaEnviada = true;
       }
     } else {
       await t.enviarTexto(envio.jid, textoTicket(envio, 0, 1), { autor: 'sistema' });
     }
-    if (envio.tipo === 'numeros_vendedor' && envio.nota?.length > CAPTION_MAX) {
+    if (envio.tipo === 'numeros_vendedor' && envio.nota?.length > CAPTION_MAX && !notaEnviada) {
       await sleep(azar(1200, 2800));
       await t.enviarTexto(envio.jid, envio.nota, { autor: 'sistema' });
     }

@@ -13,7 +13,7 @@ const metodosPago = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const envios = require('./envios');
 const tasasRuta = require('../routes/tasas');
-const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, mismaCiudad } = require('../services/vendedoresRifa');
+const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, condicionesDe, mismaCiudad } = require('../services/vendedoresRifa');
 
 const TZ = 'America/Caracas';
 const VENTANA_MIN = 30;   // si el servidor o WhatsApp estuvieron caídos, una hora atrasada ya no sale
@@ -101,20 +101,23 @@ async function tasasDelDia() {
   return { ...t, bcv: ref?.bcv?.valor || 0, paralelo: ref?.paralelo?.valor || 0, efectivo: ref?.oficial?.valor || t.copUsdBs || 0 };
 }
 
-function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
+// ubicacion: la ciudad del vendedor (su precio y su premio); sin ella, la de vendedor.ubicacion
+function armarTexto({ config, rifa, vendedor, momento, tasas, libres, ubicacion }) {
+  const cond = condicionesDe(rifa, ubicacion !== undefined ? ubicacion : vendedor.ubicacion);
   const fmt = (n, d = 2) => new Intl.NumberFormat('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
   // La tasa del bolívar: el dólar colombiano (pesos por dólar) ÷ el dólar paralelo (Bs por dólar).
   // Si el paralelo no responde, la tasa BsD/USD del sistema.
   const bsPorDolar = tasas.paralelo || tasas.bsdUsd;
   const pesosPorBs = bsPorDolar ? (tasas.copUsdBs || tasas.copUsd) / bsPorDolar : 0;
-  // El precio en bolívares: pesos ÷ esa tasa (en una rifa en dólares, dólares × Bs por dólar)
-  const precioBs = rifa.moneda === 'USD' ? (Number(rifa.precio) || 0) * (tasas.bsdUsd || 0) : (pesosPorBs ? (Number(rifa.precio) || 0) / pesosPorBs : 0);
+  // El precio en bolívares: pesos ÷ esa tasa; si el precio está en dólares, dólares × Bs por dólar
+  const precioBs = cond.moneda === 'USD' ? cond.precio * (bsPorDolar || 0) : (pesosPorBs ? cond.precio / pesosPorBs : 0);
   const fecha = String(rifa.fecha_sorteo).slice(0, 10);
   const v = {
     nombre: String(vendedor.vendedor_nombre || '').trim().split(/\s+/)[0],
     rifa: rifa.nombre,
     cuando: cuandoJuega(momento, fecha),
-    precio: metodosPago.fmtEnMoneda(Number(rifa.precio) || 0, rifa.moneda, 'pesos'),
+    precio: metodosPago.fmtEnMoneda(cond.precio, cond.moneda, 'pesos'),
+    premio: cond.premio,
     fecha: new Date(`${fecha}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }),
     tasa: pesosPorBs ? fmt(pesosPorBs) : '',
     precio_bs: precioBs ? `${fmt(precioBs)} Bs` : '',
@@ -142,7 +145,7 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
 }
 
 const leerRifa = async (id) => (await pool.query(`
-  SELECT id, nombre, imagen_url, cifras, moneda, precio, fecha_sorteo::text AS fecha_sorteo, hora_sorteo, activa,
+  SELECT id, nombre, premio, imagen_url, cifras, moneda, precio, fecha_sorteo::text AS fecha_sorteo, hora_sorteo, activa,
          COALESCE(imagenes_ubicacion, '[]'::jsonb) AS imagenes_ubicacion,
          COALESCE(recordatorio_vendedores, '{}'::jsonb) AS recordatorio_vendedores
     FROM rifas WHERE id = $1`, [id])).rows[0];
@@ -240,7 +243,7 @@ async function ejemplo(rifaId, { config, imagenes_ubicacion: imagenes, ubicacion
   return {
     vendedor: v.vendedor_nombre,
     imagen: imagenDe(prueba, ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion, cual),
-    texto: armarTexto({ config: limpiarConfig(config), rifa, vendedor: v, momento: cual, tasas, libres }),
+    texto: armarTexto({ config: limpiarConfig(config), rifa: prueba, vendedor: v, momento: cual, tasas, libres, ubicacion: ubicacion === DEMAS ? null : ubicacion ?? v.ubicacion }),
   };
 }
 

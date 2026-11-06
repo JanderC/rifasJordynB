@@ -20,7 +20,9 @@ function limpiarConfig(c) {
   return { activo: c?.activo === true, fechas, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
 }
 
-// [{ ubicacion, dia, manana, hoy }]. Las guardadas antes con una sola imagen la usan como "dia".
+// [{ ubicacion, dia, manana, hoy, precio?, moneda?, premio? }]. Las guardadas antes con una sola
+// imagen la usan como "dia". precio/moneda/premio: lo que vale el ticket y lo que se gana EN ESA
+// CIUDAD (en Rubio cuesta y paga distinto que en San Cristóbal); sin ellos, los de la rifa.
 function limpiarImagenes(lista) {
   const vistas = new Set();
   return (Array.isArray(lista) ? lista : [])
@@ -30,11 +32,18 @@ function limpiarImagenes(lista) {
         const url = String(x?.[m] || (m === 'dia' ? x?.imagen : '') || '').trim();
         if (esPropia(url)) fila[m] = url;
       }
+      const precio = Number(String(x?.precio ?? '').replace(',', '.'));
+      if (precio > 0 && precio < 1e9) {
+        fila.precio = Math.round(precio * 100) / 100;
+        fila.moneda = x?.moneda === 'USD' ? 'USD' : 'COP';
+      }
+      const premio = String(x?.premio || '').trim().slice(0, 80);
+      if (premio) fila.premio = premio;
       return fila;
     })
     .filter((x) => {
       const k = clave(x.ubicacion);
-      if (!x.ubicacion || vistas.has(k) || !MOMENTOS.some((m) => x[m])) return false;
+      if (!x.ubicacion || vistas.has(k) || !(MOMENTOS.some((m) => x[m]) || x.precio || x.premio)) return false;
       vistas.add(k);
       return true;
     });
@@ -61,4 +70,17 @@ function imagenDe(rifa, ubicacion, momento = 'dia') {
   return (suya && primera(suya, momento)) || primera(demas, momento) || rifa.imagen_url || null;
 }
 
-module.exports = { MOMENTOS, DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, mismaCiudad };
+// Precio y premio para un vendedor: los de su ciudad, luego los de "las demás", luego los de la rifa
+function condicionesDe(rifa, ubicacion) {
+  const lista = rifa.imagenes_ubicacion || [];
+  const suya = ubicacion ? lista.find((x) => igual(x.ubicacion, ubicacion)) : null;
+  const demas = lista.find((x) => x.ubicacion === DEMAS);
+  const conPrecio = [suya, demas].find((f) => f?.precio);
+  return {
+    precio: conPrecio ? conPrecio.precio : Number(rifa.precio) || 0,
+    moneda: conPrecio ? conPrecio.moneda : rifa.moneda,
+    premio: [suya, demas].find((f) => f?.premio)?.premio || rifa.premio || '',
+  };
+}
+
+module.exports = { MOMENTOS, DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, condicionesDe, mismaCiudad };

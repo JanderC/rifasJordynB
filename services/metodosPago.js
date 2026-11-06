@@ -132,12 +132,13 @@ recargar();
 setInterval(() => recargar(), 60 * 1000).unref();
 
 async function obtenerTasas() {
-  const r = await pool.query(`SELECT clave, valor FROM config_tasas WHERE clave IN ('COP_POR_USD','BSD_POR_USD','COP_POR_USD_BS')`);
+  const r = await pool.query(`SELECT clave, valor FROM config_tasas WHERE clave IN ('COP_POR_USD','BSD_POR_USD','COP_POR_USD_BS','COP_POR_BS')`);
   const t = Object.fromEntries(r.rows.map((x) => [x.clave, parseFloat(x.valor)]));
   const copUsd = t.COP_POR_USD || 4200;
   // copUsd: solo para Zelle (pesos → dólares). copUsdBs: solo para pasar los pesos a bolívares.
   // Van separadas: cambiar la de Zelle no mueve lo que se cobra por Pago Móvil.
-  return { copUsd, copUsdBs: t.COP_POR_USD_BS || copUsd, bsdUsd: t.BSD_POR_USD || 0 };
+  // copBs: pesos por 1 bolívar que escribe el dueño (solo para el mensaje a vendedores)
+  return { copUsd, copUsdBs: t.COP_POR_USD_BS || copUsd, bsdUsd: t.BSD_POR_USD || 0, copBs: t.COP_POR_BS || 0 };
 }
 
 // Monto en la moneda del método, igual que calcularPrecioMetodo de la pantalla del cliente.

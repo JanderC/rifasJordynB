@@ -2,3 +2,7 @@ node_modules/
 database/backups/
 whatsapp/sessions/
 whatsapp/sessions_personal/
+
+# Claves: nunca al repositorio (se configuran en Railway)
+.env
+.env.*

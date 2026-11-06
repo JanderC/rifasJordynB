@@ -98,14 +98,15 @@ async function tasasDelDia() {
     tasasRuta.referencias().catch(() => ({})),
   ]);
   // Dólar en efectivo: el dólar de Colombia automático; si no responde, la tasa de pesos de los bolívares
-  return { ...t, bcv: ref?.bcv?.valor || 0, efectivo: ref?.oficial?.valor || t.copUsdBs || 0 };
+  return { ...t, bcv: ref?.bcv?.valor || 0, paralelo: ref?.paralelo?.valor || 0, efectivo: ref?.oficial?.valor || t.copUsdBs || 0 };
 }
 
 function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
   const fmt = (n, d = 2) => new Intl.NumberFormat('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
-  const fmtCorto = (n) => new Intl.NumberFormat('es-VE', { maximumFractionDigits: 2 }).format(n);   // 3 → "3", 3.2 → "3,2"
-  // "Se está recibiendo a 3": la tasa del bolívar que pone el dueño en Tasas. Si no la puso, el cálculo de antes.
-  const pesosPorBs = tasas.copBs || (tasas.bsdUsd ? (tasas.copUsdBs || tasas.copUsd) / tasas.bsdUsd : 0);
+  // La tasa del bolívar: el dólar colombiano (pesos por dólar) ÷ el dólar paralelo (Bs por dólar).
+  // Si el paralelo no responde, la tasa BsD/USD del sistema.
+  const bsPorDolar = tasas.paralelo || tasas.bsdUsd;
+  const pesosPorBs = bsPorDolar ? (tasas.copUsdBs || tasas.copUsd) / bsPorDolar : 0;
   // El precio en bolívares: pesos ÷ esa tasa (en una rifa en dólares, dólares × Bs por dólar)
   const precioBs = rifa.moneda === 'USD' ? (Number(rifa.precio) || 0) * (tasas.bsdUsd || 0) : (pesosPorBs ? (Number(rifa.precio) || 0) / pesosPorBs : 0);
   const fecha = String(rifa.fecha_sorteo).slice(0, 10);
@@ -115,7 +116,7 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres }) {
     cuando: cuandoJuega(momento, fecha),
     precio: metodosPago.fmtEnMoneda(Number(rifa.precio) || 0, rifa.moneda, 'pesos'),
     fecha: new Date(`${fecha}T12:00:00Z`).toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' }),
-    tasa: pesosPorBs ? (tasas.copBs ? fmtCorto(pesosPorBs) : fmt(pesosPorBs)) : '',
+    tasa: pesosPorBs ? fmt(pesosPorBs) : '',
     precio_bs: precioBs ? `${fmt(precioBs)} Bs` : '',
     tasa_bcv: tasas.bcv ? `Bs. ${fmt(tasas.bcv)}` : '',
     tasa_dolar: tasas.bsdUsd ? `Bs. ${fmt(tasas.bsdUsd)} por dólar` : '',

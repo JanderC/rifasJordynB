@@ -32,14 +32,6 @@ const esquemaListo = pool.query(`
     SELECT 'COP_POR_USD_BS', valor, 'Pesos colombianos por 1 dólar, solo para calcular los bolívares de Pago Móvil', NOW()
       FROM config_tasas WHERE clave = 'COP_POR_USD'
     ON CONFLICT (clave) DO NOTHING`))
-  // Pesos por 1 bolívar, la escribe el dueño (la del mensaje a vendedores: 1.000 Bs × 3 = 3.000 pesos).
-  // Nace con lo que daba el cálculo (pesos por dólar ÷ Bs por dólar) para que nada cambie al crearla.
-  .then(() => pool.query(`
-    INSERT INTO config_tasas (clave, valor, descripcion, updated_at)
-    SELECT 'COP_POR_BS', ROUND(a.valor / NULLIF(b.valor, 0), 2), 'Pesos colombianos por 1 bolívar', NOW()
-      FROM config_tasas a, config_tasas b
-     WHERE a.clave = 'COP_POR_USD_BS' AND b.clave = 'BSD_POR_USD' AND b.valor > 0
-    ON CONFLICT (clave) DO NOTHING`))
   .catch((e) => console.error('[tasas] esquema:', e.message));
 
 async function traer(url) {

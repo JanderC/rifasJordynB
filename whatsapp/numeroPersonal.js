@@ -26,7 +26,7 @@ const { NUMERO, VISIBLE, TERMINOS, AVISO } = require('../config/numeroPersonal')
 const DIR = process.env.WA_PERSONAL_SESSION_PATH || path.join(__dirname, 'sessions_personal');
 const sesion = crear('wa_personal_sesion_archivos', 'Número personal');
 const CODIGO_VENCE_MS = 3 * 60 * 1000;
-const MAX_POR_DIA = 150;            // tope de envíos por día desde el número personal
+const MAX_POR_DIA = 300;            // tope de envíos por día desde el número personal (varias rifas × sus vendedores)
 const PAUSA = [8000, 18000];        // entre un envío y otro (además de la pausa de los recordatorios)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

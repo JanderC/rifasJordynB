@@ -23,8 +23,9 @@ const personal = require('./numeroPersonal');
 
 // Por dónde sale un envío: por el número personal si el dueño lo puso como principal y está
 // conectado (solo a números de teléfono; un chat @lid es del número del negocio)
+const porPersonal = (envio) => personal.esPrincipal() && /@s\.whatsapp\.net$/.test(envio.jid);
 function salida(envio) {
-  if (personal.esPrincipal() && /@s\.whatsapp\.net$/.test(envio.jid)) {
+  if (porPersonal(envio)) {
     return {
       escribiendo: async () => {},   // el personal ya hace "escribiendo…" antes de cada mensaje
       enviarImagen: (jid, url, caption) => personal.enviarImagen(jid, url, caption, 'envio'),
@@ -243,6 +244,12 @@ async function ciclo() {
     const envio = r.rows[0];
     if (!envio) return;
 
+    // Por el número personal del dueño no hay "desconocidos": son sus contactos (vendedores y clientes
+    // que ya le escriben). El tope de chats nuevos es del número del negocio.
+    if (envio.frio && porPersonal(envio)) {
+      await actualizar(envio.id, { frio: false });
+      envio.frio = false;
+    }
     if (envio.frio) {
       if (!horarioFrioAbierto(ab)) return;                       // de noche no se le escribe a desconocidos
       const esperaMin = (ab.frio_espera_min_seg ?? 90) * 1000;

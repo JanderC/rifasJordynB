@@ -77,6 +77,7 @@ app.use("/api/resultados", require("./routes/resultadosPublicados"));   // imág
 app.use("/api/ganadores", require("./routes/ganadores"));   // galería de ganadores (pública + configuración)
 app.use("/api/baileys", require("./routes/wa-baileys"));
 app.use("/api/numero-personal", require("./routes/numeroPersonal"));
+app.use("/api/talonarios", require("./routes/talonarios"));
 app.use("/api/wa-chat", require("./routes/wa-chat"));      // panel de chats en tiempo real + bot/IA
 
 // ── WhatsApp Business ──────────────────────────────────────

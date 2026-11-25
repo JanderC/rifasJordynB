@@ -133,6 +133,30 @@ router.get('/referencias', authMiddleware, soloDueno, async (req, res) => {
   }
 });
 
+// ── /api/tasas/tasa-bs ─────────────────────────────────────
+// La tasa del bolívar del mensaje a vendedores: la automática (dólar colombiano ÷ paralelo)
+// y la manual si el dueño puso una (esa manda)
+router.get('/tasa-bs', authMiddleware, soloDueno, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT clave, valor, updated_at FROM config_tasas WHERE clave IN ('COP_POR_USD','COP_POR_USD_BS','BSD_POR_USD','TASA_BS_MENSAJE')`);
+    const t = Object.fromEntries(r.rows.map((x) => [x.clave, x]));
+    const ref = await referencias().catch(() => ({}));
+    const bsPorDolar = ref?.paralelo?.valor || Number(t.BSD_POR_USD?.valor) || 0;
+    const pesos = Number(t.COP_POR_USD_BS?.valor) || Number(t.COP_POR_USD?.valor) || 0;
+    res.json({
+      automatica: bsPorDolar ? Math.round((pesos / bsPorDolar) * 100) / 100 : null,
+      pesos_por_dolar: pesos, paralelo: ref?.paralelo?.valor || null,
+      manual: t.TASA_BS_MENSAJE ? Number(t.TASA_BS_MENSAJE.valor) : null,
+      manual_desde: t.TASA_BS_MENSAJE?.updated_at || null,
+    });
+  } catch (err) { console.error('tasa-bs:', err); res.status(500).json({ error: 'Error del servidor' }); }
+});
+// Quitar la manual: el mensaje vuelve a la automática
+router.delete('/tasa-bs', authMiddleware, soloDueno, async (req, res) => {
+  try { await pool.query(`DELETE FROM config_tasas WHERE clave = 'TASA_BS_MENSAJE'`); res.json({ ok: true }); }
+  catch (err) { console.error('tasa-bs:', err); res.status(500).json({ error: 'Error del servidor' }); }
+});
+
 // ── PUT /api/tasas/:clave/fuente ───────────────────────────
 // Body: { fuente: 'manual' | 'bcv' | 'paralelo' | 'oficial' }
 // Con una fuente automática la tasa se actualiza ya y luego sola cada hora.

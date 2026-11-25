@@ -53,6 +53,10 @@ const DEFECTO = {
     mensaje: '',                // texto propio con variables ({nombre}, {numeros}, {falta}…); vacío = el automático
     con_imagen: false,          // se envía con la foto principal de la rifa
   },
+  // Texto que acompaña la imagen al enviar. Vacío = solo la imagen, sin mensaje.
+  //  ticket:  al aprobar una compra (variables {nombre} {rifa} {numeros})
+  //  numeros: al enviar la tablita de números a un vendedor ({nombre} {rifa})
+  textos_envio: { ticket: '', numeros: '' },
   // Mensajes del resultado de un sorteo (módulo Resultados del panel). Variables:
   // {titulo} {sorteo} {fecha} {hora} {loteria} {numero} {premio} {vendido_por} {descripcion}
   // ({TITULO} en mayúsculas). Una línea con una variable vacía no se envía.

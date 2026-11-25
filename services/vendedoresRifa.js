@@ -17,7 +17,15 @@ function limpiarConfig(c) {
   const horas = [...new Set((Array.isArray(c?.horas) ? c.horas : []).filter((h) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(h))))].sort().slice(0, 4);
   // fechas: los días exactos del calendario (AAAA-MM-DD). Si hay, mandan sobre "dias" (de la semana, lo de antes)
   const fechas = [...new Set((Array.isArray(c?.fechas) ? c.fechas : []).map(String).filter((f) => /^\d{4}-\d{2}-\d{2}$/.test(f)))].sort().slice(0, 120);
-  return { activo: c?.activo === true, fechas, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500) };
+  // tablita: envío programado de la publicidad CON los números de cada vendedor (aparte del de la publicidad sola)
+  const tb = c?.tablita || {};
+  const tablita = {
+    activo: tb.activo === true,
+    fechas: [...new Set((Array.isArray(tb.fechas) ? tb.fechas : []).map(String).filter((f) => /^\d{4}-\d{2}-\d{2}$/.test(f)))].sort().slice(0, 120),
+    horas: [...new Set((Array.isArray(tb.horas) ? tb.horas : []).filter((h) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(h))))].sort().slice(0, 4),
+    mensaje: String(tb.mensaje || '').trim().slice(0, 900),   // vacío = solo la imagen
+  };
+  return { activo: c?.activo === true, fechas, dias, horas, mensaje: String(c?.mensaje || '').trim().slice(0, 1500), tablita };
 }
 
 // [{ ubicacion, dia, manana, hoy, precio?, moneda?, premio? }]. Las guardadas antes con una sola

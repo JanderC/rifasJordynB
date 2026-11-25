@@ -12,6 +12,9 @@ const { datosBoleteria } = require('../services/boleteria');
 const metodosPago = require('../services/metodosPago');
 const opciones = require('../services/rifaOpciones');
 const envios = require('./envios');
+const { cloudinary } = require('../config/cloudinary');
+const { CARPETAS } = require('../services/imagenes');
+const { generarImagenVendedor } = require('../services/imagenVendedor');
 const tasasRuta = require('../routes/tasas');
 const { DEMAS, limpiarConfig, limpiarImagenes, momentoDe, imagenDe, condicionesDe, mismaCiudad } = require('../services/vendedoresRifa');
 
@@ -107,8 +110,9 @@ function armarTexto({ config, rifa, vendedor, momento, tasas, libres, ubicacion 
   const fmt = (n, d = 2) => new Intl.NumberFormat('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
   // La tasa del bolívar: el dólar colombiano (pesos por dólar) ÷ el dólar paralelo (Bs por dólar).
   // Si el paralelo no responde, la tasa BsD/USD del sistema.
+  // Si el dueño puso la tasa a mano en Tasas, manda esa (no se mueve sola con el paralelo)
   const bsPorDolar = tasas.paralelo || tasas.bsdUsd;
-  const pesosPorBs = bsPorDolar ? (tasas.copUsdBs || tasas.copUsd) / bsPorDolar : 0;
+  const pesosPorBs = tasas.tasaBsMensaje || (bsPorDolar ? (tasas.copUsdBs || tasas.copUsd) / bsPorDolar : 0);
   // El precio en bolívares: pesos ÷ esa tasa; si el precio está en dólares, dólares × Bs por dólar
   const precioBs = cond.moneda === 'USD' ? cond.precio * (bsPorDolar || 0) : (pesosPorBs ? cond.precio / pesosPorBs : 0);
   const fecha = String(rifa.fecha_sorteo).slice(0, 10);
@@ -174,6 +178,50 @@ async function lanzar(rifa, config, hoy) {
   return n;
 }
 
+// ── La tablita programada: la publicidad de su ciudad CON sus números (como «Enviar a cada uno»)
+async function encolarTablita({ rifa, v, tablita, hoy, tasas }) {
+  const dig = digitos(rifa);
+  const numeros = numerosLibres(v, dig);
+  if (!numeros.length || !v.telefono) return false;
+  const momento = momentoDe(rifa.fecha_sorteo, hoy);
+  const jpeg = await generarImagenVendedor({ numeros, dig, imagen: imagenDe(rifa, v.ubicacion, momento) });
+  const subida = await cloudinary.uploader.upload(`data:image/jpeg;base64,${jpeg.toString('base64')}`, {
+    folder: CARPETAS.numerosVendedor, public_id: `${rifa.id}_${v.vendedor_id}`, overwrite: true, invalidate: true,
+  });
+  // Sin texto propio sale solo la imagen
+  const nota = tablita.mensaje ? armarTexto({ config: { mensaje: tablita.mensaje }, rifa, vendedor: v, momento, tasas, libres: numeros.length }) : null;
+  await envios.encolarNumerosVendedor({
+    rifaId: rifa.id, rifaNombre: rifa.nombre, vendedorId: v.vendedor_id, nombre: v.vendedor_nombre,
+    destino: v.telefono, imagenUrl: subida.secure_url, nota,
+  });
+  return true;
+}
+
+async function lanzarTablita(rifa, tablita, hoy) {
+  const [bol, tasas] = await Promise.all([datosBoleteria(rifa.id), tasasDelDia()]);
+  let n = 0;
+  for (const v of bol?.vendedores || []) {
+    try { if (await encolarTablita({ rifa, v, tablita, hoy, tasas })) n += 1; }
+    catch (e) { console.error(`❌ [Tablita] ${v.vendedor_nombre}: ${e.message}`); }
+  }
+  return n;
+}
+
+// Corre un turno (publicidad o tablita) una sola vez, aunque el servidor reinicie
+async function correrTurno({ rifa, ve, horas, prefijo, lanzarlo }) {
+  for (const hora of horas) {
+    const [h, m] = hora.split(':').map(Number);
+    const atraso = ve.minutos - (h * 60 + m);
+    if (atraso < 0 || atraso >= VENTANA_MIN) continue;
+    const turno = `${prefijo}${ve.fecha}T${hora}`;
+    const nuevo = await pool.query(`INSERT INTO wa_vendedores_turnos (rifa_id, turno) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING turno`, [rifa.id, turno]);
+    if (!nuevo.rows[0]) continue;
+    const n = await lanzarlo();
+    await pool.query(`UPDATE wa_vendedores_turnos SET enviados = $1 WHERE rifa_id = $2 AND turno = $3`, [n, rifa.id, turno]);
+    console.log(`📣 [Vendedores] ${rifa.nombre} · ${turno}: ${n} en cola`);
+  }
+}
+
 // Las rifas a las que les toca ahora. Un turno solo corre una vez, aunque el servidor reinicie.
 async function revisar(cuando = new Date()) {
   await opciones.esquemaListo;
@@ -182,25 +230,20 @@ async function revisar(cuando = new Date()) {
   const ve = ahoraVE(cuando);
   const r = await pool.query(`
     SELECT id FROM rifas
-     WHERE activa AND fecha_sorteo >= $1::date AND (recordatorio_vendedores->>'activo') = 'true'`, [ve.fecha]);
+     WHERE activa AND fecha_sorteo >= $1::date
+       AND ((recordatorio_vendedores->>'activo') = 'true' OR (recordatorio_vendedores->'tablita'->>'activo') = 'true')`, [ve.fecha]);
   for (const { id } of r.rows) {
     const rifa = await leerRifa(id);
     const momento = opciones.momentoSorteo(rifa);
     if (momento && momento.getTime() <= cuando.getTime()) continue;
     const config = limpiarConfig(rifa.recordatorio_vendedores);
-    // Los días del calendario; las rifas configuradas antes por día de la semana siguen igual
-    const toca = config.fechas.length ? config.fechas.includes(ve.fecha) : config.dias.includes(ve.dia);
-    if (!toca) continue;
-    for (const hora of config.horas) {
-      const [h, m] = hora.split(':').map(Number);
-      const atraso = ve.minutos - (h * 60 + m);
-      if (atraso < 0 || atraso >= VENTANA_MIN) continue;
-      const turno = `${ve.fecha}T${hora}`;
-      const nuevo = await pool.query(`INSERT INTO wa_vendedores_turnos (rifa_id, turno) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING turno`, [id, turno]);
-      if (!nuevo.rows[0]) continue;
-      const n = await lanzar(rifa, config, ve.fecha);
-      await pool.query(`UPDATE wa_vendedores_turnos SET enviados = $1 WHERE rifa_id = $2 AND turno = $3`, [n, id, turno]);
-      console.log(`📣 [Vendedores] ${rifa.nombre} · ${turno}: ${n} en cola`);
+    // La publicidad: los días del calendario (las configuradas antes por día de la semana siguen igual)
+    if (config.activo && (config.fechas.length ? config.fechas.includes(ve.fecha) : config.dias.includes(ve.dia))) {
+      await correrTurno({ rifa, ve, horas: config.horas, prefijo: '', lanzarlo: () => lanzar(rifa, config, ve.fecha) });
+    }
+    // La tablita con los números: su propio calendario y sus horas
+    if (config.tablita.activo && config.tablita.fechas.includes(ve.fecha)) {
+      await correrTurno({ rifa, ve, horas: config.tablita.horas, prefijo: 'N', lanzarlo: () => lanzarTablita(rifa, config.tablita, ve.fecha) });
     }
   }
 }
@@ -265,7 +308,7 @@ async function ultimaConfig() {
   if (!r.rows[0]) return null;
   const c = limpiarConfig(r.rows[0].c);
   // Las fechas son de cada rifa: la nueva solo hereda el mensaje y las horas
-  return { ...c, fechas: [], dias: [], mensaje: mensajeDe(c) };
+  return { ...c, fechas: [], dias: [], mensaje: mensajeDe(c), tablita: { ...c.tablita, fechas: [] } };
 }
 
 // Los días que ya tienen marcados las otras rifas activas (para no mandar doble el mismo día)

@@ -97,25 +97,23 @@ async function actualizar(id, cambios) {
 
 const CAPTION_MAX = 900;   // el texto programado a vendedores, si es más largo, va aparte de la foto
 
-// Texto corto y natural para la foto (varía para no parecer plantilla)
-function textoTicket(envio, i, total) {
-  const nombre = String(envio.nombre || '').trim().split(/\s+/)[0] || '';
+// El texto que acompaña la imagen: el que escribió el dueño en WhatsApp → Bot (textos_envio).
+// Vacío = solo la imagen. Variables: {nombre} {rifa} {numeros}
+function plantilla(texto, envio) {
+  const v = {
+    nombre: String(envio.nombre || '').trim().split(/\s+/)[0] || '',
+    rifa: envio.rifa || '',
+    numeros: (envio.numeros || []).join(', '),
+  };
+  return String(texto || '').replace(/\{(\w+)\}/g, (todo, k) => (k.toLowerCase() in v ? v[k.toLowerCase()] : todo)).trim();
+}
+function textoTicket(envio, i, total, textos = {}) {
   if (envio.tipo === 'numeros_vendedor') {
     if (envio.nota && envio.nota.length <= CAPTION_MAX) return envio.nota;
-    const saludo = elegir([`¡Hola${nombre ? ' ' + nombre : ''}!`, `Hola${nombre ? ' ' + nombre : ''} 👋`, `¡Epa${nombre ? ' ' + nombre : ''}!`]);
-    return `${saludo} ${elegir([`Estos son tus números disponibles de *${envio.rifa}*.`, `Te paso tus números disponibles de *${envio.rifa}*.`])} ${elegir(['¡Buenas ventas! 🍀', '¡Mucho éxito con las ventas! 🙌'])}`;
+    return plantilla(textos.numeros, envio);
   }
-  const num = envio.numeros[i] || envio.numeros[0];
-  if (i > 0) return total > 1 ? `🎟️ ${num}` : '';
-  const varios = envio.numeros.length > 1;
-  const saludo = elegir([`¡Hola${nombre ? ' ' + nombre : ''}!`, `Hola${nombre ? ' ' + nombre : ''} 👋`, `¡Epa${nombre ? ' ' + nombre : ''}!`]);
-  const cuerpo = elegir([
-    `Ya verificamos tu pago ✅ aquí ${varios ? 'tienes tus tickets' : 'tienes tu ticket'} de *${envio.rifa}*${varios ? '' : ` con el *${num}*`}.`,
-    `tu pago quedó confirmado 🎉 te dejo ${varios ? 'tus tickets' : 'tu ticket'} de *${envio.rifa}*${varios ? '' : ` (número *${num}*)`}.`,
-    `listo, pago verificado 🙌 ${varios ? 'estos son tus tickets' : `este es tu ticket del *${num}*`} para *${envio.rifa}*.`,
-  ]);
-  const cierre = elegir(['¡Mucha suerte! 🍀', 'Guárdalo bien y ¡suerte! 🍀', '¡Que sea el ganador! 🤞']);
-  return `${saludo} ${cuerpo}${envio.nota ? `\n\n${envio.nota}` : ''}\n\n${cierre}`;
+  if (i > 0) return '';
+  return [plantilla(textos.ticket, envio), envio.nota || ''].filter(Boolean).join('\n\n');
 }
 
 // ── Encolar tickets al aprobar ───────────────────────────────
@@ -287,6 +285,7 @@ async function ciclo() {
 
 async function enviar(envio, ab) {
   await actualizar(envio.id, { estado: 'enviando', intentos: envio.intentos + 1 });
+  const textos = (await obtenerConfig()).textos_envio || {};
   const t = salida(envio);
   try {
     // "escribiendo…" como una persona antes de mandar
@@ -296,7 +295,7 @@ async function enviar(envio, ab) {
     if (imgs.length) {
       try {
         for (let i = 0; i < imgs.length; i++) {
-          await t.enviarImagen(envio.jid, imgs[i], textoTicket(envio, i, imgs.length), { autor: 'sistema', prioridad: envio.frio ? 'bot' : 'humano' });
+          await t.enviarImagen(envio.jid, imgs[i], textoTicket(envio, i, imgs.length, textos), { autor: 'sistema', prioridad: envio.frio ? 'bot' : 'humano' });
           if (i < imgs.length - 1) await sleep(azar(1200, 2800));
         }
       } catch (e) {
@@ -307,7 +306,8 @@ async function enviar(envio, ab) {
         notaEnviada = true;
       }
     } else {
-      await t.enviarTexto(envio.jid, textoTicket(envio, 0, 1), { autor: 'sistema' });
+      // Sin foto: el texto del dueño o, si no hay, solo lo indispensable (la rifa y los números)
+      await t.enviarTexto(envio.jid, textoTicket(envio, 0, 1, textos) || `🎟️ *${envio.rifa}* · ${(envio.numeros || []).join(', ')}`, { autor: 'sistema' });
     }
     if (envio.tipo === 'numeros_vendedor' && envio.nota?.length > CAPTION_MAX && !notaEnviada) {
       await sleep(azar(1200, 2800));

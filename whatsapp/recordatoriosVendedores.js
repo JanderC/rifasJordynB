@@ -317,18 +317,28 @@ async function ocupadas() {
   const hoy = ahoraVE().fecha;
   const r = await pool.query(`
     SELECT id, nombre, fecha_sorteo::text AS fecha_sorteo, recordatorio_vendedores AS c FROM rifas
-     WHERE activa AND fecha_sorteo >= $1::date AND (recordatorio_vendedores->>'activo') = 'true'`, [hoy]);
-  return r.rows.map((x) => {
+     WHERE activa AND fecha_sorteo >= $1::date
+       AND ((recordatorio_vendedores->>'activo') = 'true' OR (recordatorio_vendedores->'tablita'->>'activo') = 'true')`, [hoy]);
+  // Una fila por envío programado: { rifa_id, nombre, tipo: 'publicidad' | 'tablita', fechas, horas }
+  const out = [];
+  for (const x of r.rows) {
     const c = limpiarConfig(x.c);
-    let fechas = c.fechas.filter((f) => f >= hoy && f <= x.fecha_sorteo.slice(0, 10));
-    if (!c.fechas.length) {
-      fechas = [];
-      for (let d = new Date(`${hoy}T12:00:00Z`); d.toISOString().slice(0, 10) <= x.fecha_sorteo.slice(0, 10); d.setUTCDate(d.getUTCDate() + 1)) {
-        if (c.dias.includes(d.getUTCDay())) fechas.push(d.toISOString().slice(0, 10));
+    const fin = x.fecha_sorteo.slice(0, 10);
+    if (c.activo) {
+      let fechas = c.fechas.filter((f) => f >= hoy && f <= fin);
+      if (!c.fechas.length) {
+        for (let d = new Date(`${hoy}T12:00:00Z`); d.toISOString().slice(0, 10) <= fin; d.setUTCDate(d.getUTCDate() + 1)) {
+          if (c.dias.includes(d.getUTCDay())) fechas.push(d.toISOString().slice(0, 10));
+        }
       }
+      if (fechas.length) out.push({ rifa_id: x.id, nombre: x.nombre, tipo: 'publicidad', fechas, horas: c.horas });
     }
-    return { rifa_id: x.id, nombre: x.nombre, fechas };
-  }).filter((x) => x.fechas.length);
+    if (c.tablita.activo) {
+      const fechas = c.tablita.fechas.filter((f) => f >= hoy && f <= fin);
+      if (fechas.length) out.push({ rifa_id: x.id, nombre: x.nombre, tipo: 'tablita', fechas, horas: c.tablita.horas });
+    }
+  }
+  return out;
 }
 
 let corriendo = false;
